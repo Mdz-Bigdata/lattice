@@ -23,6 +23,7 @@ build-backend = "hatchling.build"
 dev = [
     "pytest>=8.0",
     "hypothesis>=6.0",
+    "jsonschema>=4.26.0",
 ]
 
 [project]

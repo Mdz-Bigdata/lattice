@@ -1,0 +1,189 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/*
+ * Styles owned by the 数据源 page. The shared shell classes
+ * (source-grid / source-card / type-picker / type-card / drawer-form / field…)
+ * live in styles.css; this file only introduces new classes, and refines a
+ * shared one through a compound selector so that the cascade order between the
+ * two stylesheets cannot silently drop the rule.
+ */
+
+/* ----- 类型选择：按分类分组的紧凑网格 ----------------------------------- */
+.type-group .type-group-count {
+  margin-left: 6px;
+  padding: 0 7px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--soft);
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 16px;
+}
+.type-picker.type-picker-compact {
+  grid-template-columns: repeat(auto-fill, minmax(196px, 1fr));
+  gap: 8px;
+  align-items: stretch;
+}
+.type-card.type-card-compact {
+  gap: 6px;
+  height: 100%;
+  padding: 10px 11px;
+  border-radius: 5px;
+}
+.type-card.type-card-compact:hover {
+  background: #f8fbff;
+  border-color: var(--primary);
+}
+.type-card.type-card-compact .type-card-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+.type-card.type-card-compact .type-card-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 5px;
+  background: var(--soft);
+  color: var(--primary);
+}
+.type-card.type-card-compact strong {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.type-card.type-card-compact .type-card-desc {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+  min-height: 34px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.55;
+}
+.type-card.type-card-compact .type-card-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: auto;
+}
+.type-card.type-card-compact .type-chip {
+  max-width: 100%;
+  overflow: hidden;
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--soft);
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 17px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.type-card.type-card-compact .type-chip-ready {
+  border-color: #cbe6d2;
+  background: #f1faf4;
+  color: #4c8c62;
+}
+
+/* ----- 表单分区 --------------------------------------------------------- */
+.drawer-form .form-block {
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+  padding: 13px 14px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--surface);
+}
+.drawer-form .form-block-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #4b6075;
+  font-size: 12px;
+  font-weight: 500;
+}
+.drawer-form .form-block-title svg {
+  color: var(--muted);
+}
+
+/* ----- 环境预设 --------------------------------------------------------- */
+.form-block .preset-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.form-block .preset-select {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+}
+.form-block .preset-hint {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.65;
+}
+.form-block .preset-note {
+  padding: 6px 9px;
+  border: 1px solid #dceafa;
+  border-left-width: 3px;
+  border-radius: 3px;
+  background: #f0f7ff;
+  color: #547da1;
+  font-size: 11px;
+  line-height: 1.65;
+}
+
+/* ----- 测试连接结果 ----------------------------------------------------- */
+.test-summary {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.test-summary .test-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 18px;
+  margin: 4px 0 0;
+}
+.test-summary .test-metric {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+.test-summary dt {
+  opacity: 0.75;
+  font-size: 10px;
+}
+.test-summary dd {
+  overflow: hidden;
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (max-width: 720px) {
+  .type-picker.type-picker-compact {
+    grid-template-columns: 1fr;
+  }
+  .form-block .preset-row {
+    flex-wrap: wrap;
+  }
+  .drawer-form .form-block {
+    padding: 11px 12px;
+  }
+}

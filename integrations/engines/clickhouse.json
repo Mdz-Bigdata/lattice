@@ -1,0 +1,8 @@
+{
+  "release": "v26.3.33.24-lts",
+  "url_template": "https://github.com/ClickHouse/ClickHouse/releases/download/{release}/clickhouse-{target}",
+  "sha256": {
+    "macos-aarch64": "c473042a4709a9ca375ced56c6a11fb20b2af3cc21df1de641a0e619e21b0b83"
+  },
+  "license": "Apache-2.0"
+}

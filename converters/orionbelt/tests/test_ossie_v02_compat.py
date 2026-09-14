@@ -20,7 +20,8 @@
 Covers the v2.6 spec bump from Ossie v0.1.1 → v0.2.0.dev0:
 
 - Emitted ``version`` is the v0.2 constant
-- Top-level ``dialects`` / ``vendors`` informational arrays are present
+- Optional root ``dialects`` / ``vendors`` arrays validate when supplied;
+  the converter emits dialect/vendor tags on individual entities
 - Dataset ``primary_key`` is promoted from per-column ``primaryKey: true``
 - Dataset ``unique_keys`` round-trips lossly via OBSL custom_extensions
 - Field ``label`` round-trips via OBSL custom_extensions
@@ -174,8 +175,8 @@ class TestEmittedVersion:
         assert ossie["version"].startswith("0.2")
 
     def test_no_root_dialects_or_vendors(self) -> None:
-        # The published Ossie core schema forbids root-level dialects/vendors
-        # (root is additionalProperties:false). See Ossie PR #148.
+        # Root advertisement arrays are optional in the core schema. This
+        # converter omits them and retains tags on expressions and extensions.
         ossie = conv.OBMLtoOssie(_OBML_WITH_PK_AND_LABEL).convert()
         assert "dialects" not in ossie
         assert "vendors" not in ossie
@@ -371,14 +372,65 @@ class TestSchemaValidation:
         errors = list(schema_validator.iter_errors(ossie))
         assert errors == [], [e.message for e in errors[:5]]
 
-    def test_schema_rejects_root_dialects_and_vendors(self, schema_validator: Any) -> None:
-        """Guard Ossie PR #148: root-level dialects/vendors are non-conformant."""
+    @pytest.mark.parametrize(
+        "metadata",
+        [
+            {"dialects": ["ANSI_SQL"]},
+            {"vendors": ["ORIONBELT"]},
+            {"dialects": ["ANSI_SQL"], "vendors": ["ORIONBELT"]},
+        ],
+    )
+    def test_schema_accepts_optional_root_metadata(
+        self, schema_validator: Any, metadata: dict[str, Any]
+    ) -> None:
+        """PR #297 added these optional properties to the canonical schema.
+
+        ``additionalProperties: false`` rejects only undeclared properties;
+        it does not prohibit these explicitly declared advertisement arrays.
+        """
         ossie = conv.OBMLtoOssie(_OBML_WITH_PK_AND_LABEL).convert()
-        ossie["dialects"] = ["ANSI_SQL"]
-        ossie["vendors"] = ["ORIONBELT"]
-        messages = [e.message for e in schema_validator.iter_errors(ossie)]
-        assert any("dialects" in m for m in messages), messages
-        assert any("vendors" in m for m in messages), messages
+        ossie.update(metadata)
+        errors = list(schema_validator.iter_errors(ossie))
+        assert errors == [], [e.message for e in errors]
+        assert conv.validate_ossie(ossie).valid
+
+    @pytest.mark.parametrize(
+        ("field", "value", "error_path", "constraint"),
+        [
+            ("dialects", "ANSI_SQL", ("dialects",), "type"),
+            ("dialects", ["UNKNOWN_SQL"], ("dialects", 0), "enum"),
+            ("vendors", "ORIONBELT", ("vendors",), "type"),
+            ("vendors", [42], ("vendors", 0), "type"),
+        ],
+    )
+    def test_schema_rejects_invalid_root_metadata(
+        self,
+        schema_validator: Any,
+        field: str,
+        value: Any,
+        error_path: tuple[str | int, ...],
+        constraint: str,
+    ) -> None:
+        """Optional metadata must still satisfy its array and item constraints."""
+        ossie = conv.OBMLtoOssie(_OBML_WITH_PK_AND_LABEL).convert()
+        ossie[field] = value
+        errors = list(schema_validator.iter_errors(ossie))
+        assert any(
+            tuple(error.absolute_path) == error_path and error.validator == constraint
+            for error in errors
+        ), [e.message for e in errors]
+
+    def test_schema_rejects_unknown_root_properties(self, schema_validator: Any) -> None:
+        """Declared optional arrays do not make the root open to arbitrary keys."""
+        ossie = conv.OBMLtoOssie(_OBML_WITH_PK_AND_LABEL).convert()
+        ossie["unknown_root_property"] = []
+        errors = list(schema_validator.iter_errors(ossie))
+        assert any(
+            not error.absolute_path
+            and error.validator == "additionalProperties"
+            and "unknown_root_property" in error.message
+            for error in errors
+        ), [e.message for e in errors]
 
 
 # ---------------------------------------------------------------------------

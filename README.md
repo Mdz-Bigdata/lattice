@@ -33,6 +33,25 @@ Apache Ossie provides a single JSON- and YAML-based specification that any tool 
 - [`validation/`](validation/) — Tooling for validating semantic models against the Ossie schema.
 - [`docs/`](docs/) — Project documentation and overview.
 
+## Local one-command setup
+
+Run `./start.sh` (or double-click `start.command` on macOS) to prepare all local
+Python environments, build the Go and Java tools, run tests, and start the local
+WebUI at **http://127.0.0.1:8787** with Apache Polaris 1.7.0, PostgreSQL, and MinIO.
+For daily use, run `./start-web.sh` (or double-click `start-web.command`);
+`./start-web.sh stop` stops the services while preserving their data.
+
+The Chinese WebUI includes sample-data charts, read-only SQL, Ossie model validation,
+model storage through Polaris Generic Tables, catalogs, identities, and an API
+workbench for every public operation in the pinned Polaris source specifications.
+The workbench identifies the five native semantic-model routes that upstream
+1.7.0 declares but leaves unimplemented. Query examples use local DuckDB data
+and explicit rules; external engines and LLM services require separate integration.
+The original `./ossie` validator and converters remain available.
+See [本地启动说明](docs/local-start.md) and
+[Polaris integration](integrations/polaris/README.md) for prerequisites, logs,
+upstream provenance, configuration, and supported scope.
+
 ## Get involved
 
 - **Contribute:** See [CONTRIBUTING.md](CONTRIBUTING.md) for how to propose specification changes, contribute code, and participate in the community.

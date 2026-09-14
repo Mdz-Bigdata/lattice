@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+set -euo pipefail
+
+ROOT="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+usage() {
+    cat <<'EOF'
+Lattice 本地工具（运行 Apache Ossie 校验器与转换器）
+
+首次运行：./start.sh
+用法：    ./lattice <命令> [参数...]
+
+命令：
+  validate <文件> [--schema <文件>]   验证 Apache Ossie YAML 模型
+  dbt | databricks | honeydew        运行对应转换器
+  nvidia | omni | orionbelt          运行对应转换器
+  sigma | snowflake | wisdom         运行对应转换器
+  ontology <Palantir ZIP 或目录>     输出 Apache Ossie YAML 到标准输出
+  salesforce toSF|toOssie <文件>     运行 Salesforce Java 转换器
+  polaris import|export [参数...]    运行 Polaris Java 转换器
+  python <core|转换器名> [参数...]    使用指定环境的 Python（含 gooddata）
+  --help                            显示本帮助，无需安装依赖
+
+示例：
+  ./lattice validate examples/tpcds_semantic_model.yaml
+  ./lattice dbt --help
+  ./lattice python gooddata -c 'import ossie_gooddata; print(ossie_gooddata.__file__)'
+
+输入和输出的相对路径均相对于当前工作目录。
+这是命令行工具集合；没有需要常驻启动的网页或后台服务。
+详细说明：docs/local-start.md
+EOF
+}
+
+missing_runtime() {
+    printf '运行环境尚未就绪：%s\n请先执行："%s/start.sh"\n' "$1" "$ROOT" >&2
+    exit 1
+}
+
+python_for() {
+    local project="$1"
+    local python="$ROOT/.runtime/envs/$project/bin/python"
+    [[ -x "$python" ]] || missing_runtime "$project 的 Python 环境"
+    printf '%s\n' "$python"
+}
+
+prepare_java() {
+    [[ -f "$ROOT/scripts/java-env.sh" ]] || missing_runtime 'Java 环境脚本'
+    # shellcheck source=scripts/java-env.sh
+    source "$ROOT/scripts/java-env.sh"
+    setup_java "$ROOT/.runtime" >&2
+    [[ -n "${JAVA_HOME:-}" && -x "$JAVA_HOME/bin/java" ]] || missing_runtime 'Java 21+'
+}
+
+command="${1:---help}"
+if [[ $# -gt 0 ]]; then
+    shift
+fi
+
+case "$command" in
+    --help|-h|help)
+        usage
+        ;;
+    validate)
+        python="$(python_for core)"
+        exec "$python" "$ROOT/validation/validate.py" "$@"
+        ;;
+    dbt|databricks|honeydew|nvidia|omni|orionbelt|sigma|snowflake|wisdom)
+        entrypoint="ossie-$command"
+        [[ "$command" != nvidia ]] || entrypoint=ossie-nvidia-gsf
+        executable="$ROOT/.runtime/envs/$command/bin/$entrypoint"
+        [[ -x "$executable" ]] || missing_runtime "$command 转换器"
+        exec "$executable" "$@"
+        ;;
+    ontology)
+        python="$(python_for ontology)"
+        exec "$python" "$ROOT/converters/ontology/scripts/palantir_to_ossie.py" "$@"
+        ;;
+    salesforce|polaris)
+        shopt -s nullglob
+        jars=("$ROOT/converters/$command/target/ossie-$command-converter-"*.jar)
+        [[ ${#jars[@]} -eq 1 ]] || missing_runtime "$command 的唯一可执行 JAR"
+        if [[ "$command" == polaris ]]; then
+            dependencies=("$ROOT/converters/polaris/target/dependency/"*.jar)
+            [[ ${#dependencies[@]} -gt 0 ]] || missing_runtime 'Polaris Java 依赖'
+        fi
+        prepare_java
+        if [[ "$command" == salesforce ]]; then
+            exec "$JAVA_HOME/bin/java" -jar "${jars[0]}" "$@"
+        fi
+        exec "$JAVA_HOME/bin/java" -cp "${jars[0]}:$ROOT/converters/polaris/target/dependency/*" \
+            org.apache.ossie.converter.polaris.OssiePolarisConverter "$@"
+        ;;
+    python)
+        project="${1:-}"
+        case "$project" in
+            core|dbt|databricks|gooddata|honeydew|nvidia|omni|ontology|orionbelt|sigma|snowflake|wisdom)
+                shift
+                python="$(python_for "$project")"
+                exec "$python" "$@"
+                ;;
+            *)
+                printf '请指定有效的 Python 环境：core 或转换器名（含 gooddata）。\n' >&2
+                exit 2
+                ;;
+        esac
+        ;;
+    *)
+        printf '未知命令：%s\n运行 ./lattice --help 查看用法。\n' "$command" >&2
+        exit 2
+        ;;
+esac

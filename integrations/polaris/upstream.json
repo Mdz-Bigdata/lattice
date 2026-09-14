@@ -1,0 +1,11 @@
+{
+  "name": "Apache Polaris",
+  "version": "1.7.0",
+  "repository": "https://github.com/apache/polaris.git",
+  "tag": "apache-polaris-1.7.0",
+  "commit": "4ac2f059d1cce149453d0a5f1ff1dff980ec97cc",
+  "binary_url": "https://github.com/apache/polaris/releases/download/apache-polaris-1.7.0/polaris-bin-1.7.0.tgz",
+  "sha512": "6b89fba39bbbadd7dbba16c7e6ffe2e22dde6d0a58d3394874c747edbf1630c1755a470481c7c567e99d331bd738d11c68231a81615c638c437938f479d978a4",
+  "license": "Apache-2.0",
+  "release_url": "https://github.com/apache/polaris/releases/tag/apache-polaris-1.7.0"
+}

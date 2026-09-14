@@ -1,0 +1,29 @@
+{
+  "comment": "Pinned official container images for the local demo engines that have no native macOS build. Digests are verified before a container is created; see scripts/lattice_docker_engines.py.",
+  "images": {
+    "starrocks": {
+      "image": "starrocks/allin1-ubuntu:3.4-latest",
+      "digest": null,
+      "license": "Apache-2.0",
+      "project": "StarRocks"
+    },
+    "doris-fe": {
+      "image": "apache/doris:fe-2.1.10",
+      "digest": null,
+      "license": "Apache-2.0",
+      "project": "Apache Doris"
+    },
+    "doris-be": {
+      "image": "apache/doris:be-2.1.10",
+      "digest": null,
+      "license": "Apache-2.0",
+      "project": "Apache Doris"
+    },
+    "hive": {
+      "image": "apache/hive:4.0.1",
+      "digest": "sha256:5194161ef50b80875f937dff04936df047cbe894e9727ab8f0606349345b1bd3",
+      "license": "Apache-2.0",
+      "project": "Apache Hive"
+    }
+  }
+}

@@ -30,3 +30,12 @@
 cli/dist/
 cli/ossie
 cli/.tool-versions
+
+# Local launcher environments, logs, and downloaded vendor schema
+/.runtime/
+**/.hypothesis/
+/converters/salesforce/src/main/resources/schemas/salesforce-semantic-model-schema.json
+
+# Local WebUI build dependencies
+/web/node_modules/
+/web/*.tsbuildinfo

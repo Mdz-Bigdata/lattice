@@ -1,0 +1,164 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Model settings drawer and the header badge that opens it (QueryPage).
+   Only the llm-* classes are defined here; panel / field / drawer / banner
+   classes live in styles.css. */
+
+/* ----- header badge ---------------------------------------------------- */
+/* The element also carries .model-badge; the tag makes these rules win
+   regardless of the order the two stylesheets end up in the bundle. */
+.query-status button.llm-model-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 320px;
+  padding: 3px 8px;
+  border: 1px solid #e2eaf6;
+  border-radius: 3px;
+  background: #f4f7fd;
+  color: #6a7f9c;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+.query-status button.llm-model-button:hover {
+  border-color: #cfe0f7;
+  background: #eaf2fe;
+  color: #3d6e9f;
+}
+.query-status button.llm-model-button.llm-model-off {
+  border-color: #f1e6cf;
+  background: #fdf8ed;
+  color: #977f4f;
+}
+.query-status button.llm-model-button.llm-model-off:hover {
+  border-color: #e9d8b4;
+  background: #fbf2df;
+  color: #7d6737;
+}
+.query-status button.llm-model-button svg {
+  flex-shrink: 0;
+  opacity: 0.85;
+}
+.llm-model-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ----- drawer ---------------------------------------------------------- */
+.llm-settings {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.llm-status-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+  padding: 13px 15px;
+  margin-bottom: 17px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--soft);
+}
+.llm-status-card > div {
+  min-width: 0;
+}
+.llm-status-card strong {
+  display: block;
+  margin-bottom: 5px;
+  font-size: 13px;
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+.llm-status-card p {
+  font-size: 11px;
+  line-height: 1.75;
+  color: var(--muted);
+}
+.llm-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 15px 16px;
+}
+/* Layout of the fields inside this drawer only; .field itself is shared. */
+.llm-grid .field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.llm-grid .field > label {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 12px;
+  color: #6f7a88;
+}
+.llm-grid .field > label b {
+  color: #d0645d;
+  font-weight: 500;
+}
+.llm-span {
+  grid-column: 1 / -1;
+}
+.llm-note {
+  display: block;
+  font-size: 11px;
+  line-height: 1.7;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.llm-hint {
+  margin: 15px 0 0;
+  padding: 10px 12px;
+  border: 1px solid #e2edfb;
+  border-radius: 3px;
+  background: #f5f9ff;
+  color: #6c88a6;
+  font-size: 11px;
+  line-height: 1.75;
+}
+.llm-banners {
+  margin-top: 17px;
+}
+.llm-banners > :last-child {
+  margin-bottom: 0;
+}
+.llm-result strong {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.llm-result p {
+  font-size: 11px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+.llm-footer {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.llm-footer .muted {
+  flex: 1;
+  min-width: 150px;
+  line-height: 1.6;
+  text-align: right;
+}
+
+/* Row under the 模型 select: the loader button and what the provider reported. */
+.llm-model-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+}
+.llm-model-actions .muted {
+  font-size: 12px;
+  line-height: 1.5;
+  flex: 1 1 180px;
+  min-width: 0;
+}
