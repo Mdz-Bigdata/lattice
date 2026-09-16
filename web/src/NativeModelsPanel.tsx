@@ -8,7 +8,7 @@ import {
   Server,
   Trash2,
 } from "lucide-react";
-import { request, errorMessage } from "./api";
+import { request, errorMessage, type ConsoleContext } from "./api";
 import { Empty, ErrorBanner, Loading } from "./components";
 
 interface NativeModel {
@@ -53,7 +53,7 @@ interface Props {
   draftName: string;
   editorBusy: boolean;
   onLoad: (yaml: string, name: string) => boolean;
-  explore: (search: string) => void;
+  explore: (search: string, context?: ConsoleContext) => void;
 }
 
 /**
@@ -92,6 +92,48 @@ export default function NativeModelsPanel({
     if (!touched) setModelName(nativeName(draftName));
   }, [draftName, touched]);
   const location = `${target.catalog}.${target.namespace.replace(/\u001f/g, ".")}`;
+  /** The first name at this target that no model holds yet.
+   *  createSemanticModel's example carries one fixed name, so it answers 409
+   *  AlreadyExists from the moment a model of that name exists - including the
+   *  moment right after the example itself was run once. */
+  function freeName() {
+    const base = NAME_PATTERN.test(modelName.trim())
+      ? modelName.trim()
+      : "semantic_model";
+    const taken = new Set(items.map((item) => item.name));
+    if (!taken.has(base)) return base;
+    for (let suffix = 2; suffix <= items.length + 2; suffix += 1)
+      if (!taken.has(`${base}_${suffix}`)) return `${base}_${suffix}`;
+    return base;
+  }
+
+  /** Open the console on this panel's own target instead of placeholder values.
+   *  The console sends path parameters verbatim, and both the gateway and the
+   *  Polaris client read %1F as the Iceberg namespace separator. A spec example
+   *  can only hold fixed values, so the two that no real call can use - the
+   *  sample entity-version and the already-taken model name - are replaced by
+   *  what this panel knows about the target. */
+  function openConsole() {
+    const name = modelName.trim();
+    const path: Record<string, string> = {
+      prefix: target.catalog,
+      namespace: target.namespace.replace(/\u001f/g, "%1F"),
+    };
+    if (name) path["semantic-model-name"] = name;
+    const known =
+      loadedVersion?.name === name
+        ? loadedVersion.version
+        : items.find((item) => item.name === name)?.entity_version;
+    explore("semantic", {
+      path,
+      body: {
+        createSemanticModel: { name: freeName() },
+        ...(known
+          ? { updateSemanticModel: { "entity-version": known } }
+          : {}),
+      },
+    });
+  }
 
   async function refresh(next = target) {
     const requestId = ++listRequest.current;
@@ -228,7 +270,7 @@ export default function NativeModelsPanel({
           <span className="source-badge">Lattice 网关实现 · 5/5 接口可用</span>
           <button
             className="text-button"
-            onClick={() => explore("semantic")}
+            onClick={openConsole}
             disabled={disabled}
           >
             在 API 控制台查看 <ArrowRight size={13} />

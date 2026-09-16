@@ -63,7 +63,7 @@ macOS 日常使用可双击 `start-web.command`。`stop` 停止本项目的 WebU
 | 健康检查 | `127.0.0.1:8182/q/health` | Polaris readiness / liveness |
 | 独立 PostgreSQL | `127.0.0.1:55432` | `.runtime/polaris/postgres/` |
 | MinIO S3 | `127.0.0.1:19000` | `.runtime/polaris/object-store/` |
-| PostgreSQL（业务库） | `127.0.0.1:5432/blog_converter` | 本机已有的库，质量元数据在 `lattice_quality` 模式 |
+| PostgreSQL（业务库） | `127.0.0.1:5432/blog_converter` | 本机已有的库，质量元数据在 `lattice_quality` 模式，七张示例表在 `public` 模式 |
 | MySQL | `127.0.0.1:33306` | `.runtime/engines/mysql/` |
 | ClickHouse | `127.0.0.1:18123`（HTTP）/ `19009` | `.runtime/engines/clickhouse/` |
 | StarRocks | `127.0.0.1:19030`（MySQL 协议）/ `18030` | Docker 卷 `lattice-starrocks-*` |
@@ -90,9 +90,11 @@ Polaris 服务凭据位于 `.runtime/polaris/credentials.json`，MinIO 凭据位
 
 ## 本地示例引擎与数据源
 
-WebUI 的数据源页面支持九种类型：DuckDB、MySQL、PostgreSQL、ClickHouse、StarRocks、Apache Doris、Apache Hive、Apache Iceberg 和 Apache Paimon。每种类型都可以在页面中新增连接、测试连通性、浏览库表字段、预览数据并执行只读 SQL。
+WebUI 的数据源页面支持十四种类型：DuckDB、MySQL、PostgreSQL、ClickHouse、StarRocks、Apache Doris、Apache Hive、Apache Iceberg、Apache Paimon、Oracle、SQL Server、MongoDB、Elasticsearch 和 Apache Kafka。每种类型都可以在页面中新增连接、测试连通性、浏览库表字段、预览数据并执行只读 SQL。
 
-项目同时提供九个开箱即用的本地实例，写入同样的六张示例表 `t_lattice_orders`、`t_lattice_order_items`、`t_lattice_customers`、`t_lattice_products`、`t_lattice_sellers`、`t_lattice_payments`（`lattice_demo` 库，共 3390 行），因此同一条 SQL 在九个数据源上返回一致结果：
+Oracle（python-oracledb thin 模式）与 SQL Server（pymssql）是普通的 SQL 数据源，分别以 `FETCH FIRST` 和 `TOP` 限制返回行数，质量核查按各自方言生成语句（SQL Server 不支持正则核查）。MongoDB、Elasticsearch 与 Kafka 没有 SQL：连接器把集合 / 索引 / 主题当作表，把抽样文档或最近的消息（JSON 展开为字段，嵌套一层用点号命名）读入内存 DuckDB 后执行 SQL，每张表最多读取“快照行数”条记录，因此聚合结果是快照上的结果；这三类在质量核查中会标注扫描不完整。驱动 `oracledb`、`pymssql`、`pymongo`、`kafka-python` 已列入 `scripts/pyproject.toml`，缺失时数据源测试会给出安装提示。
+
+项目同时提供九个开箱即用的本地实例，写入同样的七张示例表 `t_lattice_orders`、`t_lattice_order_items`、`t_lattice_customers`、`t_lattice_products`、`t_lattice_sellers`、`t_lattice_payments`，以及供 Apache Ossie 示例模型使用的 TPC-DS 风格 `store_sales`（`lattice_demo` 库，共 4490 行），因此同一条 SQL 在九个数据源上返回一致结果：
 
 ```bash
 ./start.sh                  # 首次：准备全部组件并启动九个数据源（含镜像下载）
@@ -104,7 +106,7 @@ WebUI 的数据源页面支持九种类型：DuckDB、MySQL、PostgreSQL、Click
 | 引擎 | 运行方式 | 说明 |
 | --- | --- | --- |
 | DuckDB | 项目文件 | 启动时生成的 `.runtime/webui/sample.duckdb` |
-| PostgreSQL | 本机业务库 | `localhost:5432/blog_converter`，数据质量模块的元数据也在其中 |
+| PostgreSQL | 本机业务库 | `localhost:5432/blog_converter`，数据质量模块的元数据也在其中；启动时把七张示例表写入其 `public` 模式（只新建缺失的表） |
 | MySQL | 本机 `mysqld` | 需要已安装 MySQL（`brew install mysql`），数据目录在项目内 |
 | ClickHouse | 官方二进制 | 按 `integrations/engines/clickhouse.json` 固定版本与校验和下载 |
 | Iceberg | Apache Polaris | 通过本项目的 Polaris REST Catalog 读写 `lattice.demo` |
@@ -138,17 +140,102 @@ DataVines 把正则、长度、区间归入 COMPLETENESS，把跨表核查归入
 
 ### 元数据存储
 
-规则、调度、执行日志和核查结果保存在本机业务库 `blog_converter` 的 `lattice_quality` 模式中，表结构对应 DataVines 的 `dv_rule`、`dv_job_schedule`、`dv_job_execution` 和 `dv_job_execution_result`。该模式由服务启动时自动创建，只新增对象，不读取也不修改库中原有的业务表。连接串默认取自 `LATTICE_QUALITY_DSN`，未设置时使用 `postgresql://postgres:postgres@localhost:5432/blog_converter`；SQLAlchemy 风格的 `+asyncpg` 等驱动后缀会被自动去掉，后端使用 psycopg 3 同步连接。
+规则、调度、执行日志和核查结果保存在本机业务库 `blog_converter` 的 `lattice_quality` 模式中，表结构对应 DataVines 的 `dv_rule`、`dv_job_schedule`、`dv_job_execution` 和 `dv_job_execution_result`，另有记录每次任务尝试的 `dv_task_run`。已有的 `dv_job_schedule` 会在启动时以 `ADD COLUMN IF NOT EXISTS` 补上重试与补跑相关的列。该模式由服务启动时自动创建，只新增对象，不读取也不修改库中原有的业务表。连接串默认取自 `LATTICE_QUALITY_DSN`，未设置时使用 `postgresql://postgres:postgres@localhost:5432/blog_converter`；SQLAlchemy 风格的 `+asyncpg` 等驱动后缀会被自动去掉，后端使用 psycopg 3 同步连接。
 
 平台的运行时标识符统一使用 `lattice` 前缀：质量元数据模式 `lattice_quality`、示例库 `lattice_demo`、Polaris 元数据库与角色 `lattice_polaris`、示例表 `t_lattice_*`、Polaris 目录 `lattice`（realm `LATTICE`）与存储桶 `lattice-warehouse`、Docker 标签 `lattice.project`、网络 `lattice-engines` 以及 `lattice-` 开头的容器和卷名。这些对象都由启动脚本创建和写入，重建运行时即可重新生成。
 
 同一个库同时注册为内置数据源「业务库 PostgreSQL（数据质量）」，因此规则可以直接核查其中的真实业务表。元数据库不可用时，Lattice 其余功能照常启动，质量页面会显示明确的中文提示。
 
+### 自定义 SQL、跨库比对、模板与批量下发
+
+除九种内置核查外，规则可以选择两种由自己生成全部语句的核查类型：
+
+- **自定义 SQL**（分类“自定义校验”）：填写一条只读 SELECT，可用 `${table}`、`${column}`、`${schema}` 占位符引用规则目标；“返回的每一行都是不合规记录”模式把语句结果计数作为不合规数，“返回的单个数值作为实际值”模式直接用语句返回的数值（请给该列取别名 `actual_value`）。语句不允许注释、分号或多条语句，并经过与 SQL 工作台相同的只读校验。
+- **跨库比对**（分类“一致性校验”）：在两个数据源上分别计算行数、求和、平均、最小或最大值，差异作为不合规数量，参照值作为核查数量，因此“百分比”计算方式得到的就是相对差异。参照侧的 SQL 按参照数据源自己的方言生成。
+
+**规则模板**保存不带目标表的规则定义，首次启动时写入 10 个内置模板（`dv_rule_template`），也可以从任意规则“存为模板”。**批量下发**把一个模板应用到一个数据源下勾选的多张表（字段级核查对所有表使用同一字段名），每个目标单独校验、单独失败，接口为 `POST /api/quality/rules/batch`。
+
 ### 规则执行与调度
 
-手动执行在请求内同步完成，受连接器的查询超时限制。调度由服务内的一个后台线程驱动，cron 支持界面所示的 Quartz 6 位写法（秒在最前，`?` 等同 `*`，如 `0 0 12 * * ?`），也支持 5 位 Unix 写法。错过的触发不会补跑，同一任务不会并发触发；cron 无效的任务会被停止并记录原因，不会影响其他任务。目前可调度的只有内置的 `QualityTask.run`。
+手动执行在请求内同步完成，受连接器的查询超时限制。调度由服务内的一个后台线程驱动，cron 支持界面所示的 Quartz 6 位写法（秒在最前，`?` 等同 `*`，如 `0 0 12 * * ?`），也支持 5 位 Unix 写法。同一任务不会并发触发；cron 无效的任务会被停止并记录原因，不会影响其他任务。
+
+调度器按任务名称分发：`webapi/tasks.py` 里的注册表在服务启动时登记 `QualityTask.run`（质量核查全量执行）、`MetadataTask.ingest`（元数据拾取，参数为服务 FQN，留空则拾取到期服务）、`MetadataTask.snapshot`（洞察快照，参数可为日期）与 `MetadataTask.syncViews`（视图血缘同步）。新增的后台任务只需调用 `registry.add(bean, method, label, callable)` 登记，无需再开线程。每个调度可设置**失败重试次数**（0–10）与**重试间隔**（秒），以及**错过触发时**的策略：`skip` 从现在重新计算下一次（默认）、`once` 立即补跑一次、`all` 按错过的每个时间点逐次补跑（受**补跑上限**限制）。手动“执行”不会自动重试，失败直接返回错误。每一次尝试都写入 `dv_task_run`，在“执行记录”抽屉里可按调度与状态查看；相关接口为 `GET /api/quality/tasks`、`GET /api/quality/task-runs`。
 
 所有核查 SQL 都经过与 SQL 工作台相同的只读校验，标识符按方言引用，正则、枚举、数值等字面量单独校验后才拼入 SQL；含分号、控制字符或子查询的输入会被拒绝。错误数据只做只读抽样展示，不写回任何数据源。Iceberg 与 Paimon 通过 DuckDB 读取，单表最多扫描 50 万行，页面会对这两类数据源标注统计可能不完整。
+
+## AI 增强
+
+三项辅助能力都先按规则工作，配置模型后再由模型补充，且都不会自行写入，结果交给人确认：
+
+- **规则推荐**（数据质量 → 核查规则 → “AI 推荐规则”）：读取所选表的字段与目录里已有的字段含义、标签，按主键 / 外键 / 金额 / 邮箱 / 手机号 / 时间字段等命名与类型约定给出核查规则，模型可再补充；每条建议都用与保存规则相同的校验代码预检，勾选后一键创建。
+- **语义模型草稿**（语义模型 → “AI 生成草稿”）：把勾选的表生成 Ossie 语义模型：字段类型映射、时间维度标记、按主键 / 同名外键推断 relationships、按度量字段与主键生成指标；模型可补充描述、同义词与更有业务含义的指标（只保留引用了真实数据集与字段的结果）；草稿经 Ossie 校验器检查后可载入编辑器。
+- **根因分析**（元数据管理 → 数据血缘 → 影响分析旁）：沿上游血缘最多三层收集信号——质量核查未通过、表结构变更（删字段、改类型）、资产下线、拾取失败、近期修改——按信号强度与距离打分排序并给出结论；配置模型时由模型撰写分析文字，否则用模板生成。
+
+接口：`GET /api/ai/status`、`POST /api/ai/quality-rules/suggest|apply`、`POST /api/ai/semantic-model/suggest`、`POST /api/ai/root-cause`。
+
+## 语义层查询引擎与指标平台
+
+语义模型不再只是被校验和存储：`webapi/semantic_query.py` 把 Ossie 模型直接变成可查询的语义层。
+
+- **指标目录**：指标定义只来自语义模型（内置演示模型、Lattice 模型存储与 Polaris 原生语义模型三处都会读取），“指标平台”页列出每个指标的名称、含义、同义词、计算表达式、所属数据集与模型，可按关键词搜索；模型保存或发布后 60 秒内自动刷新，也可手动“重新读取模型”。
+- **指标查询**：选择模型、指标、维度（`数据集.字段`，时间字段可按日 / 周 / 月 / 季 / 年）与筛选条件（维度字段作 WHERE，指标作 HAVING），引擎解析指标与字段表达式、按 relationships 以 LEFT JOIN 关联所需数据集（以指标所在的数据集为根），生成目标引擎方言的聚合 SQL，经与其他查询相同的只读校验、结果缓存、历史与使用率记录执行，结果用现有的图表组件展示，也可以“只看 SQL”。数据集的 `source` 按 `库.表` 解析，也可以是一段 SELECT；`main`、`public`、`default` 这三个“默认库”写法会换成所选数据源自己的默认库（本地引擎上是 `lattice_demo`，本地示例数据上直接省略），只有在该方言里它本来就是真实模式时才原样保留（PostgreSQL 的 `public`、ClickHouse 的 `default`），因此按 Ossie 示例写成 `public.store_sales` 的模型在九个数据源上都能执行。指标表达式里未在 `fields` 中声明的裸列名，会在数据集唯一（模型只有一个数据集，或表达式只点名了一个数据集）时按该数据集的物理列处理，手写的 `SUM(ss_ext_sales_price)` 无需先补字段定义。
+- **消费**：`POST /api/metrics/query`、`/api/metrics/compile`、`GET /api/metrics/catalog|models|model` 供程序调用；MCP 上下文层新增 `list_metrics` 与 `query_metric` 两个工具，智能体按同一口径取数。
+
+内置演示模型补充了六个数据集之间的关系与 `total_sales`、`order_count`、`item_count`、`avg_order_value`、`total_payment`、`customer_count` 六个指标，可在本地示例数据上直接计算。示例数据还带有一张 TPC-DS 风格的 `store_sales`（`ss_sold_date_sk`、`ss_item_sk`、`ss_customer_sk`、`ss_store_sk`、`ss_ticket_number`、`ss_quantity`、`ss_sales_price`、`ss_ext_sales_price`、`ss_net_paid`，由订单明细派生，`SUM(ss_ext_sales_price)` 与 `total_sales` 相等），Apache Ossie 规范中的 `store_sales` 示例模型无需改动即可在全部九个数据源上算出同一结果。
+
+## 可观测性
+
+服务内置进程内的可观测能力，不依赖外部组件：
+
+- **结构化日志**：每个 API 请求在服务标准输出写一行日志（默认单行文本；`LATTICE_LOG_JSON=1` 时为 JSON），字段包含追踪 ID、路由模板（如 `/api/datasources/{source_id}/query`，不是具体 ID）、状态码、耗时、用户与内部步骤数，从不记录查询语句；启动、就绪、关闭以及各模块的关键事件也会写入。级别由 `LATTICE_LOG_LEVEL` 决定，运行时可在“运行观测”页切换。
+- **指标**：按路由模板统计请求次数、按状态码的分布与耗时直方图（p95、最大值），内部步骤（引擎查询、模型调用、核查语句）单独计时；`GET /api/observability/metrics` 以 Prometheus 文本格式导出，可直接被抓取。
+- **链路追踪**：每个请求返回 `X-Lattice-Trace-Id`，服务保留最近 200 个请求的追踪，包含各步骤的耗时、属性与错误；`GET /api/observability/traces` 支持按路由、耗时、状态码筛选，`/traces/{id}` 查看单条。
+- **运行观测页**：请求量与错误率、内存与线程、各组件健康（质量元数据库、元数据目录、调度器、拾取调度、查询缓存、Polaris、模型）、最慢路由、最近的错误与慢请求、日志事件计数与级别切换，以及可点开查看步骤的追踪列表。
+
+## 多用户与鉴权
+
+平台默认仍按单人本机使用运行：不设置 `LATTICE_AUTH` 时没有登录页，所有请求以“本机管理员”身份执行，“用户与权限”页面只显示说明。设置 `LATTICE_AUTH=1` 后重启，首次打开页面会引导创建第一个管理员；之后所有 `/api/*` 接口（健康检查与登录接口除外）都需要登录会话（HttpOnly Cookie，默认 12 小时，使用时顺延）或 `Authorization: Bearer <令牌>`。
+
+角色决定接口权限：**管理员**可以做一切并管理用户；**编辑者**除用户管理外都可以；**只读**只能发 GET 请求与只读查询（智能问数、SQL 工作台、表预览、元数据搜索与助手），不能使用 MCP 写工具。每个用户还可以单独设置**可见页面**，它只影响左侧导航，权限边界始终是角色。管理员可以停用、删除用户或重置密码；停用、改角色、重置密码都会让该用户现有的登录会话失效；至少要保留一个可用的管理员。同一账号连续 5 次输错密码后会被暂时锁定 5 分钟。
+
+MCP 客户端和脚本使用 **API 令牌**：管理员或编辑者在“用户与权限”里创建（只显示一次，默认 90 天），例如
+
+```bash
+claude mcp add --transport http lattice-metadata http://127.0.0.1:8787/api/metadata/mcp --header "Authorization: Bearer <令牌>"
+```
+
+账号与会话保存在 `LATTICE_AUTH_DB`（默认 `.runtime/webui/auth.sqlite`），密码以 scrypt 加盐哈希存储，会话与令牌只保存哈希；登录后对元数据的修改会记录为该用户。相关接口在 `/api/auth/*`。
+
+## 查询结果缓存
+
+智能问数、SQL 工作台与报表执行的只读查询，其结果会按“数据源 + 语句（忽略字面量外的空白）+ 行数上限”缓存在服务内存中，由 `webapi/query_cache.py` 实现。失效策略有三类：**到期**（默认 600 秒，可用 `LATTICE_QUERY_CACHE_TTL` 或在 SQL 工作台的“查询缓存”面板修改）、**容量**（默认最多 500 条，超出按最近最少使用淘汰；单条结果超过 5000 行不缓存）与**定向失效**（数据源配置更新或删除时清空该数据源；`POST /api/query/cache/invalidate` 可按数据源、按表名或按条目清理；调度任务 `QueryCacheTask.sweep` 清理过期条目，`QueryCacheTask.clear` 清空）。任何查询请求都可带 `refresh: true` 跳过缓存重新执行，结果里的 `cached` 与 `cache_age_seconds` 说明它是否来自缓存以及有多旧；界面在结果标题旁显示“缓存 · N 秒前”并提供“刷新”。`LATTICE_QUERY_CACHE=0` 可整体关闭。缓存本身不落盘，重启即清空；只有开关与有效期设置保存在 `.runtime/webui/query-cache.json`。
+
+## 元数据管理
+
+「元数据管理」页面参照 OpenMetadata 实现元数据目录、数据血缘与 AI 上下文层（OpenMetadata 的数据质量部分不在其中，平台使用上文的数据质量模块）。
+
+### 存储与启动
+
+目录保存在业务库 `blog_converter` 的 `lattice_metadata` 模式中，服务启动时自动创建，只新增对象。连接串取自 `LATTICE_METADATA_DSN`，未设置时沿用 `LATTICE_QUALITY_DSN` 或默认的本机业务库；PostgreSQL 不可达时自动改用 `.runtime/webui/metadata.sqlite`，页面左下角会显示当前使用的存储。
+
+首次启动后，后台线程会为每个平台数据源和本地 Polaris 登记一个数据库服务，并立即拾取一次库、模式、表、字段、视图定义与血缘，此后默认每天拾取一次。拾取计划可在「元数据拾取 → 服务」中修改；设置 `LATTICE_METADATA_SCHEDULER=0` 可关闭这个线程。在页面上删除的服务不会被自动重新登记，点击「同步平台数据源」可以恢复。
+
+### 血缘来源
+
+- SQL 解析：`INSERT … SELECT`、`CREATE TABLE … AS`、`CREATE VIEW`、`MERGE` 识别写入目标，纯 `SELECT` 需要在页面指定目标；列投影生成字段级映射。
+- 视图：拾取时读取 DuckDB、PostgreSQL、MySQL、StarRocks、Doris、ClickHouse 的视图定义并解析。
+- Polaris 通用表：通过「数据接入」登记的表会连到其来源表；语义模型的数据集会连到其来源表。
+- 手工登记与导入：血缘图上添加上下游，或导入 OpenMetadata 的 `lineage` 数组。
+
+### MCP 服务
+
+端点为 `http://127.0.0.1:8787/api/metadata/mcp`（Streamable HTTP）。Claude Code 接入：
+
+```bash
+claude mcp add --transport http lattice-metadata http://127.0.0.1:8787/api/metadata/mcp
+```
+
+「AI 上下文 → MCP 服务」页面列出全部工具、资源、提示模板以及 Claude Desktop、Cursor 的配置片段；「工具调试」可以直接调用每个工具。服务只接受本机地址，拒绝跨来源请求；写操作以用户 `mcp-agent` 的身份执行并记录到活动信息流，`query_datasource` 使用与 SQL 工作台相同的只读校验。
 
 ## Lattice WebUI 功能
 
@@ -173,9 +260,9 @@ DataVines 把正则、长度、区间归入 COMPLETENESS，把跨表核查归入
 访问外网服务商时会使用环境中的 `HTTPS_PROXY`／`HTTP_PROXY`，与 Anthropic 官方 SDK 的行为一致；`NO_PROXY` 保证 Ollama、vLLM 等本机服务仍走直连。若这两个变量未设置而服务商需要经代理访问，读取模型列表和提问都会失败，并在界面上说明是网络不可达而非密钥问题。
 - **数据源**：卡片式列表，新增、编辑、测试和删除九种类型的连接，浏览库表与字段，预览数据。新增时可从「环境预设」下拉列表套用本机已有数据源的连接参数（机密留空由用户填写），保存前即可测试连接；密码等机密只保存在本机，接口一律返回掩码。每张卡片都可以删除：自建数据源会连同配置一起删除，内置数据源只从列表中隐藏（它由本机运行的引擎自动登记，每次启动都会重新生成），用页面右上角的「恢复内置数据源」可以全部找回。
 
-各页面的数据源下拉框以引擎名称作为选项（DuckDB、ClickHouse、Apache Paimon…）；只有多个数据源使用同一引擎时才追加区分信息——优先用所连数据库名，两者连的是同一个库时才回退到数据源名称。PostgreSQL 只登记一个数据源，指向本机业务库 `blog_converter`；项目 PostgreSQL 集群里的 `lattice_demo` 示例库仍由引擎管理脚本创建和写入，只是不再单独列为数据源。
+各页面的数据源下拉框以引擎名称作为选项（DuckDB、ClickHouse、Apache Paimon…）；只有多个数据源使用同一引擎时才追加区分信息——优先用所连数据库名，两者连的是同一个库时才回退到数据源名称。PostgreSQL 只登记一个数据源，指向本机业务库 `blog_converter`；项目 PostgreSQL 集群里的 `lattice_demo` 示例库仍由引擎管理脚本创建和写入，只是不再单独列为数据源。为了让语义模型与指标在这个数据源上也能计算，启动时同样把七张示例表写入业务库的 `public` 模式：只新建缺失的表，已有的表（哪怕行数不同）一律不改动，业务库不可达时跳过并提示。
 
-内置规则问数依赖六张示例表。所选数据源没有这些表时（例如业务库 PostgreSQL），页面会直接说明缺少哪张表并建议配置模型或改用 SQL 工作台，而不是把引擎的 SQL 报错抛给用户。
+内置规则问数依赖六张业务示例表。所选数据源没有这些表时（例如自建的业务数据源），页面会直接说明缺少哪张表并建议配置模型或改用 SQL 工作台，而不是把引擎的 SQL 报错抛给用户。
 - **数据质量**：核查规则、调度任务、质量报告、统计分析与执行日志五个页签，规则在真实数据源上以只读方式执行，详见下一节。
 - **数据接入**：把任意数据源中的表注册为 Polaris Generic Table，使其在 Catalog 中可见，并可随时取消注册。
 - **SQL 工作台**：对选定数据源执行只读 SELECT / WITH，展示实际结果；限制外部访问、查询时间及返回行数，截断时显示提示。
@@ -188,7 +275,7 @@ Apache Polaris 1.7.0 自身实现了其中 73 个接口。其余 5 个原生语�
 
 - 请求体与响应体、错误类型和状态码与源规范一致；
 - 目标命名空间必须在真实 Polaris 中存在，否则返回 404；
-- 文档按仓库内的 Apache Ossie JSON Schema（`core-spec/ossie-schema.json`）校验，未通过返回 400；
+- 文档按仓库内的 Apache Ossie JSON Schema（`core-spec/ossie-schema.json`）校验，未通过返回 400；`document.version` 接受当前 schema 版本 `0.2.0.dev0` 与已发布的 `0.1.1`（Polaris 官方示例所用；0.2.0 只在 0.1.1 之上增加字段，因此按向后兼容规则校验），文档按调用方提交的原样保存；
 - 更新使用 `entity-version` 乐观并发，版本不匹配返回 409；
 - 模型作为 Generic Table 记录保存在请求指定的 Catalog 与命名空间中，随 Polaris 一同持久化。
 

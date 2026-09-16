@@ -74,7 +74,7 @@ STATEMENT_TIMEOUT = 30
 POOL_MAX_SIZE = 4
 MAX_PAGE_SIZE = 100
 DEFAULT_PAGE_SIZE = 20
-TABLES = ("dv_rule", "dv_job_schedule", "dv_job_execution", "dv_job_execution_result")
+TABLES = ("dv_rule", "dv_job_schedule", "dv_job_execution", "dv_job_execution_result", "dv_task_run", "dv_rule_template")
 LEVEL_LABELS = {"high": "高", "medium": "中", "low": "低"}
 DIMENSION_LABELS = {
     "uniqueness": "唯一性校验",
@@ -83,6 +83,8 @@ DIMENSION_LABELS = {
     "standard": "数据标准校验",
     "relation": "关联性校验",
     "timeliness": "及时性校验",
+    "consistency": "一致性校验",
+    "custom": "自定义校验",
 }
 QUALITY_BANDS = ((80, "优秀"), (60, "良好"), (40, "中等"), (20, "合格"))
 
@@ -90,6 +92,8 @@ RULE_TABLE = f"{SCHEMA}.dv_rule"
 SCHEDULE_TABLE = f"{SCHEMA}.dv_job_schedule"
 EXECUTION_TABLE = f"{SCHEMA}.dv_job_execution"
 RESULT_TABLE = f"{SCHEMA}.dv_job_execution_result"
+TASK_RUN_TABLE = f"{SCHEMA}.dv_task_run"
+TEMPLATE_TABLE = f"{SCHEMA}.dv_rule_template"
 
 RULE_COLUMNS = (
     "id, name, metric, dimension, level, datasource_id, datasource_name, schema_name, "
@@ -98,7 +102,30 @@ RULE_COLUMNS = (
 )
 SCHEDULE_COLUMNS = (
     "id, name, bean_name, method_name, method_params, cron_expression, state, "
+    "retry_limit, retry_delay_seconds, misfire_policy, max_backfill, last_status, last_message, "
     "last_fire_time, next_fire_time, create_time, update_time"
+)
+#: How a schedule treats firings missed while the gateway was down.
+MISFIRE_POLICIES = ("skip", "once", "all")
+MISFIRE_LABELS = {"skip": "跳过", "once": "补跑一次", "all": "逐次补跑"}
+MAX_RETRY_LIMIT = 10
+MAX_RETRY_DELAY = 3600
+MAX_BACKFILL = 50
+TASK_RUN_STATUSES = ("running", "success", "failed", "retrying", "skipped")
+TASK_RUN_STATUS_LABELS = {
+    "running": "运行中",
+    "success": "成功",
+    "failed": "失败",
+    "retrying": "等待重试",
+    "skipped": "已跳过",
+}
+TASK_RUN_COLUMNS = (
+    "id, schedule_id, schedule_name, task, task_label, trigger_type, attempt, status, "
+    "planned_time, start_time, end_time, elapsed_ms, message, detail, create_time"
+)
+TEMPLATE_COLUMNS = (
+    "id, name, description, metric, dimension, level, config, expected_type, result_formula, "
+    "operator, threshold, builtin, create_time, update_time"
 )
 EXECUTION_COLUMNS = (
     "id, rule_id, rule_name, schedule_id, trigger_type, status, start_time, end_time, "
@@ -142,11 +169,24 @@ DDL = (
   method_params   varchar(500) NOT NULL DEFAULT '',
   cron_expression varchar(120) NOT NULL,
   state           smallint     NOT NULL DEFAULT 0,
+  retry_limit     smallint     NOT NULL DEFAULT 0,
+  retry_delay_seconds integer  NOT NULL DEFAULT 60,
+  misfire_policy  varchar(16)  NOT NULL DEFAULT 'skip',
+  max_backfill    smallint     NOT NULL DEFAULT 10,
+  last_status     varchar(16)  NOT NULL DEFAULT '',
+  last_message    text         NOT NULL DEFAULT '',
   last_fire_time  timestamptz,
   next_fire_time  timestamptz,
   create_time     timestamptz  NOT NULL DEFAULT now(),
   update_time     timestamptz  NOT NULL DEFAULT now()
 )""",
+    # Schedules created before the task registry existed gain the new columns in place.
+    f"ALTER TABLE {SCHEDULE_TABLE} ADD COLUMN IF NOT EXISTS retry_limit smallint NOT NULL DEFAULT 0",
+    f"ALTER TABLE {SCHEDULE_TABLE} ADD COLUMN IF NOT EXISTS retry_delay_seconds integer NOT NULL DEFAULT 60",
+    f"ALTER TABLE {SCHEDULE_TABLE} ADD COLUMN IF NOT EXISTS misfire_policy varchar(16) NOT NULL DEFAULT 'skip'",
+    f"ALTER TABLE {SCHEDULE_TABLE} ADD COLUMN IF NOT EXISTS max_backfill smallint NOT NULL DEFAULT 10",
+    f"ALTER TABLE {SCHEDULE_TABLE} ADD COLUMN IF NOT EXISTS last_status varchar(16) NOT NULL DEFAULT ''",
+    f"ALTER TABLE {SCHEDULE_TABLE} ADD COLUMN IF NOT EXISTS last_message text NOT NULL DEFAULT ''",
     f"""CREATE TABLE IF NOT EXISTS {EXECUTION_TABLE} (
   id           bigserial PRIMARY KEY,
   rule_id      bigint,
@@ -188,6 +228,41 @@ DDL = (
     f"CREATE INDEX IF NOT EXISTS idx_dv_result_check_time ON {RESULT_TABLE} (check_time DESC)",
     f"CREATE INDEX IF NOT EXISTS idx_dv_result_rule ON {RESULT_TABLE} (rule_id)",
     f"CREATE INDEX IF NOT EXISTS idx_dv_execution_start ON {EXECUTION_TABLE} (start_time DESC)",
+    f"""CREATE TABLE IF NOT EXISTS {TASK_RUN_TABLE} (
+  id            bigserial PRIMARY KEY,
+  schedule_id   bigint,
+  schedule_name varchar(200) NOT NULL DEFAULT '',
+  task          varchar(240) NOT NULL DEFAULT '',
+  task_label    varchar(200) NOT NULL DEFAULT '',
+  trigger_type  varchar(16)  NOT NULL DEFAULT 'schedule',
+  attempt       smallint     NOT NULL DEFAULT 1,
+  status        varchar(16)  NOT NULL DEFAULT 'running',
+  planned_time  timestamptz,
+  start_time    timestamptz  NOT NULL DEFAULT now(),
+  end_time      timestamptz,
+  elapsed_ms    integer,
+  message       text         NOT NULL DEFAULT '',
+  detail        jsonb        NOT NULL DEFAULT '{{}}'::jsonb,
+  create_time   timestamptz  NOT NULL DEFAULT now()
+)""",
+    f"CREATE INDEX IF NOT EXISTS idx_dv_task_run_start ON {TASK_RUN_TABLE} (start_time DESC)",
+    f"CREATE INDEX IF NOT EXISTS idx_dv_task_run_schedule ON {TASK_RUN_TABLE} (schedule_id)",
+    f"""CREATE TABLE IF NOT EXISTS {TEMPLATE_TABLE} (
+  id              bigserial PRIMARY KEY,
+  name            varchar(200) NOT NULL,
+  description     text         NOT NULL DEFAULT '',
+  metric          varchar(64)  NOT NULL,
+  dimension       varchar(32)  NOT NULL,
+  level           varchar(8)   NOT NULL DEFAULT 'medium',
+  config          jsonb        NOT NULL DEFAULT '{{}}'::jsonb,
+  expected_type   varchar(32)  NOT NULL DEFAULT 'fix_value',
+  result_formula  varchar(32)  NOT NULL DEFAULT 'actual',
+  operator        varchar(8)   NOT NULL DEFAULT 'lte',
+  threshold       numeric(20,4) NOT NULL DEFAULT 0,
+  builtin         smallint     NOT NULL DEFAULT 0,
+  create_time     timestamptz  NOT NULL DEFAULT now(),
+  update_time     timestamptz  NOT NULL DEFAULT now()
+)""",
 )
 
 
@@ -376,6 +451,28 @@ def _record_id(value: Any, label: str) -> int:
     if identifier <= 0:
         raise QualityStoreError(400, f"{label}无效。")
     return identifier
+
+
+def _bounded(value: Any, label: str, *, default: int, minimum: int = 0, maximum: int) -> int:
+    number = _integer(value, label, default=default)
+    if number < minimum or number > maximum:
+        raise QualityStoreError(400, f"{label}必须在 {minimum} 到 {maximum} 之间。")
+    return number
+
+
+def _policy(value: Any) -> str:
+    policy = _text(value, 16, "补跑策略", default="skip") or "skip"
+    if policy not in MISFIRE_POLICIES:
+        raise QualityStoreError(400, "补跑策略只能是 skip（跳过）、once（补跑一次）或 all（逐次补跑）。")
+    return policy
+
+
+def _run_status(value: Any, *, terminal: bool = False) -> str:
+    status = _text(value, 16, "执行状态", required=True)
+    allowed = tuple(item for item in TASK_RUN_STATUSES if not terminal or item != "running")
+    if status not in allowed:
+        raise QualityStoreError(400, f"执行状态只能是 {'、'.join(allowed)}。")
+    return status
 
 
 def _state(value: Any, label: str, *, allowed: tuple[int, ...], default: int) -> int:
@@ -714,6 +811,10 @@ class QualityStore:
             _text(data.get("method_params"), 500, "方法参数"),
             _text(data.get("cron_expression"), 120, "cron 表达式", required=True),
             _state(data.get("state"), "调度状态", allowed=(0, 1), default=0),
+            _bounded(data.get("retry_limit"), "失败重试次数", default=0, maximum=MAX_RETRY_LIMIT),
+            _bounded(data.get("retry_delay_seconds"), "重试间隔", default=60, minimum=1, maximum=MAX_RETRY_DELAY),
+            _policy(data.get("misfire_policy")),
+            _bounded(data.get("max_backfill"), "补跑上限", default=10, minimum=1, maximum=MAX_BACKFILL),
         ]
 
     def list_schedules(
@@ -744,8 +845,9 @@ class QualityStore:
         """Insert a schedule and return the stored row."""
         return self._run(
             f"""INSERT INTO {SCHEDULE_TABLE}
-                (name, bean_name, method_name, method_params, cron_expression, state)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                (name, bean_name, method_name, method_params, cron_expression, state,
+                 retry_limit, retry_delay_seconds, misfire_policy, max_backfill)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING {SCHEDULE_COLUMNS}""",
             self._schedule_values(data),
             fetch="one",
@@ -758,7 +860,8 @@ class QualityStore:
         row = self._run(
             f"""UPDATE {SCHEDULE_TABLE} SET
                 name = %s, bean_name = %s, method_name = %s, method_params = %s,
-                cron_expression = %s, state = %s, update_time = now()
+                cron_expression = %s, state = %s, retry_limit = %s, retry_delay_seconds = %s,
+                misfire_policy = %s, max_backfill = %s, update_time = now()
                 WHERE id = %s RETURNING {SCHEDULE_COLUMNS}""",
             [*self._schedule_values(merged), identifier],
             fetch="one",
@@ -820,6 +923,203 @@ class QualityStore:
             [1],
             fetch="all",
         )
+
+    def record_schedule_outcome(self, schedule_id: Any, status: str, message: str = "") -> dict[str, Any]:
+        """Remember how the last firing ended, for the 调度 list."""
+        row = self._run(
+            f"""UPDATE {SCHEDULE_TABLE} SET last_status = %s, last_message = %s, update_time = now()
+                WHERE id = %s RETURNING {SCHEDULE_COLUMNS}""",
+            [
+                _run_status(status),
+                _text(message, 2000, "执行说明", multiline=True),
+                _record_id(schedule_id, "调度编号"),
+            ],
+            fetch="one",
+        )
+        if row is None:
+            raise QualityStoreError(404, "调度任务不存在。")
+        return row
+
+    # ----- task runs ------------------------------------------------------------
+    def start_task_run(
+        self,
+        *,
+        schedule_id: Any = None,
+        schedule_name: str = "",
+        task: str = "",
+        task_label: str = "",
+        trigger_type: str = "schedule",
+        attempt: Any = 1,
+        planned_time: Any = None,
+        message: str = "",
+    ) -> int:
+        """Open a task run in status ``running`` and return its id."""
+        row = self._run(
+            f"""INSERT INTO {TASK_RUN_TABLE}
+                (schedule_id, schedule_name, task, task_label, trigger_type, attempt, status,
+                 planned_time, message)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+            [
+                _optional_integer(schedule_id, "调度编号"),
+                _text(schedule_name, 200, "任务名称"),
+                _text(task, 240, "任务标识"),
+                _text(task_label, 200, "任务说明"),
+                _text(trigger_type, 16, "触发方式", required=True),
+                _bounded(attempt, "执行次序", default=1, minimum=1, maximum=MAX_RETRY_LIMIT + 1),
+                "running",
+                _timestamp(planned_time, "计划执行时间"),
+                _text(message, 2000, "执行说明", multiline=True),
+            ],
+            fetch="one",
+        )
+        return int(row["id"])
+
+    def finish_task_run(
+        self,
+        run_id: Any,
+        status: str,
+        elapsed_ms: Any = None,
+        message: str = "",
+        detail: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Close a task run; no row is ever left ``running``."""
+        row = self._run(
+            f"""UPDATE {TASK_RUN_TABLE}
+                SET status = %s, end_time = now(), elapsed_ms = %s, message = %s, detail = %s
+                WHERE id = %s RETURNING {TASK_RUN_COLUMNS}""",
+            [
+                _run_status(status, terminal=True),
+                _optional_integer(elapsed_ms, "耗时"),
+                _text(message, 4000, "执行说明", multiline=True),
+                Jsonb(detail if isinstance(detail, dict) else {}),
+                _record_id(run_id, "执行编号"),
+            ],
+            fetch="one",
+        )
+        if row is None:
+            raise QualityStoreError(404, "任务执行记录不存在。")
+        return row
+
+    def list_task_runs(
+        self,
+        schedule_id: Any = None,
+        status: str | None = None,
+        task: str | None = None,
+        page: Any = 1,
+        size: Any = DEFAULT_PAGE_SIZE,
+    ) -> dict[str, Any]:
+        """Page over task runs, newest first."""
+        conditions: list[str] = []
+        params: list[Any] = []
+        if schedule_id not in (None, ""):
+            conditions.append("schedule_id = %s")
+            params.append(_record_id(schedule_id, "调度编号"))
+        if status:
+            conditions.append("status = %s")
+            params.append(_run_status(status))
+        if task:
+            conditions.append("task = %s")
+            params.append(_text(task, 240, "任务标识"))
+        return self._paged(TASK_RUN_COLUMNS, TASK_RUN_TABLE, conditions, params, "id DESC", page, size)
+
+    def get_task_run(self, run_id: Any) -> dict[str, Any]:
+        row = self._run(
+            f"SELECT {TASK_RUN_COLUMNS} FROM {TASK_RUN_TABLE} WHERE id = %s",
+            [_record_id(run_id, "执行编号")],
+            fetch="one",
+        )
+        if row is None:
+            raise QualityStoreError(404, "任务执行记录不存在。")
+        return row
+
+    # ----- rule templates -------------------------------------------------------
+    def _template_values(self, data: dict[str, Any]) -> list[Any]:
+        return [
+            _text(data.get("name"), 200, "模板名称", required=True),
+            _text(data.get("description"), 2000, "模板说明", multiline=True),
+            _text(data.get("metric"), 64, "核查类型", required=True),
+            _text(data.get("dimension"), 32, "规则分类", required=True),
+            _text(data.get("level"), 8, "规则级别", default="medium"),
+            Jsonb(_config(data.get("config"))),
+            _text(data.get("expected_type"), 32, "期望值类型", default="fix_value"),
+            _text(data.get("result_formula"), 32, "结果计算方式", default="actual"),
+            _text(data.get("operator"), 8, "比较方式", default="lte"),
+            _number(data.get("threshold"), "阈值"),
+            _state(data.get("builtin"), "内置标记", allowed=(0, 1), default=0),
+        ]
+
+    def list_templates(
+        self, name: str | None = None, metric: str | None = None, page: Any = 1, size: Any = DEFAULT_PAGE_SIZE
+    ) -> dict[str, Any]:
+        conditions: list[str] = []
+        params: list[Any] = []
+        if name:
+            conditions.append("name ILIKE %s")
+            params.append(like_pattern(_text(name, 200, "模板名称")))
+        if metric:
+            conditions.append("metric = %s")
+            params.append(_text(metric, 64, "核查类型"))
+        return self._paged(TEMPLATE_COLUMNS, TEMPLATE_TABLE, conditions, params, "builtin DESC, id", page, size)
+
+    def count_templates(self) -> int:
+        return int(self._run(f"SELECT count(1) FROM {TEMPLATE_TABLE}", [], fetch="value") or 0)
+
+    def get_template(self, template_id: Any) -> dict[str, Any]:
+        row = self._run(
+            f"SELECT {TEMPLATE_COLUMNS} FROM {TEMPLATE_TABLE} WHERE id = %s",
+            [_record_id(template_id, "模板编号")],
+            fetch="one",
+        )
+        if row is None:
+            raise QualityStoreError(404, "规则模板不存在。")
+        return row
+
+    def create_template(self, data: dict[str, Any]) -> dict[str, Any]:
+        return self._run(
+            f"""INSERT INTO {TEMPLATE_TABLE}
+                (name, description, metric, dimension, level, config, expected_type,
+                 result_formula, operator, threshold, builtin)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING {TEMPLATE_COLUMNS}""",
+            self._template_values(data),
+            fetch="one",
+        )
+
+    def update_template(self, template_id: Any, data: dict[str, Any]) -> dict[str, Any]:
+        identifier = _record_id(template_id, "模板编号")
+        merged = {**self.get_template(identifier), **data}
+        row = self._run(
+            f"""UPDATE {TEMPLATE_TABLE} SET
+                name = %s, description = %s, metric = %s, dimension = %s, level = %s, config = %s,
+                expected_type = %s, result_formula = %s, operator = %s, threshold = %s, builtin = %s,
+                update_time = now()
+                WHERE id = %s RETURNING {TEMPLATE_COLUMNS}""",
+            [*self._template_values(merged), identifier],
+            fetch="one",
+        )
+        if row is None:
+            raise QualityStoreError(404, "规则模板不存在。")
+        return row
+
+    def delete_template(self, template_id: Any) -> dict[str, Any]:
+        row = self._run(
+            f"DELETE FROM {TEMPLATE_TABLE} WHERE id = %s RETURNING id",
+            [_record_id(template_id, "模板编号")],
+            fetch="one",
+        )
+        if row is None:
+            raise QualityStoreError(404, "规则模板不存在。")
+        return {"id": row["id"], "deleted": True}
+
+    def task_run_counts(self) -> dict[str, int]:
+        """Runs by status over the last day, for 质量健康 and the 调度 header."""
+        rows = self._run(
+            f"""SELECT status, count(1) AS total FROM {TASK_RUN_TABLE}
+                WHERE start_time >= now() - interval '1 day' GROUP BY status""",
+            [],
+            fetch="all",
+        )
+        return {str(row["status"]): int(row["total"]) for row in rows or ()}
 
     # ----- executions -----------------------------------------------------------
     def start_execution(
@@ -959,6 +1259,20 @@ class QualityStore:
                     ORDER BY rule_id, check_time DESC, id DESC
                 ) latest ORDER BY latest.check_time DESC, latest.id DESC""",
             params,
+            fetch="all",
+        )
+
+    def recent_results(self, table_names: list[str], days: Any = 7, limit: Any = 200) -> list[dict[str, Any]]:
+        """Results recorded for these tables within the last ``days`` days, newest first."""
+        names = [_text(name, 200, "数据表") for name in table_names if str(name or "").strip()][:50]
+        if not names:
+            return []
+        placeholders = ", ".join(["%s"] * len(names))
+        return self._run(
+            f"""SELECT {RESULT_COLUMNS} FROM {RESULT_TABLE}
+                WHERE table_name IN ({placeholders}) AND check_time >= now() - (%s * interval '1 day')
+                ORDER BY check_time DESC, id DESC LIMIT %s""",
+            [*names, _bounded(days, "天数", default=7, minimum=1, maximum=365), _bounded(limit, "条数", default=200, minimum=1, maximum=1000)],
             fetch="all",
         )
 

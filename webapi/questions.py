@@ -24,15 +24,17 @@ from __future__ import annotations
 import datetime as dt
 import time
 import uuid
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 import duckdb
 import sqlglot
 
-from .connectors import CONNECTORS, DIALECT_LABELS, ConnectorError, chart_hint
+from .connectors import CONNECTORS, DIALECT_LABELS, ConnectorError, chart_hint, guard_sql, referenced_tables
 from .datasources import DataSourceError, DataSourceRegistry
 from .llm import LlmError, LlmSettings, SqlGenerator
 from .query import QueryStore
+from .observability import observe
+from .query_cache import QueryCache
 
 LOCAL_SAMPLE = "local-sample"
 #: Tables every local demo engine is seeded with; the built-in rules need them.
@@ -59,11 +61,20 @@ def source_label(record: dict[str, Any]) -> str:
 
 
 class QueryService:
-    def __init__(self, store: QueryStore, registry: DataSourceRegistry, llm: LlmSettings):
+    def __init__(
+        self, store: QueryStore, registry: DataSourceRegistry, llm: LlmSettings, cache: QueryCache | None = None
+    ):
         self.store = store
         self.registry = registry
         self.llm = llm
         self.generator = SqlGenerator(llm)
+        # Results are read-only, so repeating a question or a report query answers
+        # from here until the entry expires or is invalidated; ``refresh`` bypasses it.
+        self.cache = cache if cache is not None else QueryCache.from_env()
+        # Called with every executed payload (the metadata catalog attributes usage).
+        self.observers: list[Callable[[dict[str, Any]], Any]] = []
+        # Returns business semantics for a data source, appended to the model's schema.
+        self.annotator: Callable[[dict[str, Any]], str] | None = None
 
     # ----- execution ---------------------------------------------------------------
     def _record(self, source_id: str | None) -> dict[str, Any]:
@@ -72,17 +83,32 @@ class QueryService:
         except DataSourceError as error:
             raise QueryError(error.status_code, str(error)) from error
 
-    def execute(self, record: dict[str, Any], sql: str, limit: Any = None) -> dict[str, Any]:
+    def execute(self, record: dict[str, Any], sql: str, limit: Any = None, *, refresh: bool = False) -> dict[str, Any]:
+        if not refresh:
+            hit = self.cache.get(record["id"], sql, limit)
+            if hit is not None:
+                return hit
         try:
-            if record["id"] == LOCAL_SAMPLE:
-                return self.store.execute_sql(sql)
-            return self.registry.connector(record["id"]).query(sql, limit)
+            with observe("query", "engine", datasource=record["id"], engine=record.get("type", "")):
+                if record["id"] == LOCAL_SAMPLE:
+                    result = self.store.execute_sql(sql)
+                else:
+                    result = self.registry.connector(record["id"]).query(sql, limit)
         except DataSourceError as error:
             raise QueryError(error.status_code, str(error)) from error
         except (ConnectorError, sqlglot.errors.SqlglotError, duckdb.Error) as error:
             raise QueryError(400, str(error)[:800]) from error
         except ValueError as error:
             raise QueryError(400, str(error)[:800]) from error
+        self.cache.put(record["id"], sql, limit, result, self._tables(record, sql))
+        return {**result, "cached": False}
+
+    def _tables(self, record: dict[str, Any], sql: str) -> list[tuple[str | None, str]]:
+        """Tables a statement reads, so a table-level invalidation can find its entries."""
+        try:
+            return referenced_tables(guard_sql(sql, CONNECTORS[record["type"]].dialect))
+        except Exception:  # noqa: BLE001 - an unparseable statement is cached without table tags
+            return []
 
     def payload(
         self,
@@ -105,6 +131,10 @@ class QueryService:
         elapsed = result.get("elapsed_ms")
         if started is not None:
             elapsed = round((time.monotonic() - started) * 1000, 1)
+        cached = bool(result.get("cached"))
+        age = result.get("cache_age_seconds")
+        if cached:
+            steps = [*steps, f"命中查询缓存，返回 {age if age is not None else 0} 秒前执行的结果；需要最新数据时请刷新。"]
         payload = {
             "id": str(uuid.uuid4()),
             "title": title,
@@ -121,14 +151,21 @@ class QueryService:
             "datasource_id": record["id"],
             "datasource_name": record["name"],
             "dialect": CONNECTORS[record["type"]].dialect,
+            "cached": cached,
+            "cache_age_seconds": age if cached else None,
         }
         self.store.record(payload)
+        for observer in list(self.observers):
+            try:
+                observer(payload)
+            except Exception:  # noqa: BLE001 - an observer must never fail a query
+                continue
         return payload
 
-    def run_sql(self, source_id: str | None, sql: str, limit: Any = None) -> dict[str, Any]:
+    def run_sql(self, source_id: str | None, sql: str, limit: Any = None, refresh: bool = False) -> dict[str, Any]:
         record = self._record(source_id)
         started = time.monotonic()
-        result = self.execute(record, sql, limit)
+        result = self.execute(record, sql, limit, refresh=refresh)
         steps = [
             f"在 {source_label(record)} 上执行只读 SQL（{DIALECT_LABELS.get(CONNECTORS[record['type']].dialect, '')}）。",
             f"返回 {len(result['rows'])} 行" + ("（已截断）。" if result.get("truncated") else "。"),
@@ -158,11 +195,13 @@ class QueryService:
         return self.payload(record, title, result, "sql", [f"预览 {title}。"], started=started)
 
     # ----- natural language ----------------------------------------------------------
-    def answer(self, question: str | None, sql: str | None, source_id: str | None) -> Iterator[tuple[str, Any]]:
+    def answer(
+        self, question: str | None, sql: str | None, source_id: str | None, refresh: bool = False
+    ) -> Iterator[tuple[str, Any]]:
         record = self._record(source_id)
         if sql:
             yield "step", {"text": f"在 {source_label(record)} 上执行只读 SQL。"}
-            payload = self.run_sql(record["id"], sql)
+            payload = self.run_sql(record["id"], sql, refresh=refresh)
             yield "sql", {"sql": payload["sql"], "title": payload["title"]}
             yield "result", payload
             return
@@ -190,7 +229,7 @@ class QueryService:
                 for step in plan["steps"]:
                     yield "step", {"text": step}
                 yield "sql", {"sql": plan["sql"], "title": plan["title"]}
-                result, repaired = self.run_generated(record, plan["sql"], dialect, dialect_label)
+                result, repaired = self.run_generated(record, plan["sql"], dialect, dialect_label, refresh)
                 steps = list(plan["steps"])
                 if repaired:
                     steps.append(f"模型返回的 SQL 不能在该引擎直接执行，已按 {dialect_label} 方言转换后重试。")
@@ -208,7 +247,7 @@ class QueryService:
         yield "step", {"text": "识别问题中的维度与指标，匹配示例业务表（本地规则）。"}
         proposed = self.localize(proposed, dialect, dialect_label)
         yield "sql", {"sql": proposed.strip(), "title": title}
-        result = self.execute(record, proposed)
+        result = self.execute(record, proposed, refresh=refresh)
         steps = [
             "识别问题中的维度与指标，匹配示例业务表。",
             f"按 {dialect_label} 方言生成只读 SQL 并执行安全检查。",
@@ -218,7 +257,7 @@ class QueryService:
         yield "result", self.payload(record, title, result, "rules", steps, started=started)
 
     def run_generated(
-        self, record: dict[str, Any], sql: str, dialect: str, dialect_label: str
+        self, record: dict[str, Any], sql: str, dialect: str, dialect_label: str, refresh: bool = False
     ) -> tuple[dict[str, Any], str]:
         """Execute model SQL, repairing its dialect once if the engine rejects it.
 
@@ -231,7 +270,7 @@ class QueryService:
         the user rather than silently substituted.
         """
         try:
-            return self.execute(record, sql), ""
+            return self.execute(record, sql, refresh=refresh), ""
         except QueryError as first:
             if dialect == "duckdb":
                 raise
@@ -242,7 +281,7 @@ class QueryService:
             if len(repaired) != 1 or repaired[0].strip() == sql.strip():
                 raise first from None
             try:
-                return self.execute(record, repaired[0]), repaired[0]
+                return self.execute(record, repaired[0], refresh=refresh), repaired[0]
             except QueryError:
                 raise first from None
 
@@ -265,9 +304,10 @@ class QueryService:
             return  # A source that cannot be inspected fails later with its own message.
         missing = [name for name in needed if name not in context]
         if missing:
+            joined = "、".join(missing)
             raise QueryError(
                 400,
-                f"{label}中没有内置规则所需的示例表（{"、".join(missing)}）。"
+                f"{label}中没有内置规则所需的示例表（{joined}）。"
                 "请配置模型后按该数据源的真实表结构提问，或改用 SQL 工作台。",
             )
 
@@ -294,16 +334,30 @@ class QueryService:
 
     def _schema_context(self, record: dict[str, Any]) -> str:
         if record["id"] == LOCAL_SAMPLE:
-            return "\n".join(
+            text = "\n".join(
                 f"- {table['name']}（{table['label']}，{table['rows']} 行）："
                 + ", ".join(f"{column['name']} {column['type']}" for column in table["columns"])
                 for table in self.store.metadata()
             )
-        return self.registry.schema_context(record["id"])
+        else:
+            text = self.registry.schema_context(record["id"])
+        return self._annotate(record, text)
 
-    def complete(self, question: str | None, sql: str | None, source_id: str | None) -> dict[str, Any]:
+    def _annotate(self, record: dict[str, Any], text: str) -> str:
+        """Append the catalog's business semantics; a failing annotator changes nothing."""
+        if self.annotator is None:
+            return text
+        try:
+            semantics = self.annotator(record)
+        except Exception:  # noqa: BLE001 - the model still gets the plain schema
+            return text
+        return f"{text}\n\n{semantics}" if semantics else text
+
+    def complete(
+        self, question: str | None, sql: str | None, source_id: str | None, refresh: bool = False
+    ) -> dict[str, Any]:
         result = None
-        for name, data in self.answer(question, sql, source_id):
+        for name, data in self.answer(question, sql, source_id, refresh):
             if name == "result":
                 result = data
         if result is None:

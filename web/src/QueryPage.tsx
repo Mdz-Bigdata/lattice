@@ -21,6 +21,7 @@ import {
   TrendingUp,
 } from "lucide-react";
 import {
+  formatAge,
   request,
   errorMessage,
   streamQuery,
@@ -68,9 +69,12 @@ function linkPort(link: string) {
 export function QueryReport({
   result,
   defaultMode = "bar",
+  onRefresh,
 }: {
   result: QueryResult;
   defaultMode?: ChartMode;
+  /** Re-run the query bypassing the result cache. */
+  onRefresh?: () => void;
 }) {
   const canChart =
     result.columns.includes(result.chart?.dimension) &&
@@ -82,8 +86,27 @@ export function QueryReport({
     <section className="report-card" aria-label="查询结果">
       <div className="report-heading">
         <h2>{result.title}</h2>
-        <span>
+        <span className="report-meta">
           {result.rows.length} 条结果 · {result.elapsed_ms.toLocaleString()} ms
+          {result.cached && (
+            <span
+              className="neutral-badge"
+              title="结果来自查询结果缓存；需要最新数据时点击“刷新”重新执行"
+            >
+              缓存 · {formatAge(result.cache_age_seconds)}
+            </span>
+          )}
+          {onRefresh && (
+            <button
+              type="button"
+              className="text-button"
+              title="跳过缓存重新执行"
+              onClick={onRefresh}
+            >
+              <RefreshCw size={12} />
+              刷新
+            </button>
+          )}
         </span>
       </div>
       {result.truncated && (
@@ -231,7 +254,7 @@ export default function QueryPage({
     };
   }, []);
 
-  async function ask(value: string) {
+  async function ask(value: string, refresh = false) {
     const text = value.trim();
     if (!text || busy) return;
     controller.current?.abort();
@@ -242,7 +265,7 @@ export default function QueryPage({
     setSteps([]);
     setPendingSql(null);
     setSubmitted(text);
-    const body = { question: text, datasource_id: sourceId };
+    const body = { question: text, datasource_id: sourceId, refresh };
     let outcome: Outcome = "pending";
     function finish(answer: QueryResult) {
       outcome = "result";
@@ -382,7 +405,11 @@ export default function QueryPage({
           </div>
         )}
         {phase === "answered" && result && !error && (
-          <QueryReport key={result.id} result={result} />
+          <QueryReport
+            key={result.id}
+            result={result}
+            onRefresh={() => void ask(submitted, true)}
+          />
         )}
         {phase === "idle" && !result && !error && (
           <Empty title="开始探索你的数据">

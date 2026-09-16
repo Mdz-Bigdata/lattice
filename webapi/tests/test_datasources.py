@@ -180,6 +180,7 @@ def test_connector_normalization_validates_ports_and_required_fields():
 def test_all_connector_types_expose_descriptors():
     assert set(CONNECTORS) == {
         "duckdb", "mysql", "postgresql", "clickhouse", "starrocks", "doris", "hive", "iceberg", "paimon",
+        "oracle", "mssql", "mongodb", "elasticsearch", "kafka",
     }
     for connector in CONNECTORS.values():
         descriptor = connector.descriptor()
@@ -200,7 +201,7 @@ def test_mask_and_merge_secrets():
 def test_registry_lists_builtin_sample_and_masks_user_secrets(registry, duck_file):
     listing = registry.list()
     assert [item["id"] for item in listing["items"]] == ["local-sample"]
-    assert len(listing["types"]) == 9
+    assert len(listing["types"]) == 14
     created = registry.create("分析库", "duckdb", {"path": str(duck_file)}, "测试")
     assert created["id"].startswith("ds_") and created["summary"] == str(duck_file)
     mysql = registry.create("仓库", "mysql", {"host": "127.0.0.1", "port": 1, "user": "u", "password": "p"})
@@ -229,7 +230,7 @@ def test_registry_test_reports_unreachable_engines_without_raising(registry):
     result = registry.test_config("postgresql", {"host": "127.0.0.1", "port": 1, "user": "u", "database": "d"})
     assert result["ok"] is False
     with pytest.raises(DataSourceError):
-        registry.test_config("oracle", {})
+        registry.test_config("sqlite", {})
 
 
 def test_registry_seeds_builtin_sources_from_private_runtime_files(tmp_path, registry):
@@ -485,7 +486,7 @@ def test_health_reports_a_build_that_changes_with_the_bundle(monkeypatch, tmp_pa
 # ----- API routes ---------------------------------------------------------------------------
 def test_api_datasource_lifecycle_and_queries(client, duck_file):
     listing = client.get("/api/datasources").json()
-    assert [item["id"] for item in listing["items"]] == ["local-sample"] and len(listing["types"]) == 9
+    assert [item["id"] for item in listing["items"]] == ["local-sample"] and len(listing["types"]) == 14
     created = client.post("/api/datasources", json={"name": "分析库", "type": "duckdb", "config": {"path": str(duck_file)}}).json()
     source_id = created["id"]
     assert client.post(f"/api/datasources/{source_id}/test", json={}).json()["ok"] is True
@@ -627,7 +628,7 @@ def test_model_sql_in_the_wrong_dialect_is_repaired_once(monkeypatch):
         def __init__(self):  # bypass the real stores; only run_generated is under test
             pass
 
-        def execute(self, record, sql, limit=None):
+        def execute(self, record, sql, limit=None, refresh=False):
             calls.append(sql)
             if "strftime" in sql:
                 raise QueryError(400, "function strftime(date, unknown) does not exist")
@@ -645,7 +646,7 @@ def test_model_sql_in_the_wrong_dialect_is_repaired_once(monkeypatch):
 
     # When the translation also fails, the original error is what the user sees.
     class AlwaysFails(Service):
-        def execute(self, record, sql, limit=None):
+        def execute(self, record, sql, limit=None, refresh=False):
             raise QueryError(400, "原始错误")
 
     with pytest.raises(QueryError, match="原始错误"):
@@ -738,3 +739,30 @@ def test_builtin_rule_explains_a_source_without_the_sample_tables():
 
     service.registry = Seeded()
     service.require_sample_tables(record, sql, "MySQL")
+
+
+def test_api_repeated_queries_are_served_from_the_cache_until_invalidated(client, duck_file):
+    created = client.post("/api/datasources", json={"name": "缓存库", "type": "duckdb", "config": {"path": str(duck_file)}}).json()
+    source_id = created["id"]
+    first = client.post(f"/api/datasources/{source_id}/query", json={"sql": "SELECT count(*) AS n FROM sales"}).json()
+    assert first["cached"] is False and first["cache_age_seconds"] is None
+    second = client.post(f"/api/datasources/{source_id}/query", json={"sql": "SELECT count(*) AS n  FROM sales;"}).json()
+    assert second["cached"] is True and second["rows"] == [[3]] and second["id"] != first["id"]
+    assert "命中查询缓存" in second["steps"][-1]
+    fresh = client.post(f"/api/datasources/{source_id}/query", json={"sql": "SELECT count(*) AS n FROM sales", "refresh": True}).json()
+    assert fresh["cached"] is False
+    via_query = client.post("/api/query", json={"sql": "SELECT count(*) AS n FROM sales", "datasource_id": source_id}).json()
+    assert via_query["cached"] is True
+    listing = client.get("/api/query/cache", params={"datasource_id": source_id}).json()
+    assert listing["stats"]["entries"] == 1 and listing["items"][0]["tables"] == ["sales"] and listing["stats"]["hits"] == 2
+    assert client.post("/api/query/cache/invalidate", json={"table": "sales"}).json()["removed"] == 1
+    assert client.post(f"/api/datasources/{source_id}/query", json={"sql": "SELECT count(*) AS n FROM sales"}).json()["cached"] is False
+    client.post(f"/api/datasources/{source_id}/update", json={"description": "改了描述"})
+    assert client.get("/api/query/cache").json()["stats"]["entries"] == 0
+    settings = client.post("/api/query/cache/settings", json={"ttl_seconds": 120, "max_entries": 50}).json()
+    assert (settings["ttl_seconds"], settings["max_entries"]) == (120, 50)
+    assert client.post("/api/query/cache/settings", json={"ttl_seconds": 1}).status_code == 422
+    assert client.post("/api/query/cache/settings", json={"enabled": False}).json()["enabled"] is False
+    assert client.post(f"/api/datasources/{source_id}/query", json={"sql": "SELECT 1 AS one"}).json()["cached"] is False
+    assert client.post(f"/api/datasources/{source_id}/query", json={"sql": "SELECT 1 AS one"}).json()["cached"] is False
+    assert "查询结果缓存" in " ".join(client.get("/api/bootstrap").json()["capabilities"])

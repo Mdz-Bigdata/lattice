@@ -39,6 +39,10 @@ dependencies = [
     "pypaimon>=1.0,<3",
     "anthropic>=1.0,<2",
     "croniter>=3.0,<7",
+    "oracledb>=2.5,<4",
+    "pymssql>=2.3,<3",
+    "pymongo>=4.10,<5",
+    "kafka-python>=2.0.2,<3",
 ]
 
 [tool.uv]

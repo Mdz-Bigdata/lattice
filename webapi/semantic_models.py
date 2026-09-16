@@ -22,7 +22,10 @@ with HTTP 501.  This module implements the same contract in the Lattice gateway:
   ``polaris-catalog-apis/semantic-models-api.yaml`` (``LoadSemanticModelResponse``,
   ``ListSemanticModelsResponse``, ``IcebergErrorResponse``);
 * the target namespace must exist in the real Polaris catalog (404 otherwise);
-* documents are validated against the bundled Apache Ossie JSON schema (400 on failure);
+* documents are validated against the bundled Apache Ossie JSON schema (400 on
+  failure); ``document.version`` may be the schema's own version or a released
+  Apache Ossie version such as the ``0.1.1`` used by the Polaris contract's
+  example (see :mod:`webapi.ossie_document`);
 * optimistic concurrency through opaque ``entity-version`` values (409 on
   mismatch);
 * persistence as Polaris **Generic Table** records inside the requested
@@ -39,7 +42,6 @@ import datetime as dt
 import json
 import re
 import secrets
-from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -48,6 +50,7 @@ import yaml
 
 from validation import validate as validator
 
+from .ossie_document import check_document
 from .polaris import PolarisError
 
 OPERATIONS = {
@@ -70,7 +73,6 @@ MAX_PAGE_SIZE = 500
 MAX_LIST_PAGES = 50
 ENTITY_VERSION = re.compile(r"[A-Za-z0-9._:@+~-]{1,255}\Z")
 UNIT_SEPARATOR = "\x1f"
-SCHEMA = Path(__file__).resolve().parent.parent / "core-spec" / "ossie-schema.json"
 
 
 class SemanticModelError(Exception):
@@ -168,19 +170,7 @@ def parse_document(document: Any) -> tuple[dict[str, str], dict[str, Any]]:
         raise _bad_request("document.semantic_model must be a JSON object (or array of objects)")
     data = {"version": version, "semantic_model": models}
     try:
-        schema = json.loads(SCHEMA.read_text())
-        failures = validator.validate_schema(data, schema)
-        if not failures:
-            messages = (
-                validator.validate_unique_names(data)
-                + validator.validate_references(data)
-                + validator.validate_sql(data)
-            )
-            failures = [
-                message
-                for message in messages
-                if not str(message).startswith(("[Reference] Warning:", "[SQL] Warning:"))
-            ]
+        failures, _ = check_document(data)
     except (yaml.YAMLError, ValueError, OverflowError, RecursionError, TypeError) as error:
         raise _bad_request("semantic model validation failed: " + str(error)[:300]) from error
     if failures:

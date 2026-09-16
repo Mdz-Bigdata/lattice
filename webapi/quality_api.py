@@ -73,11 +73,16 @@ from .quality_service import (
     decorate_page,
     decorate_rule,
     decorate_schedule,
+    decorate_task_run,
+    decorate_template,
     next_fire_time,
 )
+from .tasks import TaskError, TaskRegistry
 from .quality_store import (
     DEFAULT_PAGE_SIZE,
     MAX_PAGE_SIZE,
+    MISFIRE_LABELS,
+    TASK_RUN_STATUS_LABELS,
     QualityStore,
     QualityStoreError,
 )
@@ -137,6 +142,10 @@ class CreateScheduleInput(BaseModel):
     method_params: str | None = Field(default=None, max_length=500)
     cron_expression: str = Field(min_length=1, max_length=120)
     state: int | None = Field(default=None, ge=0, le=1)
+    retry_limit: int | None = Field(default=None, ge=0, le=10)
+    retry_delay_seconds: int | None = Field(default=None, ge=1, le=3600)
+    misfire_policy: str | None = Field(default=None, max_length=16)
+    max_backfill: int | None = Field(default=None, ge=1, le=50)
 
 
 class UpdateScheduleInput(BaseModel):
@@ -147,11 +156,66 @@ class UpdateScheduleInput(BaseModel):
     method_params: str | None = Field(default=None, max_length=500)
     cron_expression: str | None = Field(default=None, min_length=1, max_length=120)
     state: int | None = Field(default=None, ge=0, le=1)
+    retry_limit: int | None = Field(default=None, ge=0, le=10)
+    retry_delay_seconds: int | None = Field(default=None, ge=1, le=3600)
+    misfire_policy: str | None = Field(default=None, max_length=16)
+    max_backfill: int | None = Field(default=None, ge=1, le=50)
 
 
 class ToggleScheduleInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     state: int | None = Field(default=None, ge=0, le=1)
+
+
+class CreateTemplateInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(min_length=1, max_length=200)
+    description: str | None = Field(default=None, max_length=2000)
+    metric: str = Field(min_length=1, max_length=64)
+    level: str | None = Field(default=None, max_length=8)
+    config: dict[str, Any] = Field(default_factory=dict)
+    expected_type: str | None = Field(default=None, max_length=32)
+    result_formula: str | None = Field(default=None, max_length=32)
+    operator: str | None = Field(default=None, max_length=8)
+    threshold: float | None = None
+
+
+class UpdateTemplateInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    description: str | None = Field(default=None, max_length=2000)
+    metric: str | None = Field(default=None, min_length=1, max_length=64)
+    level: str | None = Field(default=None, max_length=8)
+    config: dict[str, Any] | None = None
+    expected_type: str | None = Field(default=None, max_length=32)
+    result_formula: str | None = Field(default=None, max_length=32)
+    operator: str | None = Field(default=None, max_length=8)
+    threshold: float | None = None
+
+
+class SaveTemplateInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str | None = Field(default=None, max_length=200)
+    description: str | None = Field(default=None, max_length=2000)
+
+
+class BatchTargetInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    datasource_id: str = Field(min_length=1, max_length=64)
+    schema_name: str | None = Field(default=None, max_length=200)
+    table_name: str = Field(min_length=1, max_length=200)
+    column_name: str | None = Field(default=None, max_length=200)
+
+
+class BatchRulesInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    template_id: int | None = Field(default=None, ge=1)
+    rule: CreateTemplateInput | None = None
+    targets: list[BatchTargetInput] = Field(min_length=1, max_length=200)
+    config: dict[str, Any] = Field(default_factory=dict)
+    name_prefix: str | None = Field(default=None, max_length=200)
+    state: int | None = Field(default=None, ge=0, le=1)
+    comment: str | None = Field(default=None, max_length=2000)
 
 
 def guarded(operation, *args, **kwargs):
@@ -167,6 +231,7 @@ def guarded(operation, *args, **kwargs):
     except (
         QualityError,
         QualityStoreError,
+        TaskError,
         MetricError,
         DataSourceError,
         ConnectorError,
@@ -190,6 +255,15 @@ def _store(request: Request) -> QualityStore:
 
 def _scheduler(request: Request) -> QualityScheduler:
     return _from_state(request, "quality_scheduler")
+
+
+def _registry(request: Request) -> TaskRegistry | None:
+    registry = getattr(request.app.state, "tasks", None)
+    return registry if registry is not None else getattr(_service(request), "registry", None)
+
+
+def _schedule_view(request: Request, row: dict[str, Any]) -> dict[str, Any]:
+    return decorate_schedule(row, _registry(request))
 
 
 def _from_state(request: Request, name: str) -> Any:
@@ -268,6 +342,53 @@ def rule_failures(
     return guarded(_service(request).sample_failures, rule_id, limit)
 
 
+@router.post("/rules/batch")
+def batch_rules(payload: BatchRulesInput, request: Request):
+    return guarded(_service(request).batch_create, payload.model_dump())
+
+
+@router.post("/rules/{rule_id}/template")
+def save_rule_as_template(rule_id: str, payload: SaveTemplateInput, request: Request):
+    service = _service(request)
+    store = _store(request)
+    rule = guarded(store.get_rule, rule_id)
+    prepared = guarded(service.template_from_rule, rule, payload.name, payload.description)
+    return decorate_template(guarded(store.create_template, prepared))
+
+
+# ----- rule templates -------------------------------------------------------------
+@router.get("/templates")
+def list_templates(
+    request: Request,
+    name: str | None = Query(default=None, max_length=200),
+    metric: str | None = Query(default=None, max_length=64),
+    page: int = Query(default=1, ge=1),
+    size: int = Query(default=DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+):
+    listing = guarded(_store(request).list_templates, name, metric, page, size)
+    return decorate_page(listing, decorate_template)
+
+
+@router.post("/templates")
+def create_template(payload: CreateTemplateInput, request: Request):
+    prepared = guarded(_service(request).prepare_template, payload.model_dump())
+    return decorate_template(guarded(_store(request).create_template, prepared))
+
+
+@router.post("/templates/{template_id}/update")
+def update_template(template_id: str, payload: UpdateTemplateInput, request: Request):
+    store = _store(request)
+    stored = guarded(store.get_template, template_id)
+    merged = {**stored, **payload.model_dump(exclude_unset=True)}
+    prepared = guarded(_service(request).prepare_template, merged)
+    return decorate_template(guarded(store.update_template, template_id, prepared))
+
+
+@router.post("/templates/{template_id}/delete")
+def delete_template(template_id: str, payload: EmptyInput, request: Request):
+    return guarded(_store(request).delete_template, template_id)
+
+
 @router.post("/run")
 def run_all(payload: EmptyInput, request: Request):
     return guarded(_service(request).run_enabled, trigger="manual")
@@ -282,13 +403,13 @@ def list_schedules(
     size: int = Query(default=DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
 ):
     listing = guarded(_store(request).list_schedules, name, page, size)
-    return decorate_page(listing, decorate_schedule)
+    return decorate_page(listing, lambda row: _schedule_view(request, row))
 
 
 @router.post("/schedules")
 def create_schedule(payload: CreateScheduleInput, request: Request):
     prepared = guarded(_service(request).prepare_schedule, payload.model_dump())
-    return decorate_schedule(guarded(_store(request).create_schedule, prepared))
+    return _schedule_view(request, guarded(_store(request).create_schedule, prepared))
 
 
 @router.post("/schedules/{schedule_id}/update")
@@ -307,7 +428,7 @@ def update_schedule(schedule_id: str, payload: UpdateScheduleInput, request: Req
         planned = guarded(next_fire_time, updated.get("cron_expression"))
         updated = guarded(store.set_schedule_state, schedule_id, 1, planned)
         _scheduler(request).forget(schedule_id)
-    return decorate_schedule(updated)
+    return _schedule_view(request, updated)
 
 
 @router.post("/schedules/{schedule_id}/delete")
@@ -326,12 +447,42 @@ def toggle_schedule(schedule_id: str, payload: ToggleScheduleInput, request: Req
         # Starting a task validates its cron now, so a broken expression is
         # refused here instead of stopping the task again on the next tick.
         planned = guarded(next_fire_time, stored.get("cron_expression"))
-    return decorate_schedule(guarded(store.set_schedule_state, schedule_id, target, planned))
+    return _schedule_view(request, guarded(store.set_schedule_state, schedule_id, target, planned))
 
 
 @router.post("/schedules/{schedule_id}/run")
 def run_schedule(schedule_id: str, payload: EmptyInput, request: Request):
     return guarded(_scheduler(request).fire, schedule_id)
+
+
+# ----- registered tasks and their runs --------------------------------------------
+@router.get("/tasks")
+def list_tasks(request: Request):
+    registry = _registry(request)
+    return {
+        "items": registry.options() if registry else [],
+        "misfire_policies": [{"value": key, "label": label} for key, label in MISFIRE_LABELS.items()],
+        "run_statuses": [{"value": key, "label": label} for key, label in TASK_RUN_STATUS_LABELS.items()],
+        "scheduler": _scheduler(request).status(),
+    }
+
+
+@router.get("/task-runs")
+def list_task_runs(
+    request: Request,
+    schedule_id: str | None = Query(default=None, max_length=20),
+    status: str | None = Query(default=None, max_length=16),
+    task: str | None = Query(default=None, max_length=240),
+    page: int = Query(default=1, ge=1),
+    size: int = Query(default=DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+):
+    listing = guarded(_store(request).list_task_runs, schedule_id or None, status or None, task or None, page, size)
+    return decorate_page(listing, decorate_task_run)
+
+
+@router.get("/task-runs/{run_id}")
+def get_task_run(run_id: str, request: Request):
+    return decorate_task_run(guarded(_store(request).get_task_run, run_id))
 
 
 # ----- analysis and history -------------------------------------------------------

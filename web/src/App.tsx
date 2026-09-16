@@ -13,12 +13,14 @@ import {
   Expand,
   Globe2,
   Layers,
+  ListTree,
   Menu,
   MessageSquareText,
   Network,
   RefreshCw,
   Search,
   ShieldCheck,
+  Sigma,
   TerminalSquare,
   Users,
   X,
@@ -27,7 +29,10 @@ import {
   request,
   errorMessage,
   LOCAL_SAMPLE_ID,
+  type AuthStatus,
+  type AuthUser,
   type Bootstrap,
+  type ConsoleContext,
   type DataSource,
   type Health,
   type QueryResult,
@@ -47,6 +52,10 @@ import {
   StandardsPage,
 } from "./DataPages";
 import { PolarisExplorer, PolarisOverviewPage } from "./PolarisPages";
+import MetadataPage from "./MetadataPage";
+import { LoginPage, UserMenu, UsersPage } from "./AuthPages";
+import OpsPage from "./OpsPage";
+import MetricsPage from "./MetricsPage";
 
 const navigation = [
   { id: "overview", label: "指标总览", icon: ChartNoAxesCombined },
@@ -54,8 +63,10 @@ const navigation = [
   { id: "sources", label: "数据源", icon: Database },
   { id: "ingestion", label: "数据接入", icon: ArrowDownToLine },
   { id: "quality", label: "数据质量", icon: ShieldCheck },
+  { id: "metadata", label: "元数据管理", icon: ListTree },
   { id: "standards", label: "标准规范", icon: BookOpen },
   { id: "semantic", label: "语义模型", icon: Network },
+  { id: "metrics", label: "指标平台", icon: Sigma },
   { id: "sql", label: "SQL 工作台", icon: TerminalSquare },
   { id: "services", label: "数据服务", icon: Boxes },
   { id: "questions", label: "智能问数", icon: MessageSquareText },
@@ -67,9 +78,12 @@ const navigation = [
   },
   { id: "identities", label: "身份与权限", icon: Users },
   { id: "explorer", label: "API 控制台", icon: TerminalSquare },
+  { id: "ops", label: "运行观测", icon: Activity, group: "平台管理" },
+  { id: "users", label: "用户与权限", icon: Users },
 ];
 function initialPage() {
-  const id = window.location.hash.slice(1);
+  // A page may keep its own sub-route after a slash (#metadata/entity/…).
+  const id = window.location.hash.slice(1).split("/")[0];
   return navigation.some((item) => item.id === id) ? id : "questions";
 }
 
@@ -85,11 +99,14 @@ export default function App() {
   const [searchOpen, setSearchOpen] = useState(false);
   const [search, setSearch] = useState("");
   const [bootstrap, setBootstrap] = useState<Bootstrap | null>(null);
+  const [auth, setAuth] = useState<AuthStatus | null>(null);
+  const [authError, setAuthError] = useState("");
   const [health, setHealth] = useState<Health | null>(null);
   const [error, setError] = useState("");
   const [result, setResult] = useState<QueryResult | null>(null);
   const [sql, setSql] = useState("");
   const [explorerSearch, setExplorerSearch] = useState("");
+  const [explorerContext, setExplorerContext] = useState<ConsoleContext>({});
   const [revision, setRevision] = useState(0);
   const [fullscreenError, setFullscreenError] = useState("");
   const [stale, setStale] = useState(false);
@@ -117,7 +134,25 @@ export default function App() {
       setSourcesError(errorMessage(e));
     }
   }
+  const signedIn = !!auth && (!auth.enabled || !!auth.user);
+  async function loadAuth() {
+    try {
+      setAuth(await request<AuthStatus>("/api/auth/status"));
+      setAuthError("");
+    } catch (e) {
+      setAuthError(errorMessage(e));
+    }
+  }
   useEffect(() => {
+    void loadAuth();
+    const onSignedOut = () => {
+      setAuth((current) => (current && current.enabled ? { ...current, user: null } : current));
+    };
+    window.addEventListener("lattice:unauthenticated", onSignedOut);
+    return () => window.removeEventListener("lattice:unauthenticated", onSignedOut);
+  }, []);
+  useEffect(() => {
+    if (!signedIn) return;
     request<Bootstrap>("/api/bootstrap")
       .then(setBootstrap)
       .catch((e) => setError(errorMessage(e)));
@@ -159,7 +194,7 @@ export default function App() {
       document.removeEventListener("visibilitychange", recheck);
       window.removeEventListener("focus", recheck);
     };
-  }, []);
+  }, [signedIn]);
   function goTo(id: string, query?: string, source?: string) {
     if (source) setSourceId(source);
     if (query !== undefined) {
@@ -173,8 +208,12 @@ export default function App() {
     setSearch("");
     if (window.innerWidth <= 860) setSidebarOpen(false);
   }
-  function explore(query: string) {
+  function explore(query: string, context?: ConsoleContext) {
     setExplorerSearch(query);
+    // A page that already knows which catalog, namespace or model it is showing
+    // hands that identity over, so the console opens on a runnable request
+    // instead of placeholder values that no real call can satisfy.
+    setExplorerContext(context ?? {});
     setRevision((value) => value + 1);
     goTo("explorer");
   }
@@ -198,6 +237,9 @@ export default function App() {
   }
   const label =
     navigation.find((item) => item.id === page)?.label ?? "智能问数";
+  const visibleNavigation = navigation.filter(
+    (item) => !auth?.user || auth.user.pages.includes(item.id),
+  );
   const shared = bootstrap
     ? {
         bootstrap,
@@ -219,12 +261,38 @@ export default function App() {
         sources: () => <SourcesPage {...shared} />,
         ingestion: () => <IngestionPage {...shared} />,
         quality: () => <QualityPage {...shared} />,
+        metadata: () => <MetadataPage {...shared} />,
         standards: () => <StandardsPage {...shared} />,
         semantic: () => <SemanticPage {...shared} />,
+        metrics: () => <MetricsPage {...shared} />,
         sql: () => <SqlPage {...shared} initialSql={sql} />,
         services: () => <ServicesPage {...shared} />,
       }
     : {};
+  if (auth && auth.enabled && !auth.user) {
+    return (
+      <LoginPage
+        status={auth}
+        onLoggedIn={(user: AuthUser) => setAuth({ ...auth, user, setup_required: false })}
+      />
+    );
+  }
+  if (!auth) {
+    return (
+      <div className="login-page">
+        {authError ? (
+          <div className="login-card">
+            <ErrorBanner message={`无法读取登录状态：${authError}`} />
+            <button type="button" className="secondary-button" onClick={() => void loadAuth()}>
+              重试
+            </button>
+          </div>
+        ) : (
+          <Loading text="正在连接服务…" />
+        )}
+      </div>
+    );
+  }
   return (
     <div
       className={`app-shell ${sidebarOpen ? "sidebar-open" : "sidebar-closed"}`}
@@ -272,7 +340,7 @@ export default function App() {
           <span>Lattice 数据平台</span>
         </a>
         <nav aria-label="主导航">
-          {navigation.map((item) => (
+          {visibleNavigation.map((item) => (
             <div key={item.id}>
               {item.group && (
                 <div className="navigation-group">{item.group}</div>
@@ -328,8 +396,19 @@ export default function App() {
               <Expand size={17} />
             </button>
             <span className="topbar-divider" />
-            <span className="avatar">L</span>
-            <span className="user-label">Lattice</span>
+            {auth?.user ? (
+              <UserMenu
+                user={auth.user}
+                enabled={auth.enabled}
+                onLoggedOut={() => void loadAuth()}
+                onOpenUsers={() => goTo("users")}
+              />
+            ) : (
+              <>
+                <span className="avatar">L</span>
+                <span className="user-label">Lattice</span>
+              </>
+            )}
           </div>
         </header>
         <div className="tabbar">
@@ -388,7 +467,14 @@ export default function App() {
                 explore={explore}
               />
             ) : page === "explorer" ? (
-              <PolarisExplorer initialSearch={explorerSearch} />
+              <PolarisExplorer
+                initialSearch={explorerSearch}
+                initialContext={explorerContext}
+              />
+            ) : page === "ops" ? (
+              <OpsPage />
+            ) : page === "users" ? (
+              auth && auth.user && <UsersPage status={auth} me={auth.user} />
             ) : shared ? (
               views[page]?.()
             ) : (
@@ -420,7 +506,7 @@ export default function App() {
             </button>
           </div>
           <div>
-            {navigation
+            {visibleNavigation
               .filter((item) =>
                 item.label.toLowerCase().includes(search.toLowerCase()),
               )

@@ -459,3 +459,15 @@ def test_an_unusable_dsn_warns_instead_of_writing_a_broken_card(tmp_path, monkey
     monkeypatch.setenv("LATTICE_QUALITY_DSN", "mysql://user@host/db")
     engines.write_quality_datasource()
     assert not (runtime / "quality-datasource.json").exists()
+
+
+# ----- the business PostgreSQL -----------------------------------------------------------
+def test_business_postgres_seeding_is_skipped_without_a_reachable_database(monkeypatch):
+    """The business database is not started by the script: missing config or a closed
+    port must be reported as unavailable, never as a failed engine."""
+    monkeypatch.setattr(engines, "read_config", lambda name: None)
+    with pytest.raises(engines.EngineUnavailable):
+        engines.seed_business_postgres({})
+    monkeypatch.setattr(engines, "read_config", lambda name: {"type": "postgresql", "host": "127.0.0.1", "port": 1, "user": "u", "password": "p", "database": "d"})
+    with pytest.raises(engines.EngineUnavailable, match="无法连接"):
+        engines.seed_business_postgres({})

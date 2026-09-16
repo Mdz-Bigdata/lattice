@@ -53,11 +53,15 @@ from __future__ import annotations
 
 import datetime as dt
 import threading
+from dataclasses import replace
 import time
 from operator import eq, ge, gt, le, lt, ne
 from typing import Any, Callable
 
 from croniter import croniter
+
+from .observability import observe
+from .tasks import TaskError, TaskRegistry, json_detail, summarize
 
 from .connectors import ConnectorError
 from .datasources import DataSourceError, DataSourceRegistry
@@ -70,11 +74,17 @@ from .quality_metrics import (
     dimension_label,
     make_context,
     metric_label,
+    reference_aggregate_sql,
     validate_config,
 )
 from .quality_store import (
     DIMENSION_LABELS,
     LEVEL_LABELS,
+    MAX_BACKFILL,
+    MAX_RETRY_DELAY,
+    MAX_RETRY_LIMIT,
+    MISFIRE_LABELS,
+    TASK_RUN_STATUS_LABELS,
     QualityStore,
     QualityStoreError,
     plain_number,
@@ -103,15 +113,29 @@ RULE_STATE_LABELS = {1: "启用", 0: "禁用"}
 SCHEDULE_STATE_LABELS = {1: "运行", 0: "停止"}
 EXECUTION_STATUS_LABELS = {0: "运行中", 1: "成功", 2: "失败"}
 RESULT_STATE_LABELS = {1: "成功", 2: "失败"}
-TRIGGER_LABELS = {"manual": "手动", "schedule": "调度"}
+TRIGGER_LABELS = {"manual": "手动", "schedule": "调度", "retry": "重试", "backfill": "补跑"}
 SUPPORTED_BEAN = "QualityTask"
 SUPPORTED_METHOD = "run"
-SCAN_LIMIT_NOTE = "「该数据源按最多 50 万行扫描，统计可能不完整。」"
+SCAN_LIMIT_NOTE = "「该数据源按有限快照扫描（数据湖表最多 50 万行，文档 / 消息按快照行数），统计可能不完整。」"
 DEFAULT_SAMPLE_ROWS = 20
 MAX_SAMPLE_ROWS = 200
 MAX_CRON_LENGTH = 120
 CRON_FIELDS = (5, 6)
 SCHEDULER_INTERVAL = 5.0
+MAX_BATCH_TARGETS = 200
+#: Seeded once into dv_rule_template; users edit, delete and add their own.
+BUILTIN_TEMPLATES: tuple[dict[str, Any], ...] = (
+    {"name": "主键唯一", "description": "核查字段不允许出现重复值。", "metric": "column_duplicate", "level": "high", "threshold": 0},
+    {"name": "字段非空", "description": "核查字段不允许为 NULL。", "metric": "column_null", "level": "high", "threshold": 0},
+    {"name": "字段非空白", "description": "核查字段不允许为空字符串或仅有空白。", "metric": "column_blank", "threshold": 0},
+    {"name": "空值率不超过 5%", "description": "允许少量空值，按百分比比较。", "metric": "column_null", "result_formula": "percentage", "operator": "lte", "threshold": 5},
+    {"name": "手机号格式", "description": "中国大陆 11 位手机号。", "metric": "column_match_regex", "config": {"regexp": "^1[3-9][0-9]{9}$"}, "threshold": 0},
+    {"name": "邮箱格式", "description": "形如 name@domain 的邮箱地址。", "metric": "column_match_regex", "config": {"regexp": "^[^@ ]+@[^@ ]+[.][^@ ]+$"}, "threshold": 0},
+    {"name": "金额非负", "description": "数值字段不允许小于 0。", "metric": "column_value_between", "config": {"min": 0}, "threshold": 0},
+    {"name": "当日已更新", "description": "表内最新时间字段距今不超过 1 天。", "metric": "table_freshness", "config": {"interval_value": 1, "interval_unit": "day"}, "threshold": 0},
+    {"name": "行数与参照库一致", "description": "下发时填写参照数据源与参照表；差异行数不超过阈值。", "metric": "cross_source_compare", "config": {"aggregate": "count"}, "threshold": 0},
+    {"name": "自定义 SQL 无异常行", "description": "把 WHERE 条件改成异常记录的判断条件，返回的每一行都算不合规。", "metric": "custom_sql", "config": {"mode": "rows", "sql": "SELECT * FROM ${table} WHERE 1 = 0"}, "threshold": 0},
+)
 MAX_MESSAGE = 2000
 
 
@@ -230,10 +254,34 @@ def decorate_rule(row: dict[str, Any]) -> dict[str, Any]:
     return rule
 
 
-def decorate_schedule(row: dict[str, Any]) -> dict[str, Any]:
+def decorate_schedule(row: dict[str, Any], registry: TaskRegistry | None = None) -> dict[str, Any]:
     schedule = dict(row or {})
     schedule["state_label"] = SCHEDULE_STATE_LABELS.get(_as_int(schedule.get("state")), "")
+    schedule["task"] = f"{schedule.get('bean_name') or SUPPORTED_BEAN}.{schedule.get('method_name') or SUPPORTED_METHOD}"
+    schedule["task_label"] = (
+        registry.label_of(schedule.get("bean_name"), schedule.get("method_name")) if registry else schedule["task"]
+    )
+    schedule["misfire_policy_label"] = MISFIRE_LABELS.get(_text(schedule.get("misfire_policy")) or "skip", "")
+    schedule["last_status_label"] = TASK_RUN_STATUS_LABELS.get(_text(schedule.get("last_status")), "")
     return schedule
+
+
+def decorate_template(row: dict[str, Any]) -> dict[str, Any]:
+    template = dict(row or {})
+    metric = METRICS.get(_text(template.get("metric")))
+    template["metric_label"] = metric.label if metric else _text(template.get("metric"))
+    template["dimension_label"] = _dimension_label(template.get("dimension"))
+    template["level_label"] = LEVEL_LABELS.get(_text(template.get("level")), "")
+    template["needs_column"] = bool(metric.needs_column) if metric else False
+    template["builtin"] = _as_int(template.get("builtin")) == 1
+    return template
+
+
+def decorate_task_run(row: dict[str, Any]) -> dict[str, Any]:
+    run = dict(row or {})
+    run["trigger_label"] = TRIGGER_LABELS.get(_text(run.get("trigger_type")), "")
+    run["status_label"] = TASK_RUN_STATUS_LABELS.get(_text(run.get("status")), "")
+    return run
 
 
 def decorate_result(row: dict[str, Any]) -> dict[str, Any]:
@@ -263,9 +311,11 @@ def decorate_page(page: dict[str, Any], decorate: Callable[[dict], dict]) -> dic
 class QualityService:
     """Runs rules: SQL generation, execution through a connector, verdict, history."""
 
-    def __init__(self, store: QualityStore, sources: DataSourceRegistry):
+    def __init__(self, store: QualityStore, sources: DataSourceRegistry, registry: TaskRegistry | None = None):
         self.store = store
         self.sources = sources
+        #: Dispatch table of the 调度 screen; ``None`` means only QualityTask.run exists.
+        self.registry = registry
 
     # ----- form metadata --------------------------------------------------------
     def options(self) -> dict[str, Any]:
@@ -285,6 +335,8 @@ class QualityService:
             {"value": state, "label": label} for state, label in RULE_STATE_LABELS.items()
         ]
         data["scheduler"] = {"bean_name": SUPPORTED_BEAN, "method_name": SUPPORTED_METHOD}
+        data["tasks"] = self.registry.options() if self.registry else []
+        data["misfire_policies"] = [{"value": key, "label": label} for key, label in MISFIRE_LABELS.items()]
         return data
 
     # ----- saving ---------------------------------------------------------------
@@ -320,6 +372,9 @@ class QualityService:
             raise QualityError(400, "结果计算方式只能是 actual 或 percentage。")
         if metric.needs_column and not _text(rule.get("column_name")):
             raise QualityError(400, f"{metric.label} 需要指定核查字段。")
+        aggregate = _text((rule.get("config") or {}).get("aggregate")) or "count"
+        if metric_id == "cross_source_compare" and aggregate != "count" and not _text(rule.get("column_name")):
+            raise QualityError(400, "按求和、平均、最小或最大值跨库比对时需要指定核查字段。")
         source_id = _text(rule.get("datasource_id"))
         if not source_id:
             raise QualityError(400, "请选择数据源。")
@@ -343,24 +398,153 @@ class QualityService:
         return rule
 
     def prepare_schedule(self, data: dict[str, Any]) -> dict[str, Any]:
-        """Validate a schedule; only the built-in task is dispatchable."""
+        """Validate a schedule: a registered task, a parseable cron, sane policies."""
         schedule = dict(data or {})
         bean = _text(schedule.get("bean_name")) or SUPPORTED_BEAN
         method = _text(schedule.get("method_name")) or SUPPORTED_METHOD
-        if bean != SUPPORTED_BEAN or method != SUPPORTED_METHOD:
+        if self.registry is not None:
+            task = self.registry.get(bean, method)
+            params = self.registry.check_params(task, schedule.get("method_params"))
+        elif bean != SUPPORTED_BEAN or method != SUPPORTED_METHOD:
             raise QualityError(
                 400, f"调度任务仅支持内置的 {SUPPORTED_BEAN}.{SUPPORTED_METHOD}。"
             )
+        else:
+            params = _text(schedule.get("method_params"))
         fields = cron_fields(schedule.get("cron_expression"))
         next_fire_time(" ".join(fields))
+        policy = _text(schedule.get("misfire_policy")) or "skip"
+        if policy not in MISFIRE_LABELS:
+            raise QualityError(400, "补跑策略只能是 skip（跳过）、once（补跑一次）或 all（逐次补跑）。")
         schedule.update(
             {
                 "bean_name": bean,
                 "method_name": method,
+                "method_params": params,
                 "cron_expression": " ".join(str(schedule.get("cron_expression") or "").split()),
+                "retry_limit": _int_between(schedule.get("retry_limit"), "失败重试次数", 0, 0, MAX_RETRY_LIMIT),
+                "retry_delay_seconds": _int_between(schedule.get("retry_delay_seconds"), "重试间隔", 60, 1, MAX_RETRY_DELAY),
+                "misfire_policy": policy,
+                "max_backfill": _int_between(schedule.get("max_backfill"), "补跑上限", 10, 1, MAX_BACKFILL),
             }
         )
         return schedule
+
+    # ----- templates and batches --------------------------------------------------
+    def prepare_template(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Validate a template: a rule definition without a target; required
+        parameters may stay empty until the template is applied."""
+        template = dict(data or {})
+        metric_id = _text(template.get("metric"))
+        metric = METRICS.get(metric_id)
+        if metric is None:
+            raise QualityError(400, f"不支持的核查类型：{metric_id[:40] or '（空）'}。")
+        level = _text(template.get("level")) or "medium"
+        if level not in LEVEL_LABELS:
+            raise QualityError(400, "规则级别只能是 high、medium 或 low。")
+        operator = _text(template.get("operator")) or "lte"
+        if operator not in OPERATORS:
+            raise QualityError(400, "比较方式只能是 " + "、".join(OPERATORS) + "。")
+        expected_type = _text(template.get("expected_type")) or "fix_value"
+        if expected_type not in EXPECTED_TYPES:
+            raise QualityError(400, "期望值类型只能是 fix_value 或 table_total_rows。")
+        formula = _text(template.get("result_formula")) or "actual"
+        if formula not in RESULT_FORMULAS:
+            raise QualityError(400, "结果计算方式只能是 actual 或 percentage。")
+        if not _text(template.get("name")):
+            raise QualityError(400, "请填写模板名称。")
+        template.update(
+            {
+                "name": _text(template.get("name")),
+                "description": _text(template.get("description")),
+                "metric": metric_id,
+                "dimension": metric.dimension,
+                "level": level,
+                "operator": operator,
+                "expected_type": expected_type,
+                "result_formula": formula,
+                "threshold": _number(template.get("threshold"), "阈值"),
+                "config": validate_config(metric_id, template.get("config"), partial=True),
+            }
+        )
+        return template
+
+    def template_from_rule(self, rule: dict[str, Any], name: str | None = None, description: str | None = None) -> dict[str, Any]:
+        """A template carrying a rule's definition, with the target left out."""
+        return self.prepare_template(
+            {
+                "name": _text(name) or _text(rule.get("name")),
+                "description": _text(description) or f"由规则「{_text(rule.get('name'))}」保存",
+                "metric": rule.get("metric"),
+                "level": rule.get("level"),
+                "config": rule.get("config") or {},
+                "expected_type": rule.get("expected_type"),
+                "result_formula": rule.get("result_formula"),
+                "operator": rule.get("operator"),
+                "threshold": rule.get("threshold"),
+            }
+        )
+
+    def ensure_templates(self) -> None:
+        """Seed the built-in templates once; a database that is down is left to health()."""
+        try:
+            if self.store.count_templates() > 0:
+                return
+            for item in BUILTIN_TEMPLATES:
+                self.store.create_template({**self.prepare_template(item), "builtin": 1})
+        except (QualityStoreError, QualityError, MetricError):
+            return
+
+    def batch_create(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Apply one definition to many targets; every target is validated on its own."""
+        data = dict(payload or {})
+        template = self.store.get_template(data["template_id"]) if data.get("template_id") else None
+        base = template or data.get("rule") or {}
+        if not base:
+            raise QualityError(400, "请选择规则模板或提供规则定义。")
+        targets = [dict(item) for item in data.get("targets") or [] if isinstance(item, dict)]
+        if not targets:
+            raise QualityError(400, "请至少选择一个目标表。")
+        if len(targets) > MAX_BATCH_TARGETS:
+            raise QualityError(400, f"一次最多下发 {MAX_BATCH_TARGETS} 个目标。")
+        overrides = {key: value for key, value in (data.get("config") or {}).items() if value not in (None, "")}
+        prefix = _text(data.get("name_prefix")) or _text(base.get("name")) or METRICS[_text(base.get("metric"))].label
+        created: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+        for target in targets:
+            table = _text(target.get("table_name"))
+            column = _text(target.get("column_name")) or None
+            name = f"{prefix} · {table}" + (f".{column}" if column else "")
+            rule = {
+                "name": name[:200],
+                "metric": base.get("metric"),
+                "dimension": base.get("dimension"),
+                "level": base.get("level"),
+                "config": {**(base.get("config") or {}), **overrides},
+                "expected_type": base.get("expected_type"),
+                "result_formula": base.get("result_formula"),
+                "operator": base.get("operator"),
+                "threshold": base.get("threshold"),
+                "datasource_id": target.get("datasource_id"),
+                "schema_name": _text(target.get("schema_name")) or None,
+                "table_name": table,
+                "column_name": column,
+                "state": 1 if data.get("state") is None else data.get("state"),
+                "comment": _text(data.get("comment")) or (f"由模板「{template['name']}」批量下发" if template else "批量下发"),
+            }
+            try:
+                created.append(decorate_rule(self.store.create_rule(self.prepare_rule(rule))))
+            except (*ENGINE_ERRORS, ValueError) as error:
+                errors.append(
+                    {
+                        "datasource_id": target.get("datasource_id"),
+                        "schema_name": rule["schema_name"],
+                        "table_name": table,
+                        "column_name": column,
+                        "message": _reason(error),
+                    }
+                )
+        return {"total": len(targets), "created": created, "errors": errors}
 
     # ----- SQL ------------------------------------------------------------------
     def _build(self, rule: dict[str, Any], connector: Any) -> MetricSql:
@@ -372,7 +556,30 @@ class QualityService:
             rule.get("config") or {},
             source_type=getattr(connector, "type_id", ""),
         )
-        return build(_text(rule.get("metric")), context)
+        built = build(_text(rule.get("metric")), context)
+        if built.compare == "aggregate":
+            # The reference side runs on another engine, so it is generated in that
+            # engine's dialect from the reference connector, never from the source's.
+            config = rule.get("config") or {}
+            reference_id = _text(config.get("reference_datasource"))
+            if not reference_id:
+                raise QualityError(400, "跨库比对需要选择参照数据源。")
+            record = self.sources.record(reference_id)
+            reference = self.sources.connector(reference_id)
+            built = replace(
+                built,
+                reference_datasource=reference_id,
+                reference_label=_text(record.get("name")) or reference_id,
+                reference_sql=reference_aggregate_sql(
+                    reference.dialect,
+                    config.get("reference_schema"),
+                    config.get("reference_table"),
+                    config.get("reference_column"),
+                    config.get("aggregate") or "count",
+                    config.get("reference_filter") or "",
+                ),
+            )
+        return built
 
     def preview(self, rule_id: Any) -> dict[str, Any]:
         """The three statements of a stored rule, without executing anything."""
@@ -388,6 +595,10 @@ class QualityService:
             "invalidate_sql": built.invalidate_sql,
             "predicate": built.predicate,
             "scan_limited": built.scan_limited,
+            "compare": built.compare,
+            "reference_datasource": built.reference_datasource,
+            "reference_label": built.reference_label,
+            "reference_sql": built.reference_sql,
         }
 
     def sample_failures(self, rule_id: Any, limit: Any = DEFAULT_SAMPLE_ROWS) -> dict[str, Any]:
@@ -411,7 +622,8 @@ class QualityService:
     @staticmethod
     def _scalar(connector: Any, sql: str, label: str) -> float:
         """Read the single aggregate value of one generated statement."""
-        answer = connector.query(sql, 1)
+        with observe(label, "quality"):
+            answer = connector.query(sql, 1)
         rows = answer.get("rows") or []
         value = rows[0][0] if rows and rows[0] else 0
         if value is None:
@@ -486,8 +698,20 @@ class QualityService:
         try:
             connector = self.sources.connector(_text(rule.get("datasource_id")))
             built = self._build(rule, connector)
-            checked = self._scalar(connector, built.total_sql, "核查数量")
-            actual = self._scalar(connector, built.actual_sql, "不合规数量")
+            summary = ""
+            if built.compare == "aggregate":
+                source_value = self._scalar(connector, built.actual_sql, "本库聚合值")
+                reference_value = self._scalar(
+                    self.sources.connector(built.reference_datasource), built.reference_sql, "参照库聚合值"
+                )
+                checked, actual = reference_value, abs(source_value - reference_value)
+                summary = (
+                    f"跨库比对完成：本库 {plain_number(source_value)}，"
+                    f"参照库（{built.reference_label}）{plain_number(reference_value)}，差异 {plain_number(actual)}"
+                )
+            else:
+                checked = self._scalar(connector, built.total_sql, "核查数量")
+                actual = self._scalar(connector, built.actual_sql, "不合规数量")
             verdict = self._verdict(rule, checked, actual)
         except Exception as error:  # noqa: BLE001 - the row must never stay 运行中
             message = f"规则「{name}」执行失败：{_reason(error)}"
@@ -499,8 +723,9 @@ class QualityService:
             raise
 
         message = (
-            f"核查完成：核查 {plain_number(checked)} 行，"
-            f"不合规 {plain_number(actual)} 行，得分 {verdict['score']}。"
+            f"{summary}，得分 {verdict['score']}。"
+            if summary
+            else f"核查完成：核查 {plain_number(checked)} 行，不合规 {plain_number(actual)} 行，得分 {verdict['score']}。"
         )
         if built.scan_limited:
             message += SCAN_LIMIT_NOTE
@@ -602,6 +827,40 @@ def _status(error: BaseException) -> int:
     return status if isinstance(status, int) else 400
 
 
+def _int_between(value: Any, label: str, default: int, minimum: int, maximum: int) -> int:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        raise QualityError(400, f"{label}必须是整数。")
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as error:
+        raise QualityError(400, f"{label}必须是整数。") from error
+    if number < minimum or number > maximum:
+        raise QualityError(400, f"{label}必须在 {minimum} 到 {maximum} 之间。")
+    return number
+
+
+def _int_or(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def missed_slots(expression: Any, start: dt.datetime, end: dt.datetime, limit: int) -> list[dt.datetime]:
+    """Every cron firing from ``start`` (inclusive) up to ``end``, at most ``limit``."""
+    slots: list[dt.datetime] = []
+    cursor = start - dt.timedelta(seconds=1)
+    while len(slots) < max(1, limit):
+        slot = next_fire_time(expression, cursor)
+        if slot > end:
+            break
+        slots.append(slot)
+        cursor = slot
+    return slots
+
+
 def _sample_limit(limit: Any) -> int:
     if limit is None or limit == "":
         return DEFAULT_SAMPLE_ROWS
@@ -613,27 +872,37 @@ def _sample_limit(limit: Any) -> int:
 
 
 class QualityScheduler:
-    """In-process cron scheduler for 质量调度管理.
+    """In-process cron scheduler for 质量调度管理 and every registered task.
 
     One daemon thread polls the schedules in state 运行 and fires those whose
-    cron time has arrived. The loop body is fully guarded: a schedule with an
-    unparseable cron is stopped and reported through an execution row instead of
-    killing the thread, and a schedule that is already firing is skipped so two
-    runs of the same task can never overlap. Missed firings are never replayed —
-    the next time is computed from the moment of the decision to fire.
+    cron time has arrived, dispatching each through the task registry. The loop
+    body is fully guarded: a schedule with an unparseable cron is stopped and
+    reported through an execution row instead of killing the thread, and a
+    schedule that is already firing is skipped so two runs of the same task can
+    never overlap. A failed run is retried up to the schedule's ``retry_limit``
+    after ``retry_delay_seconds``; firings missed while the gateway was down
+    follow its ``misfire_policy``: skipped (the default, planned again from the
+    moment of the decision), replayed once, or replayed slot by slot up to
+    ``max_backfill``. Every attempt leaves a row in ``dv_task_run``.
     """
 
     def __init__(
-        self, store: QualityStore, service: QualityService, interval: float = SCHEDULER_INTERVAL
+        self,
+        store: QualityStore,
+        service: QualityService,
+        interval: float = SCHEDULER_INTERVAL,
+        registry: TaskRegistry | None = None,
     ):
         self.store = store
         self.service = service
         self.interval = max(0.1, float(interval))
+        self.registry = registry
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._planned: dict[int, dt.datetime] = {}
         self._firing: set[int] = set()
+        self._retries: dict[int, tuple[dt.datetime, int]] = {}
         self._error = ""
 
     # ----- lifecycle ------------------------------------------------------------
@@ -658,6 +927,24 @@ class QualityScheduler:
         thread = self._thread
         return thread is not None and thread.is_alive()
 
+    def tasks(self) -> TaskRegistry:
+        """The dispatch table; without one, only the built-in quality job exists."""
+        registry = self.registry or getattr(self.service, "registry", None)
+        if registry is None:
+            registry = TaskRegistry()
+            registry.add(
+                SUPPORTED_BEAN,
+                SUPPORTED_METHOD,
+                "质量核查全量执行",
+                lambda params, context: self.service.run_enabled(
+                    trigger=str(context.get("trigger") or "schedule"), schedule_id=context.get("schedule_id")
+                ),
+                description="执行全部启用的核查规则。",
+                category="数据质量",
+            )
+            self.registry = registry
+        return registry
+
     def status(self) -> dict[str, Any]:
         """What 质量健康 shows: the thread's state and the jobs it is watching."""
         jobs: list[dict[str, Any]] = []
@@ -667,19 +954,28 @@ class QualityScheduler:
         except QualityStoreError as failure:
             schedules = []
             error = _reason(failure)
+        registry = self.tasks()
         for schedule in schedules:
             identifier = _as_int(schedule.get("id"))
             planned = self._planned.get(identifier)
+            retry = self._retries.get(identifier)
             jobs.append(
                 {
                     "id": schedule.get("id"),
                     "name": schedule.get("name") or "",
+                    "task": f"{schedule.get('bean_name')}.{schedule.get('method_name')}",
+                    "task_label": registry.label_of(schedule.get("bean_name"), schedule.get("method_name")),
                     "next_fire_time": (
                         planned.isoformat() if planned else schedule.get("next_fire_time")
                     ),
+                    "retry_due": retry[0].isoformat() if retry else None,
+                    "retry_attempt": retry[1] if retry else None,
+                    "last_status": schedule.get("last_status") or "",
+                    "last_message": schedule.get("last_message") or "",
+                    "firing": identifier in self._firing,
                 }
             )
-        return {"running": self.running(), "jobs": jobs, "last_error": error}
+        return {"running": self.running(), "jobs": jobs, "last_error": error, "tasks": registry.keys()}
 
     # ----- loop -----------------------------------------------------------------
     def _loop(self) -> None:
@@ -710,6 +1006,8 @@ class QualityScheduler:
         # A schedule that was stopped is re-planned from its cron when it starts again.
         for identifier in set(self._planned) - live:
             self._planned.pop(identifier, None)
+        for identifier in set(self._retries) - live:
+            self._retries.pop(identifier, None)
         return fired
 
     def forget(self, schedule_id: Any) -> None:
@@ -723,9 +1021,14 @@ class QualityScheduler:
         if identifier is not None:
             with self._lock:
                 self._planned.pop(identifier, None)
+                self._retries.pop(identifier, None)
 
     def fire(self, schedule_id: Any) -> dict[str, Any]:
-        """Fire one schedule immediately, as 立即执行 on the 调度 screen does."""
+        """Fire one schedule immediately, as 立即执行 on the 调度 screen does.
+
+        A manual run is never retried automatically: the person who pressed the
+        button is watching and gets the failure back as an error.
+        """
         schedule = self.store.get_schedule(schedule_id)
         identifier = _as_int(schedule.get("id"))
         moment = dt.datetime.now()
@@ -735,15 +1038,26 @@ class QualityScheduler:
                 raise QualityError(409, "该调度任务正在执行中，请稍后再试。")
             self._firing.add(identifier)
         try:
-            summary = self.service.run_enabled(trigger="schedule", schedule_id=identifier)
+            result = self._run_task(
+                schedule, identifier, moment, attempt=1, trigger="manual", planned_time=moment, retry_allowed=False
+            )
             self._remember(identifier, moment, planned)
         finally:
             with self._lock:
                 self._firing.discard(identifier)
-        return summary
+        if not result["ok"]:
+            raise QualityError(result["status_code"], result["message"])
+        outcome = result["outcome"]
+        return {**(outcome if isinstance(outcome, dict) else {}), **result}
 
     # ----- one schedule ---------------------------------------------------------
     def _due(self, schedule: dict[str, Any], identifier: int, moment: dt.datetime) -> bool:
+        retry = self._retries.get(identifier)
+        if retry is not None:
+            due, attempt = retry
+            if moment < due:
+                return False
+            return self._fire(schedule, identifier, moment, attempt=attempt, trigger="retry", planned_time=due)
         planned = self._planned.get(identifier)
         if planned is None:
             planned = self._plan(schedule, identifier, moment)
@@ -760,12 +1074,42 @@ class QualityScheduler:
         if planned is None:
             return None
         stored = _parse_time(schedule.get("next_fire_time"))
-        # A restart honours a future firing already announced on the 调度 screen.
+        last: Any = schedule.get("last_fire_time")
         if stored is not None and moment < stored < planned:
+            # A restart honours a future firing already announced on the 调度 screen.
             planned = stored
+        elif stored is not None and stored <= moment and self._backfill(schedule, identifier, moment, stored):
+            last = moment
         self._planned[identifier] = planned
-        self._remember(identifier, schedule.get("last_fire_time"), planned)
+        self._remember(identifier, last, planned)
         return planned
+
+    def _backfill(
+        self, schedule: dict[str, Any], identifier: int, moment: dt.datetime, stored: dt.datetime
+    ) -> bool:
+        """Replay firings missed while the gateway was down, per the schedule's policy."""
+        policy = str(schedule.get("misfire_policy") or "skip")
+        if policy == "skip":
+            return False
+        if policy == "all":
+            slots = missed_slots(schedule.get("cron_expression"), stored, moment, _int_or(schedule.get("max_backfill"), 10))
+        else:
+            slots = [stored]
+        with self._lock:
+            if identifier in self._firing:
+                return False
+            self._firing.add(identifier)
+        try:
+            for slot in slots:
+                if self._stop.is_set():
+                    break
+                self._run_task(
+                    schedule, identifier, moment, attempt=1, trigger="backfill", planned_time=slot, retry_allowed=False
+                )
+        finally:
+            with self._lock:
+                self._firing.discard(identifier)
+        return bool(slots)
 
     def _next(
         self, schedule: dict[str, Any], identifier: int, moment: dt.datetime
@@ -776,24 +1120,123 @@ class QualityScheduler:
             self._disable(schedule, identifier, _reason(error))
             return None
 
-    def _fire(self, schedule: dict[str, Any], identifier: int, moment: dt.datetime) -> bool:
+    def _fire(
+        self,
+        schedule: dict[str, Any],
+        identifier: int,
+        moment: dt.datetime,
+        *,
+        attempt: int = 1,
+        trigger: str = "schedule",
+        planned_time: dt.datetime | None = None,
+    ) -> bool:
         with self._lock:
             if identifier in self._firing:
                 return False
             self._firing.add(identifier)
         try:
-            planned = self._next(schedule, identifier, moment)
-            if planned is None:
-                return False
-            # Computed before the run and from ``moment``: an overrunning run or
-            # a gateway that was down skips the missed slots, never replays them.
-            self._planned[identifier] = planned
-            self.service.run_enabled(trigger="schedule", schedule_id=identifier)
-            self._remember(identifier, moment, planned)
+            if trigger == "schedule":
+                planned_time = self._planned.get(identifier) or moment
+                planned = self._next(schedule, identifier, moment)
+                if planned is None:
+                    return False
+                # Computed before the run and from ``moment``: an overrunning run
+                # skips the slots it covered instead of replaying them.
+                self._planned[identifier] = planned
+                self._retries.pop(identifier, None)
+            self._run_task(schedule, identifier, moment, attempt=attempt, trigger=trigger, planned_time=planned_time)
+            if trigger == "schedule":
+                self._remember(identifier, moment, self._planned.get(identifier))
             return True
         finally:
             with self._lock:
                 self._firing.discard(identifier)
+
+    def _run_task(
+        self,
+        schedule: dict[str, Any],
+        identifier: int,
+        moment: dt.datetime,
+        *,
+        attempt: int,
+        trigger: str,
+        planned_time: dt.datetime | None,
+        retry_allowed: bool = True,
+    ) -> dict[str, Any]:
+        """Dispatch one attempt, record it, and decide whether a retry follows."""
+        registry = self.tasks()
+        bean = str(schedule.get("bean_name") or SUPPORTED_BEAN)
+        method = str(schedule.get("method_name") or SUPPORTED_METHOD)
+        name = str(schedule.get("name") or identifier)
+        run_id = self._open_run(schedule, identifier, f"{bean}.{method}", registry.label_of(bean, method), trigger, attempt, planned_time)
+        started = time.monotonic()
+        context = {
+            # 立即执行 of a schedule is still a scheduled job to the task it runs: the
+            # quality executions it writes carry that schedule, as they always did.
+            "trigger": "schedule" if trigger == "manual" else trigger,
+            "schedule_id": identifier,
+            "schedule_name": name,
+            "attempt": attempt,
+            "planned_time": planned_time.isoformat() if planned_time else None,
+        }
+        try:
+            outcome = registry.run(bean, method, schedule.get("method_params") or "", context)
+        except Exception as error:  # noqa: BLE001 - any task failure is recorded, and maybe retried
+            message = _reason(error)
+            limit = _int_or(schedule.get("retry_limit"), 0) if retry_allowed and not isinstance(error, TaskError) else 0
+            if attempt <= limit:
+                delay = max(1, _int_or(schedule.get("retry_delay_seconds"), 60))
+                due = moment + dt.timedelta(seconds=delay)
+                self._retries[identifier] = (due, attempt + 1)
+                status = "retrying"
+                text = f"第 {attempt} 次执行失败，{due:%H:%M:%S} 进行第 {attempt + 1} 次尝试：{message}"
+            else:
+                self._retries.pop(identifier, None)
+                status = "failed"
+                text = f"执行失败（共尝试 {attempt} 次）：{message}" if attempt > 1 else f"执行失败：{message}"
+            self._close_run(run_id, status, started, text, {})
+            self._outcome(identifier, status, text)
+            self._error = f"调度任务「{name}」{text}"
+            return {"ok": False, "status": status, "message": text, "run_id": run_id, "outcome": None, "status_code": _status(error)}
+        self._retries.pop(identifier, None)
+        text = summarize(outcome) or "执行完成"
+        if attempt > 1:
+            text = f"第 {attempt} 次尝试成功：{text}"
+        self._close_run(run_id, "success", started, text, json_detail(outcome))
+        self._outcome(identifier, "success", text)
+        return {"ok": True, "status": "success", "message": text, "run_id": run_id, "outcome": outcome, "status_code": 200}
+
+    # ----- bookkeeping ----------------------------------------------------------
+    def _open_run(
+        self, schedule: dict[str, Any], identifier: int, task: str, label: str, trigger: str, attempt: int, planned_time: Any
+    ) -> int | None:
+        try:
+            return self.store.start_task_run(
+                schedule_id=identifier,
+                schedule_name=str(schedule.get("name") or "")[:200],
+                task=task,
+                task_label=label,
+                trigger_type=trigger,
+                attempt=attempt,
+                planned_time=planned_time,
+            )
+        except (QualityStoreError, AttributeError) as error:
+            self._error = f"任务执行记录未能写入元数据库：{_reason(error)}"
+            return None
+
+    def _close_run(self, run_id: int | None, status: str, started: float, message: str, detail: dict[str, Any]) -> None:
+        if run_id is None:
+            return
+        try:
+            self.store.finish_task_run(run_id, status, _elapsed(started), message[:MAX_MESSAGE], detail)
+        except (QualityStoreError, AttributeError) as error:
+            self._error = f"任务执行记录未能写入元数据库：{_reason(error)}"
+
+    def _outcome(self, identifier: int, status: str, message: str) -> None:
+        try:
+            self.store.record_schedule_outcome(identifier, status, message[:MAX_MESSAGE])
+        except (QualityStoreError, AttributeError) as error:
+            self._error = f"调度结果未能写入元数据库：{_reason(error)}"
 
     def _disable(self, schedule: dict[str, Any], identifier: int, reason: str) -> None:
         """Stop a schedule whose cron cannot be parsed, and say so in 执行日志."""
@@ -801,6 +1244,7 @@ class QualityScheduler:
         message = f"调度任务「{name}」的 cron 表达式无效，已停止运行：{reason}"
         self._error = message
         self._planned.pop(identifier, None)
+        self._retries.pop(identifier, None)
         try:
             self.store.set_schedule_state(identifier, 0)
             execution_id = self.store.start_execution(

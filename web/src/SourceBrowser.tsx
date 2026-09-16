@@ -6,10 +6,13 @@ import {
   Cpu,
   Database,
   Eye,
+  FileJson,
   FolderTree,
   HardDrive,
   Layers,
+  Radio,
   RefreshCw,
+  Search,
   Table2,
   Upload,
   Warehouse,
@@ -76,7 +79,13 @@ export function categoryIcon(category: string, size = 18): ReactNode {
         ? Warehouse
         : category.includes("表格式") || category.includes("数据湖")
           ? Layers
-          : Database;
+          : category.includes("文档")
+            ? FileJson
+            : category.includes("搜索")
+              ? Search
+              : category.includes("消息")
+                ? Radio
+                : Database;
   return <Icon size={size} />;
 }
 /** Trailing detail of a connection summary, e.g. "lattice_demo" of "127.0.0.1:5432 / lattice_demo". */

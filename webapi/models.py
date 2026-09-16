@@ -23,17 +23,16 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
-import json
 import re
 import threading
 import uuid
-from pathlib import Path
 
 import yaml
 import httpx
 
 from validation import validate as validator
 
+from .ossie_document import check_document
 from .polaris import PolarisClient, PolarisError
 
 CATALOG = "lattice"
@@ -45,7 +44,6 @@ MAX_LIST_RECORDS = 1000
 MODEL_ID = re.compile(r"lattice_model_[0-9a-f]{32}\Z")
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 OWNER = "lattice-webui"
-SCHEMA = Path(__file__).resolve().parent.parent / "core-spec" / "ossie-schema.json"
 
 
 class ModelStoreError(ValueError):
@@ -99,19 +97,7 @@ def validate_document(document: str) -> bytes:
     """Validate on the server even when the browser previously validated YAML."""
     data = parse_document(document)
     try:
-        schema = json.loads(SCHEMA.read_text())
-        failures = validator.validate_schema(data, schema)
-        if not failures:
-            messages = (
-                validator.validate_unique_names(data)
-                + validator.validate_references(data)
-                + validator.validate_sql(data)
-            )
-            failures = [
-                message
-                for message in messages
-                if not message.startswith(("[Reference] Warning:", "[SQL] Warning:"))
-            ]
+        failures, _ = check_document(data)
         if failures:
             raise ModelStoreError(
                 422,

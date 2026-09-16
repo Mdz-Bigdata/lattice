@@ -8,11 +8,13 @@ import {
   RefreshCw,
   Save,
   ShieldCheck,
+  Sparkles,
   Trash2,
 } from "lucide-react";
 import { request, errorMessage } from "./api";
 import type { DataPageProps } from "./DataPages";
 import { Empty, ErrorBanner, Loading, PageTitle } from "./components";
+import { AiModelDrawer } from "./AiPanels";
 import NativeModelsPanel from "./NativeModelsPanel";
 
 interface Validation {
@@ -68,7 +70,7 @@ function rememberDraft(patch: Partial<{ name: string; yaml: string }>) {
   }
 }
 
-export default function SemanticPage({ bootstrap, explore }: DataPageProps) {
+export default function SemanticPage({ bootstrap, explore, sources, sourceId }: DataPageProps) {
   const [initialDraft] = useState(() => readDraft(bootstrap.model_yaml));
   const [yaml, setYamlState] = useState(initialDraft.yaml);
   const [name, setNameState] = useState(initialDraft.name);
@@ -93,6 +95,7 @@ export default function SemanticPage({ bootstrap, explore }: DataPageProps) {
   const [listBusy, setListBusy] = useState(false);
   const [listError, setListError] = useState("");
   const [listNotice, setListNotice] = useState("");
+  const [aiOpen, setAiOpen] = useState(false);
   const listRequest = useRef(0);
   const dirty = yaml !== baseline.yaml || name !== baseline.name;
 
@@ -268,6 +271,10 @@ export default function SemanticPage({ bootstrap, explore }: DataPageProps) {
             <button className="secondary-button" onClick={download}>
               <Download size={14} />
               导出 YAML
+            </button>
+            <button className="secondary-button" onClick={() => setAiOpen(true)} disabled={!!busy}>
+              <Sparkles size={14} />
+              AI 生成草稿
             </button>
             <button
               className="secondary-button"
@@ -458,6 +465,19 @@ export default function SemanticPage({ bootstrap, explore }: DataPageProps) {
           )
         )}
       </section>
+      {aiOpen && (
+        <AiModelDrawer
+          sources={sources}
+          sourceId={sourceId}
+          onClose={() => setAiOpen(false)}
+          onLoad={(draftName, draftYaml) => {
+            setAiOpen(false);
+            setName(draftName);
+            setYaml(draftYaml);
+            setSuccess("已载入 AI 生成的草稿，请校验后保存。");
+          }}
+        />
+      )}
     </div>
   );
 }

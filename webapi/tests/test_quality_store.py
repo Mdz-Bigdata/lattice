@@ -375,7 +375,8 @@ def test_bootstrap_is_idempotent_ddl(store, database):
     created = " ".join(database.statements)
     for table in TABLES:
         assert f"{SCHEMA}.{table}" in created
-    assert created.count("CREATE INDEX IF NOT EXISTS") == 2 * 3
+    assert created.count("CREATE INDEX IF NOT EXISTS") == 2 * 5
+    assert created.count("ADD COLUMN IF NOT EXISTS") == 2 * 6
 
 
 def test_bootstrap_never_raises_when_the_database_is_down(store, database):
@@ -565,8 +566,8 @@ def test_create_schedule_applies_the_documented_defaults(store, database):
     database.queue(["id"], [(1,)])
     store.create_schedule({"name": "每日质量巡检", "cron_expression": "0 0 12 * * ?"})
     sql, params = database.calls[0]
-    assert params == ("每日质量巡检", "QualityTask", "run", "", "0 0 12 * * ?", 0)
-    assert sql.count("%s") == 6
+    assert params == ("每日质量巡检", "QualityTask", "run", "", "0 0 12 * * ?", 0, 0, 60, "skip", 10)
+    assert sql.count("%s") == 10
     assert_parameterised(database)
 
 
@@ -861,3 +862,38 @@ def test_report_date_bounds_are_rejected_as_chinese_errors():
             _day(bad)
         assert info.value.status_code == 400
         assert str(info.value).endswith("。")
+
+
+def test_task_runs_are_parameterised_and_bounded(store, database):
+    database.queue(["id"], [(7,)])
+    run_id = store.start_task_run(
+        schedule_id=3, schedule_name="每日巡检", task="QualityTask.run", task_label="质量核查全量执行",
+        trigger_type="retry", attempt=2, planned_time="2026-09-12T12:00:00", message=INJECTION,
+    )
+    assert run_id == 7
+    sql, params = database.calls[0]
+    assert params[:7] == (3, "每日巡检", "QualityTask.run", "质量核查全量执行", "retry", 2, "running")
+    assert params[8] == INJECTION and INJECTION not in sql
+    database.queue(["id"], [(7,)])
+    store.finish_task_run(7, "success", 120, "共 3 条规则", {"total": 3})
+    sql, params = database.calls[1]
+    assert params[0] == "success" and params[1] == 120 and params[4] == 7
+    with pytest.raises(QualityStoreError, match="执行状态"):
+        store.finish_task_run(7, "running")
+    with pytest.raises(QualityStoreError, match="补跑策略"):
+        store.create_schedule({"name": "x", "cron_expression": "0 0 12 * * ?", "misfire_policy": "later"})
+    with pytest.raises(QualityStoreError, match="失败重试次数"):
+        store.create_schedule({"name": "x", "cron_expression": "0 0 12 * * ?", "retry_limit": 99})
+    assert_parameterised(database)
+
+
+def test_task_run_listing_filters_by_schedule_status_and_task(store, database):
+    database.queue(["count"], [(1,)])
+    database.queue(["id"], [(1,)])
+    store.list_task_runs(schedule_id=3, status="failed", task="MetadataTask.ingest", page=2, size=10)
+    count_sql, count_params = database.calls[0]
+    assert count_params == (3, "failed", "MetadataTask.ingest")
+    assert "schedule_id = %s AND status = %s AND task = %s" in count_sql
+    _, params = database.calls[1]
+    assert params[-2:] == (10, 10)
+    assert_parameterised(database)

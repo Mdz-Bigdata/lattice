@@ -42,7 +42,9 @@ from webapi.quality_service import (
     cron_fields,
     next_fire_time,
 )
+from webapi.quality_metrics import MetricError
 from webapi.quality_store import DIMENSION_LABELS, QualityStoreError
+from webapi.tasks import TaskError, TaskRegistry, register_platform_tasks
 
 BASE = dt.datetime(2026, 9, 12, 11, 59, 30)
 SOURCE_ID = "quality-postgres"
@@ -119,8 +121,10 @@ class FakeStore:
         self.schedules = {}
         self.executions = {}
         self.results = []
-        self.counters = {"rule": 0, "schedule": 0, "execution": 0, "result": 0}
+        self.counters = {"rule": 0, "schedule": 0, "execution": 0, "result": 0, "task_run": 0, "template": 0}
         self.failure = None
+        self.task_runs = {}
+        self.templates = {}
 
     # ----- helpers ----------------------------------------------------------
     def _claim(self, kind):
@@ -263,6 +267,96 @@ class FakeStore:
         return [dict(row) for row in self.schedules.values() if row.get("state") == 1]
 
     # ----- executions -------------------------------------------------------
+    # ----- templates --------------------------------------------------------
+    def count_templates(self):
+        self._check()
+        return len(self.templates)
+
+    def list_templates(self, name=None, metric=None, page=1, size=20):
+        self._check()
+        items = [dict(row) for row in self.templates.values() if (not name or name in row["name"]) and (not metric or row["metric"] == metric)]
+        return {"items": items, "total": len(items)}
+
+    def get_template(self, template_id):
+        self._check()
+        row = self.templates.get(self._identifier(template_id, "模板编号"))
+        if row is None:
+            raise QualityStoreError(404, "规则模板不存在。")
+        return dict(row)
+
+    def create_template(self, data):
+        self._check()
+        row = {"description": "", "level": "medium", "config": {}, "expected_type": "fix_value", "result_formula": "actual", "operator": "lte", "threshold": 0, "builtin": 0, **data, "id": self._claim("template")}
+        self.templates[row["id"]] = row
+        return dict(row)
+
+    def update_template(self, template_id, data):
+        identifier = self._identifier(template_id, "模板编号")
+        row = {**self.get_template(identifier), **data, "id": identifier}
+        self.templates[identifier] = row
+        return dict(row)
+
+    def delete_template(self, template_id):
+        identifier = self._identifier(template_id, "模板编号")
+        self.get_template(identifier)
+        self.templates.pop(identifier)
+        return {"id": identifier, "deleted": True}
+
+    def record_schedule_outcome(self, schedule_id, status, message=""):
+        identifier = self._identifier(schedule_id, "调度编号")
+        row = self.get_schedule(identifier)
+        row["last_status"] = status
+        row["last_message"] = message
+        self.schedules[identifier] = row
+        return dict(row)
+
+    # ----- task runs --------------------------------------------------------
+    def start_task_run(self, *, schedule_id=None, schedule_name="", task="", task_label="", trigger_type="schedule", attempt=1, planned_time=None, message=""):
+        self._check()
+        identifier = self._claim("task_run")
+        self.task_runs[identifier] = {
+            "id": identifier,
+            "schedule_id": schedule_id,
+            "schedule_name": schedule_name,
+            "task": task,
+            "task_label": task_label,
+            "trigger_type": trigger_type,
+            "attempt": attempt,
+            "status": "running",
+            "planned_time": self._moment(planned_time),
+            "start_time": "2026-09-12T12:00:00",
+            "end_time": None,
+            "elapsed_ms": None,
+            "message": message,
+            "detail": {},
+        }
+        return identifier
+
+    def finish_task_run(self, run_id, status, elapsed_ms=None, message="", detail=None):
+        self._check()
+        row = self.task_runs.get(self._identifier(run_id, "执行编号"))
+        if row is None:
+            raise QualityStoreError(404, "任务执行记录不存在。")
+        row.update({"status": status, "end_time": "2026-09-12T12:00:01", "elapsed_ms": elapsed_ms, "message": message, "detail": detail or {}})
+        return dict(row)
+
+    def list_task_runs(self, schedule_id=None, status=None, task=None, page=1, size=20):
+        self._check()
+        items = [
+            dict(row)
+            for row in sorted(self.task_runs.values(), key=lambda row: -row["id"])
+            if (schedule_id in (None, "") or str(row["schedule_id"]) == str(schedule_id))
+            and (not status or row["status"] == status)
+            and (not task or row["task"] == task)
+        ]
+        return {"items": items, "total": len(items)}
+
+    def get_task_run(self, run_id):
+        row = self.task_runs.get(self._identifier(run_id, "执行编号"))
+        if row is None:
+            raise QualityStoreError(404, "任务执行记录不存在。")
+        return dict(row)
+
     def start_execution(
         self, rule_id=None, rule_name="", trigger_type="manual", schedule_id=None, message=""
     ):
@@ -1012,3 +1106,326 @@ def test_percentage_rule_keeps_the_count_column_a_count(store):
     assert by_count["result"]["state"] == 2
     assert by_ratio["result"]["state"] == 1
     assert "不合规 4 行" in by_ratio["execution"]["message"]
+
+
+# ---------------------------------------------------------------------------
+# Task registry: any registered job, retries, missed firings, run history
+# ---------------------------------------------------------------------------
+class FlakyTask:
+    """Fails the first ``failures`` calls, then answers with a summary."""
+
+    def __init__(self, failures=0, error=None):
+        self.failures = failures
+        self.error = error or RuntimeError("目标库连接超时")
+        self.calls = []
+
+    def __call__(self, params, context):
+        self.calls.append((params, dict(context)))
+        if len(self.calls) <= self.failures:
+            raise self.error
+        return {"tables": 3, "params": params}
+
+
+def registry_with(task, **extra):
+    registry = TaskRegistry()
+    registry.add("MetadataTask", "ingest", "元数据拾取", task, params_label="服务 FQN", **extra)
+    return registry
+
+
+def run_rows(store):
+    return [(row["trigger_type"], row["attempt"], row["status"]) for row in store.task_runs.values()]
+
+
+def test_scheduler_dispatches_any_registered_task(store):
+    task = FlakyTask()
+    scheduler = QualityScheduler(store, RecordingService(), interval=0.05, registry=registry_with(task))
+    store.schedules[1] = make_schedule(bean_name="MetadataTask", method_name="ingest", method_params="mysql-local", cron_expression="0 * * * * ?")
+    scheduler.tick(dt.datetime(2026, 9, 12, 12, 0, 0))
+    assert scheduler.tick(dt.datetime(2026, 9, 12, 12, 1, 0)) == [1]
+    assert task.calls[0][0] == "mysql-local"
+    assert task.calls[0][1]["trigger"] == "schedule" and task.calls[0][1]["schedule_id"] == 1
+    assert scheduler.service.calls == []
+    assert run_rows(store) == [("schedule", 1, "success")]
+    assert store.task_runs[1]["task"] == "MetadataTask.ingest" and store.task_runs[1]["detail"] == {"tables": 3, "params": "mysql-local"}
+    assert store.schedules[1]["last_status"] == "success" and "数据表 3" in store.schedules[1]["last_message"]
+    job = scheduler.status()["jobs"][0]
+    assert job["task_label"] == "元数据拾取" and job["last_status"] == "success"
+
+
+def test_failed_runs_are_retried_after_the_delay_until_the_limit(store):
+    task = FlakyTask(failures=2)
+    scheduler = QualityScheduler(store, RecordingService(), interval=0.05, registry=registry_with(task))
+    store.schedules[1] = make_schedule(bean_name="MetadataTask", method_name="ingest", cron_expression="0 0 12 * * ?", retry_limit=2, retry_delay_seconds=30)
+    scheduler.tick(dt.datetime(2026, 9, 12, 11, 0, 0))
+    noon = dt.datetime(2026, 9, 12, 12, 0, 0)
+    assert scheduler.tick(noon) == [1]
+    assert store.schedules[1]["last_status"] == "retrying"
+    assert scheduler.status()["jobs"][0]["retry_attempt"] == 2
+    assert scheduler.tick(noon + dt.timedelta(seconds=10)) == []
+    assert scheduler.tick(noon + dt.timedelta(seconds=30)) == [1]
+    assert scheduler.tick(noon + dt.timedelta(seconds=45)) == []
+    assert scheduler.tick(noon + dt.timedelta(seconds=60)) == [1]
+    assert run_rows(store) == [("schedule", 1, "retrying"), ("retry", 2, "retrying"), ("retry", 3, "success")]
+    assert store.schedules[1]["last_message"].startswith("第 3 次尝试成功")
+    assert scheduler.status()["jobs"][0]["retry_due"] is None
+    # The regular cadence is untouched by the retries.
+    assert store.schedules[1]["next_fire_time"] == "2026-09-13T12:00:00"
+
+
+def test_retries_stop_at_the_limit_and_a_task_error_is_never_retried(store):
+    task = FlakyTask(failures=9)
+    scheduler = QualityScheduler(store, RecordingService(), interval=0.05, registry=registry_with(task))
+    store.schedules[1] = make_schedule(bean_name="MetadataTask", method_name="ingest", cron_expression="0 0 12 * * ?", retry_limit=1, retry_delay_seconds=5)
+    noon = dt.datetime(2026, 9, 12, 12, 0, 0)
+    scheduler.tick(dt.datetime(2026, 9, 12, 11, 0, 0))
+    scheduler.tick(noon)
+    scheduler.tick(noon + dt.timedelta(seconds=5))
+    assert [row[2] for row in run_rows(store)] == ["retrying", "failed"]
+    assert store.schedules[1]["last_message"].startswith("执行失败（共尝试 2 次）")
+    assert scheduler.tick(noon + dt.timedelta(seconds=10)) == []
+    store.schedules[2] = make_schedule(id=2, name="未注册", bean_name="Nope", method_name="run", cron_expression="0 0 13 * * ?", retry_limit=3)
+    scheduler.tick(dt.datetime(2026, 9, 12, 12, 30, 0))
+    scheduler.tick(dt.datetime(2026, 9, 12, 13, 0, 0))
+    assert store.schedules[2]["last_status"] == "failed" and "未注册的调度任务" in store.schedules[2]["last_message"]
+    assert scheduler.status()["jobs"][1]["retry_due"] is None
+
+
+def test_missed_firings_follow_the_misfire_policy(store):
+    task = FlakyTask()
+    scheduler = QualityScheduler(store, RecordingService(), interval=0.05, registry=registry_with(task))
+    stored = "2026-09-12T12:00:00"
+    store.schedules[1] = make_schedule(id=1, name="跳过", bean_name="MetadataTask", method_name="ingest", cron_expression="0 * * * * ?", next_fire_time=stored)
+    store.schedules[2] = make_schedule(id=2, name="补跑一次", bean_name="MetadataTask", method_name="ingest", cron_expression="0 * * * * ?", next_fire_time=stored, misfire_policy="once")
+    store.schedules[3] = make_schedule(id=3, name="逐次补跑", bean_name="MetadataTask", method_name="ingest", cron_expression="0 * * * * ?", next_fire_time=stored, misfire_policy="all", max_backfill=3)
+    late = dt.datetime(2026, 9, 12, 12, 5, 30)
+    assert scheduler.tick(late) == []
+    runs = [(row["schedule_id"], row["trigger_type"], row["planned_time"]) for row in store.task_runs.values()]
+    assert runs == [
+        (2, "backfill", "2026-09-12T12:00:00"),
+        (3, "backfill", "2026-09-12T12:00:00"),
+        (3, "backfill", "2026-09-12T12:01:00"),
+        (3, "backfill", "2026-09-12T12:02:00"),
+    ]
+    assert len(task.calls) == 4 and task.calls[0][1]["planned_time"] == "2026-09-12T12:00:00"
+    for identifier in (1, 2, 3):
+        assert store.schedules[identifier]["next_fire_time"] == "2026-09-12T12:06:00"
+    assert store.schedules[1]["last_fire_time"] is None
+    assert store.schedules[3]["last_fire_time"] == "2026-09-12T12:05:30"
+
+
+def test_manual_fire_reports_a_failure_and_records_it(store):
+    task = FlakyTask(failures=1)
+    scheduler = QualityScheduler(store, RecordingService(), interval=0.05, registry=registry_with(task))
+    store.schedules[1] = make_schedule(bean_name="MetadataTask", method_name="ingest", state=0, retry_limit=3)
+    with pytest.raises(QualityError) as error:
+        scheduler.fire(1)
+    assert "目标库连接超时" in str(error.value)
+    assert run_rows(store) == [("manual", 1, "failed")]
+    assert scheduler.status()["jobs"] == []
+    outcome = scheduler.fire(1)
+    assert outcome["ok"] and outcome["tables"] == 3 and outcome["run_id"] == 2
+
+
+def test_prepare_schedule_checks_the_registry_and_policies(store):
+    task = FlakyTask()
+    registry = registry_with(task, params_required=True, params_hint="填写服务 FQN。")
+    service = QualityService(store, sources=None, registry=registry)
+    with pytest.raises(TaskError, match="未注册的调度任务"):
+        service.prepare_schedule({"name": "x", "bean_name": "Nope", "method_name": "run", "cron_expression": "0 0 12 * * ?"})
+    with pytest.raises(TaskError, match="需要填写服务 FQN"):
+        service.prepare_schedule({"name": "x", "bean_name": "MetadataTask", "method_name": "ingest", "cron_expression": "0 0 12 * * ?"})
+    with pytest.raises(QualityError, match="补跑策略"):
+        service.prepare_schedule({"name": "x", "bean_name": "MetadataTask", "method_name": "ingest", "method_params": "pg", "cron_expression": "0 0 12 * * ?", "misfire_policy": "later"})
+    with pytest.raises(QualityError, match="失败重试次数"):
+        service.prepare_schedule({"name": "x", "bean_name": "MetadataTask", "method_name": "ingest", "method_params": "pg", "cron_expression": "0 0 12 * * ?", "retry_limit": 11})
+    prepared = service.prepare_schedule({"name": "x", "bean_name": "MetadataTask", "method_name": "ingest", "method_params": " pg ", "cron_expression": "0 0 12 * * ?"})
+    assert prepared["method_params"] == "pg" and prepared["misfire_policy"] == "skip"
+    assert (prepared["retry_limit"], prepared["retry_delay_seconds"], prepared["max_backfill"]) == (0, 60, 10)
+    assert [item["key"] for item in service.options()["tasks"]] == ["MetadataTask.ingest"]
+
+
+def test_platform_tasks_adapt_the_services_they_wrap():
+    class Ingestor:
+        def __init__(self):
+            self.calls = []
+
+        def run(self, ref, *, trigger="manual"):
+            self.calls.append((ref, trigger))
+            return {"status": "success", "summary": {"tables": 2, "columns": 9}}
+
+        def due_services(self):
+            return [{"fqn": "a"}, {"fqn": "b"}]
+
+    class Insights:
+        def snapshot(self, day=None):
+            return {"day": day or "today", "assets": 5}
+
+    class Lineage:
+        def sync_views(self, service_fqn=None):
+            return {"views": 1, "edges": 2, "service": service_fqn}
+
+    ingestor = Ingestor()
+    registry = register_platform_tasks(TaskRegistry(), ingestor=ingestor, insights=Insights(), lineage=Lineage())
+    assert registry.keys() == ["MetadataTask.ingest", "MetadataTask.snapshot", "MetadataTask.syncViews"]
+    assert registry.run("MetadataTask", "ingest", "mysql-local", {"trigger": "schedule"}) == {"services": 1, "status": "success", "tables": 2, "columns": 9}
+    assert registry.run("MetadataTask", "ingest", "", {}) == {"services": 2, "tables": 4, "columns": 18}
+    assert ingestor.calls == [("mysql-local", "schedule"), ("a", "scheduled"), ("b", "scheduled")]
+    assert registry.run("MetadataTask", "snapshot", "2026-09-01", {})["day"] == "2026-09-01"
+    assert registry.run("MetadataTask", "syncViews", "", {})["service"] is None
+
+
+def test_task_routes_list_tasks_and_runs(store, service):
+    registry = registry_with(FlakyTask(failures=1))
+    service.registry = registry
+    application = FastAPI()
+    application.include_router(quality_api.router)
+    application.state.quality_store = store
+    application.state.quality = service
+    application.state.tasks = registry
+    application.state.quality_scheduler = QualityScheduler(store, service, interval=0.05, registry=registry)
+    with TestClient(application, base_url="http://127.0.0.1:8787") as client:
+        listing = client.get("/api/quality/tasks").json()
+        assert [item["key"] for item in listing["items"]] == ["MetadataTask.ingest"]
+        assert [item["value"] for item in listing["misfire_policies"]] == ["skip", "once", "all"]
+        refused = client.post("/api/quality/schedules", json={"name": "x", "bean_name": "Nope", "method_name": "run", "cron_expression": "0 0 12 * * ?"})
+        assert refused.status_code == 400 and "未注册的调度任务" in refused.json()["detail"]
+        created = client.post("/api/quality/schedules", json={"name": "拾取", "bean_name": "MetadataTask", "method_name": "ingest", "cron_expression": "0 0 12 * * ?", "retry_limit": 2, "misfire_policy": "once"}).json()
+        assert created["task_label"] == "元数据拾取" and created["misfire_policy_label"] == "补跑一次" and created["retry_limit"] == 2
+        failed = client.post(f"/api/quality/schedules/{created['id']}/run", json={})
+        assert failed.status_code == 400 and "目标库连接超时" in failed.json()["detail"]
+        assert client.post(f"/api/quality/schedules/{created['id']}/run", json={}).json()["ok"] is True
+        runs = client.get("/api/quality/task-runs", params={"schedule_id": created["id"]}).json()
+        assert [(item["status"], item["status_label"], item["trigger_label"]) for item in runs["items"]] == [("success", "成功", "手动"), ("failed", "失败", "手动")]
+        assert client.get("/api/quality/task-runs", params={"status": "failed"}).json()["total"] == 1
+        assert client.get(f"/api/quality/task-runs/{runs['items'][0]['id']}").json()["task"] == "MetadataTask.ingest"
+        assert client.get("/api/quality/task-runs/999").status_code == 404
+        schedules = client.get("/api/quality/schedules").json()["items"]
+        assert schedules[0]["last_status_label"] == "成功"
+
+
+# ---------------------------------------------------------------------------
+# Custom SQL, cross-source comparison, templates and batch creation
+# ---------------------------------------------------------------------------
+class TwoSources(FakeSources):
+    """A registry with one connector per data source, for cross-source rules."""
+
+    def __init__(self, connectors):
+        super().__init__(known=tuple(connectors))
+        self.connectors = connectors
+
+    def record(self, source_id):
+        if source_id not in self.connectors:
+            raise DataSourceError(404, "数据源不存在。")
+        return {"id": source_id, "name": f"库 {source_id}", "type": "postgresql"}
+
+    def connector(self, source_id):
+        self.record(source_id)
+        return self.connectors[source_id]
+
+
+def test_cross_source_rule_compares_aggregates_from_two_engines(store):
+    source = FakeConnector(checked=0, actual=1000)  # actual_value: this engine's row count
+    reference = FakeConnector(checked=997, actual=0)  # checked_count: the reference engine's
+    service = QualityService(store, TwoSources({"pg": source, "ch": reference}))
+    rule = service.prepare_rule({
+        "name": "订单行数一致", "metric": "cross_source_compare", "datasource_id": "pg", "schema_name": "public", "table_name": "orders",
+        "config": {"aggregate": "count", "reference_datasource": "ch", "reference_schema": "dw", "reference_table": "orders"},
+        "result_formula": "percentage", "operator": "lte", "threshold": 1,
+    })
+    assert rule["dimension"] == "consistency" and rule["datasource_name"] == "库 pg"
+    outcome = service.run_rule(store.create_rule(rule))
+    result = outcome["result"]
+    assert (result["checked_count"], result["actual_value"], result["state"]) == (997, 3, 1)
+    assert "本库 1000" in outcome["execution"]["message"] and "参照库（库 ch）997" in outcome["execution"]["message"]
+    assert reference.queries[-1][0] == 'SELECT count(1) AS checked_count FROM "dw"."orders"'
+    assert source.queries[-1][0] == 'SELECT count(1) AS actual_value FROM "public"."orders"'
+    preview = service.preview(rule["id"] if "id" in rule else 1)
+    assert preview["compare"] == "aggregate" and preview["reference_label"] == "库 ch" and "checked_count" in preview["reference_sql"]
+    with pytest.raises(QualityError, match="核查字段"):
+        service.prepare_rule({**rule, "config": {**rule["config"], "aggregate": "sum"}, "column_name": None})
+    with pytest.raises(DataSourceError):
+        service.prepare_rule({**rule, "config": {**rule["config"], "reference_datasource": "nope"}})
+
+
+def test_custom_sql_rule_runs_in_both_modes(store, connector, service):
+    rows = service.prepare_rule({
+        "name": "负金额", "metric": "custom_sql", "datasource_id": SOURCE_ID, "table_name": "orders",
+        "config": {"mode": "rows", "sql": "SELECT * FROM ${table} WHERE amount < 0"}, "threshold": 0,
+    })
+    outcome = service.run_rule(store.create_rule(rows))
+    assert outcome["result"]["actual_value"] == 4 and outcome["result"]["state"] == 2
+    assert "lattice_src" in outcome["result"]["invalidate_sql"]
+    value = service.prepare_rule({
+        "name": "负金额合计", "metric": "custom_sql", "datasource_id": SOURCE_ID, "table_name": "orders",
+        "config": {"mode": "value", "sql": "SELECT 4 AS actual_value"}, "operator": "lte", "threshold": 10,
+    })
+    assert service.run_rule(store.create_rule(value))["result"]["state"] == 1
+    with pytest.raises(MetricError, match="注释"):
+        service.prepare_rule({**rows, "config": {"mode": "rows", "sql": "SELECT * FROM ${table} -- x"}})
+
+
+def test_templates_are_seeded_once_and_saved_from_rules(store, service):
+    service.ensure_templates()
+    service.ensure_templates()
+    names = [row["name"] for row in store.templates.values()]
+    assert names[:2] == ["主键唯一", "字段非空"] and len(names) == 10
+    assert all(row["builtin"] == 1 for row in store.templates.values())
+    rule = store.create_rule(service.prepare_rule({
+        "name": "订单号唯一", "metric": "column_duplicate", "datasource_id": SOURCE_ID, "table_name": "orders", "column_name": "order_id", "level": "high",
+    }))
+    template = service.template_from_rule(rule, name="订单号唯一模板")
+    assert (template["metric"], template["level"], template["dimension"], template["description"]) == ("column_duplicate", "high", "uniqueness", "由规则「订单号唯一」保存")
+    with pytest.raises(QualityError, match="核查类型"):
+        service.prepare_template({"name": "x", "metric": "nope"})
+    with pytest.raises(QualityError, match="模板名称"):
+        service.prepare_template({"metric": "column_null"})
+
+
+def test_batch_create_validates_each_target_and_reports_the_rest(store, service):
+    template = store.create_template(service.prepare_template({"name": "字段非空", "metric": "column_null", "threshold": 0}))
+    outcome = service.batch_create({
+        "template_id": template["id"],
+        "targets": [
+            {"datasource_id": SOURCE_ID, "schema_name": "public", "table_name": "orders", "column_name": "order_id"},
+            {"datasource_id": SOURCE_ID, "table_name": "customers", "column_name": "customer_id"},
+            {"datasource_id": SOURCE_ID, "table_name": "payments"},
+            {"datasource_id": "missing", "table_name": "orders", "column_name": "id"},
+        ],
+        "state": 0,
+    })
+    assert outcome["total"] == 4 and [rule["name"] for rule in outcome["created"]] == ["字段非空 · orders.order_id", "字段非空 · customers.customer_id"]
+    assert [error["table_name"] for error in outcome["errors"]] == ["payments", "orders"]
+    assert "核查字段" in outcome["errors"][0]["message"] and outcome["created"][0]["state"] == 0
+    assert outcome["created"][0]["comment"] == "由模板「字段非空」批量下发"
+    overridden = service.batch_create({
+        "rule": {"name": "手机号", "metric": "column_match_regex", "config": {"regexp": "^1[0-9]{10}$"}},
+        "targets": [{"datasource_id": SOURCE_ID, "table_name": "users", "column_name": "phone"}],
+        "config": {"regexp": "^1[3-9][0-9]{9}$"},
+        "name_prefix": "手机号格式",
+    })
+    assert overridden["created"][0]["config"]["regexp"] == "^1[3-9][0-9]{9}$" and overridden["created"][0]["name"] == "手机号格式 · users.phone"
+    with pytest.raises(QualityError, match="目标表"):
+        service.batch_create({"template_id": template["id"], "targets": []})
+
+
+def test_template_and_batch_routes(client, store):
+    listing = client.get("/api/quality/templates").json()
+    assert listing["total"] == 0
+    created = client.post("/api/quality/templates", json={"name": "行数一致", "metric": "cross_source_compare", "config": {"aggregate": "count"}}).json()
+    assert created["dimension_label"] == "一致性校验" and created["needs_column"] is False and created["builtin"] is False
+    updated = client.post(f"/api/quality/templates/{created['id']}/update", json={"description": "参照库行数"}).json()
+    assert updated["description"] == "参照库行数"
+    assert client.post("/api/quality/templates", json={"name": "坏", "metric": "nope"}).status_code == 400
+    batch = client.post("/api/quality/rules/batch", json={
+        "template_id": created["id"],
+        "targets": [{"datasource_id": SOURCE_ID, "table_name": "orders"}],
+        "config": {"reference_datasource": SOURCE_ID, "reference_table": "orders_copy"},
+    }).json()
+    assert len(batch["created"]) == 1 and batch["created"][0]["metric_label"] == "跨库比对" and batch["errors"] == []
+    rule_id = batch["created"][0]["id"]
+    saved = client.post(f"/api/quality/rules/{rule_id}/template", json={"name": "从规则保存"}).json()
+    assert saved["metric"] == "cross_source_compare" and saved["config"]["reference_table"] == "orders_copy"
+    assert client.get("/api/quality/templates", params={"metric": "cross_source_compare"}).json()["total"] == 2
+    assert client.post(f"/api/quality/templates/{saved['id']}/delete", json={}).json()["deleted"] is True
+    assert client.post("/api/quality/templates/999/delete", json={}).status_code == 404
+    assert client.post("/api/quality/rules/batch", json={"targets": [{"datasource_id": SOURCE_ID, "table_name": "t"}]}).status_code == 400

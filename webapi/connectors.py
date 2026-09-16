@@ -28,6 +28,8 @@ from __future__ import annotations
 import concurrent.futures
 import datetime as dt
 import decimal
+import importlib
+import json
 import math
 import re
 import ssl as ssl_module
@@ -37,6 +39,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 import duckdb
+import httpx
 import sqlglot
 from sqlglot import exp
 
@@ -339,6 +342,10 @@ class Connector:
     def table(self, schema: str, name: str) -> dict[str, Any]:
         raise NotImplementedError
 
+    def view_definition(self, schema: str, name: str) -> str | None:
+        """The query behind a view when the engine exposes it (the catalog derives lineage from it)."""
+        return None
+
     def execute(self, sql: str, limit: int) -> tuple[list[str], list[list[Any]]]:
         """Run validated SQL and return up to ``limit`` raw rows."""
         raise NotImplementedError
@@ -526,6 +533,17 @@ class DuckDBConnector(Connector):
                 for row in columns
             ],
         }
+
+    def view_definition(self, schema, name):
+        check_identifier(schema, "模式名")
+        check_identifier(name, "表名")
+        row = self._run(
+            lambda con: con.execute(
+                "SELECT sql FROM duckdb_views() WHERE NOT internal AND schema_name = ? AND view_name = ?",
+                [schema, name],
+            ).fetchone()
+        )
+        return str(row[0]) if row and row[0] else None
 
     def default_schema(self):
         return "main"
@@ -715,6 +733,20 @@ class MySQLFamilyConnector(Connector):
                 for row in columns
             ],
         }
+
+    def view_definition(self, schema, name):
+        check_identifier(schema, "数据库名")
+        check_identifier(name, "表名")
+
+        def load(cursor):
+            cursor.execute(
+                "SELECT VIEW_DEFINITION FROM information_schema.VIEWS WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s",
+                (schema, name),
+            )
+            return cursor.fetchone()
+
+        row = self._run(load)
+        return str(row[0]) if row and row[0] else None
 
     def timeout_statements(self) -> list[str]:
         return [f"SET SESSION max_execution_time = {QUERY_TIMEOUT * 1000}"]
@@ -970,6 +1002,21 @@ class PostgresConnector(Connector):
             ],
         }
 
+    def view_definition(self, schema, name):
+        check_identifier(schema, "模式名")
+        check_identifier(name, "表名")
+
+        def load(cursor):
+            cursor.execute(
+                "SELECT pg_get_viewdef(c.oid, true) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE n.nspname = %s AND c.relname = %s AND c.relkind IN ('v', 'm')",
+                (schema, name),
+            )
+            return cursor.fetchone()
+
+        row = self._run(load)
+        return str(row[0]) if row and row[0] else None
+
     def execute(self, sql, limit):
         def call(cursor):
             cursor.execute(sql)
@@ -1091,6 +1138,17 @@ class ClickHouseConnector(Connector):
             }
             for row in rows
         ]
+
+    def view_definition(self, schema, name):
+        check_identifier(schema, "数据库名")
+        check_identifier(name, "表名")
+        rows = self._run(
+            lambda client: client.query(
+                "SELECT as_select FROM system.tables WHERE database = {db:String} AND name = {name:String}",
+                parameters={"db": schema, "name": name},
+            ).result_rows
+        )
+        return str(rows[0][0]) if rows and rows[0][0] else None
 
     def table(self, schema, name):
         check_identifier(schema, "数据库名")
@@ -1645,6 +1703,967 @@ class PaimonConnector(ArrowLakeConnector):
             raise ConnectorError(f"读取 Paimon 表 {schema}.{name} 失败：" + str(error)[:400]) from error
 
 
+# ---------------------------------------------------------------------------
+# Optional drivers and document snapshots (Oracle, SQL Server, MongoDB,
+# Elasticsearch, Kafka)
+# ---------------------------------------------------------------------------
+#: Import name -> pip distribution, for the message shown when a driver is absent.
+OPTIONAL_DRIVERS = {"oracledb": "oracledb", "pymssql": "pymssql", "pymongo": "pymongo", "kafka": "kafka-python"}
+#: Snapshot connectors never pull more than this many documents or messages per table.
+SNAPSHOT_MAX_ROWS = 200_000
+SNAPSHOT_DEFAULT_ROWS = 10_000
+#: Elasticsearch refuses ``from + size`` beyond ``index.max_result_window`` (10 000 by default).
+ELASTIC_PAGE = 10_000
+SYSTEM_DATABASES_MONGO = {"admin", "local", "config"}
+
+
+def optional_driver(module: str):
+    """Import a driver lazily; a missing one is a configuration problem, not a crash."""
+    try:
+        return importlib.import_module(module)
+    except ImportError as error:
+        package = OPTIONAL_DRIVERS.get(module, module)
+        raise ConnectorError(
+            f"缺少驱动 {package}：请在运行环境中安装后重试（例如 uv pip install {package}）。"
+        ) from error
+
+
+def flatten_document(document: Any, prefix: str = "", depth: int = 0) -> dict[str, Any]:
+    """One level of dotted keys for nested objects; deeper values become JSON text."""
+    flat: dict[str, Any] = {}
+    if not isinstance(document, dict):
+        return {"value": scalar_value(document)}
+    for key, value in document.items():
+        name = f"{prefix}{key}"
+        if isinstance(value, dict) and depth < 1:
+            flat.update(flatten_document(value, f"{name}.", depth + 1))
+        else:
+            flat[name] = scalar_value(value)
+    return flat
+
+
+def scalar_value(value: Any) -> Any:
+    """A JSON-safe scalar for one cell of a snapshot; containers become JSON text."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (dt.datetime, dt.date)):
+        return value
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8")
+        except UnicodeDecodeError:
+            return value.hex()
+    if isinstance(value, decimal.Decimal):
+        return float(value)
+    if isinstance(value, (dict, list, tuple)):
+        try:
+            return json.dumps(value, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            return str(value)
+    return str(value)
+
+
+def rows_to_arrow(rows: list[dict[str, Any]], columns: list[str] | None = None):
+    """An Arrow table whose column types survive mixed documents.
+
+    Arrow infers one type per column from the first values it sees and fails on
+    the first document that disagrees; a column that is not consistently
+    numeric, boolean or temporal is therefore stored as text.
+    """
+    import pyarrow as pa
+
+    names: list[str] = list(columns or [])
+    for row in rows:
+        for key in row:
+            if key not in names:
+                names.append(key)
+    if not names:
+        names = ["value"]
+    arrays = {}
+    for name in names:
+        values = [row.get(name) for row in rows]
+        present = [value for value in values if value is not None]
+        if all(isinstance(value, bool) for value in present):
+            arrays[name] = pa.array(values, type=pa.bool_())
+        elif all(isinstance(value, int) and not isinstance(value, bool) for value in present):
+            arrays[name] = pa.array(values, type=pa.int64())
+        elif all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in present):
+            arrays[name] = pa.array([float(value) if value is not None else None for value in values], type=pa.float64())
+        elif all(isinstance(value, dt.datetime) for value in present):
+            arrays[name] = pa.array(
+                [None if value is None else (value.replace(tzinfo=None) if value.tzinfo else value) for value in values],
+                type=pa.timestamp("us"),
+            )
+        else:
+            arrays[name] = pa.array([None if value is None else (value if isinstance(value, str) else str(value)) for value in values], type=pa.string())
+    return pa.table(arrays)
+
+
+def infer_columns(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Column descriptors from sampled documents: name, union of types, nullable."""
+    seen: dict[str, set[str]] = {}
+    counts: dict[str, int] = {}
+    nulls: set[str] = set()
+    for row in rows:
+        for key, value in row.items():
+            counts[key] = counts.get(key, 0) + 1
+            if value is None:
+                nulls.add(key)
+                continue
+            kind = {bool: "boolean", int: "integer", float: "double", str: "string"}.get(type(value))
+            if kind is None:
+                kind = "timestamp" if isinstance(value, (dt.datetime, dt.date)) else "string"
+            seen.setdefault(key, set()).add(kind)
+    return [
+        {
+            "name": key,
+            "type": " | ".join(sorted(seen.get(key, {"null"}))),
+            "nullable": counts.get(key, 0) < len(rows) or key in nulls,
+        }
+        for key in counts
+    ]
+
+
+def sample_rows_field(default: int = SNAPSHOT_DEFAULT_ROWS) -> dict[str, Any]:
+    return field(
+        "sample_rows",
+        "快照行数",
+        "number",
+        default=default,
+        help=f"每张表最多读取多少条记录用于查询与核查（上限 {SNAPSHOT_MAX_ROWS}）。",
+    )
+
+
+class SnapshotConnector(ArrowLakeConnector):
+    """A source without SQL: rows are pulled into DuckDB and queried there."""
+
+    dialect = "duckdb"
+    schema_name = "default"
+    schema_label = ""
+
+    def sample_limit(self, limit: int | None = None) -> int:
+        configured = self.config.get("sample_rows") or SNAPSHOT_DEFAULT_ROWS
+        bounded = max(1, min(int(configured), SNAPSHOT_MAX_ROWS))
+        return min(bounded, int(limit)) if limit else bounded
+
+    def default_schema(self):
+        return self.schema_name
+
+    def load_rows(self, schema: str, name: str, limit: int) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    def load_arrow(self, schema, name, limit):
+        if schema != self.schema_name:
+            raise ConnectorError(f"该数据源只有一个库 {self.schema_name}，没有 {schema}。")
+        return rows_to_arrow(self.load_rows(schema, name, self.sample_limit(limit)))
+
+
+# ----- Oracle ----------------------------------------------------------------------
+class OracleConnector(Connector):
+    type_id = "oracle"
+    label = "Oracle"
+    category = "关系数据库"
+    description = "Oracle Database 12c+（python-oracledb thin 模式，无需安装客户端库）。"
+    driver = "python-oracledb"
+    dialect = "oracle"
+    default_port = 1521
+    fields = [
+        field("host", "主机", required=True, placeholder="127.0.0.1"),
+        field("port", "端口", "number", required=True, default=1521),
+        field("user", "用户名", required=True),
+        field("password", "密码", "password"),
+        field("service_name", "服务名", required=True, placeholder="ORCLPDB1", help="连接串使用 主机:端口/服务名。"),
+        field("schema", "默认模式", help="留空时使用登录用户名（大写）。"),
+    ]
+
+    def summary(self):
+        return f"{self.config['host']}:{self.config['port']} / {self.config['service_name']}"
+
+    def connect(self):
+        oracledb = optional_driver("oracledb")
+        try:
+            return oracledb.connect(
+                user=self.config["user"],
+                password=self.config.get("password") or "",
+                dsn=f"{self.config['host']}:{self.config['port']}/{self.config['service_name']}",
+                tcp_connect_timeout=CONNECT_TIMEOUT,
+            )
+        except Exception as error:  # noqa: BLE001 - the driver's error hierarchy is its own
+            raise ConnectorError(str(error).strip()[:600]) from error
+
+    def _run(self, action):
+        state: dict[str, Any] = {}
+
+        def call():
+            connection = self.connect()
+            state["connection"] = connection
+            try:
+                cursor = connection.cursor()
+                try:
+                    return action(cursor)
+                finally:
+                    cursor.close()
+            finally:
+                connection.close()
+
+        def cancel():
+            connection = state.get("connection")
+            if connection is not None:
+                try:
+                    connection.cancel()
+                finally:
+                    connection.close()
+
+        try:
+            return self.timed(call, cancel)
+        except ConnectorError:
+            raise
+        except Exception as error:  # noqa: BLE001
+            raise ConnectorError(str(error).strip()[:600]) from error
+
+    def default_schema(self):
+        return (self.config.get("schema") or self.config["user"]).upper()
+
+    def test(self):
+        started = time.monotonic()
+
+        def probe(cursor):
+            cursor.execute("SELECT banner FROM v$version")
+            row = cursor.fetchone()
+            cursor.execute("SELECT count(*) FROM all_tables WHERE owner = :1", (self.default_schema(),))
+            return (row[0] if row else "Oracle"), cursor.fetchone()[0]
+
+        version, count = self._run(probe)
+        return {
+            "ok": True,
+            "status": "online",
+            "latency_ms": round((time.monotonic() - started) * 1000, 1),
+            "server_version": str(version)[:120],
+            "detail": f"连接成功，模式 {self.default_schema()} 中有 {count} 张表。",
+            "table_count": int(count),
+        }
+
+    def schemas(self):
+        def load(cursor):
+            cursor.execute("SELECT owner, count(*) FROM all_tables GROUP BY owner ORDER BY owner")
+            return cursor.fetchall()
+
+        return [{"name": row[0], "table_count": int(row[1])} for row in self._run(load)]
+
+    def tables(self, schema):
+        check_identifier(schema, "模式名")
+
+        def load(cursor):
+            cursor.execute(
+                "SELECT t.table_name, 'table', t.num_rows, c.comments FROM all_tables t "
+                "LEFT JOIN all_tab_comments c ON c.owner = t.owner AND c.table_name = t.table_name "
+                "WHERE t.owner = :1 "
+                "UNION ALL SELECT v.view_name, 'view', NULL, c.comments FROM all_views v "
+                "LEFT JOIN all_tab_comments c ON c.owner = v.owner AND c.table_name = v.view_name "
+                "WHERE v.owner = :2 ORDER BY 1",
+                (schema, schema),
+            )
+            return cursor.fetchall()
+
+        return [
+            {"schema": schema, "name": row[0], "kind": row[1], "rows": int(row[2]) if row[2] is not None else None, "comment": row[3] or ""}
+            for row in self._run(load)
+        ]
+
+    def table(self, schema, name):
+        check_identifier(schema, "模式名")
+        check_identifier(name, "表名")
+
+        def load(cursor):
+            cursor.execute(
+                "SELECT column_name, data_type, nullable FROM all_tab_columns "
+                "WHERE owner = :1 AND table_name = :2 ORDER BY column_id",
+                (schema, name),
+            )
+            columns = cursor.fetchall()
+            if not columns:
+                raise ConnectorError(f"未找到表 {schema}.{name}。")
+            cursor.execute(
+                "SELECT cc.column_name FROM all_constraints c JOIN all_cons_columns cc "
+                "ON cc.owner = c.owner AND cc.constraint_name = c.constraint_name "
+                "WHERE c.owner = :1 AND c.table_name = :2 AND c.constraint_type = 'P'",
+                (schema, name),
+            )
+            keys = {row[0] for row in cursor.fetchall()}
+            cursor.execute(f"SELECT count(*) FROM {self.qualified(schema, name)}")
+            return columns, keys, cursor.fetchone()[0]
+
+        columns, keys, count = self._run(load)
+        return {
+            "schema": schema,
+            "name": name,
+            "kind": "table",
+            "rows": int(count),
+            "columns": [
+                {"name": row[0], "type": row[1], "nullable": row[2] == "Y", "primary_key": row[0] in keys}
+                for row in columns
+            ],
+        }
+
+    def view_definition(self, schema, name):
+        check_identifier(schema, "模式名")
+        check_identifier(name, "表名")
+
+        def load(cursor):
+            cursor.execute("SELECT text FROM all_views WHERE owner = :1 AND view_name = :2", (schema, name))
+            return cursor.fetchone()
+
+        row = self._run(load)
+        return str(row[0]) if row and row[0] else None
+
+    def prepare(self, tree, sql, limit):
+        return f"SELECT * FROM (\n{strip_statement(sql)}\n) lattice_q FETCH FIRST {int(limit)} ROWS ONLY"
+
+    def execute(self, sql, limit):
+        def call(cursor):
+            cursor.execute(sql)
+            columns = [item[0] for item in cursor.description or []]
+            return columns, [list(row) for row in cursor.fetchmany(limit)]
+
+        return self._run(call)
+
+
+# ----- SQL Server -------------------------------------------------------------------
+class SqlServerConnector(Connector):
+    type_id = "mssql"
+    label = "SQL Server"
+    category = "关系数据库"
+    description = "Microsoft SQL Server 2016+ 与 Azure SQL Database。"
+    driver = "pymssql"
+    dialect = "tsql"
+    default_port = 1433
+    fields = [
+        field("host", "主机", required=True, placeholder="127.0.0.1"),
+        field("port", "端口", "number", required=True, default=1433),
+        field("user", "用户名", required=True),
+        field("password", "密码", "password"),
+        field("database", "数据库", required=True),
+        field("schema", "默认模式", default="dbo"),
+    ]
+
+    def connect(self):
+        pymssql = optional_driver("pymssql")
+        try:
+            return pymssql.connect(
+                server=self.config["host"],
+                port=str(self.config["port"]),
+                user=self.config["user"],
+                password=self.config.get("password") or "",
+                database=self.config["database"],
+                login_timeout=CONNECT_TIMEOUT,
+                timeout=QUERY_TIMEOUT,
+                autocommit=True,
+            )
+        except Exception as error:  # noqa: BLE001
+            raise ConnectorError(str(error).strip()[:600]) from error
+
+    def _run(self, action):
+        state: dict[str, Any] = {}
+
+        def call():
+            connection = self.connect()
+            state["connection"] = connection
+            try:
+                cursor = connection.cursor()
+                try:
+                    return action(cursor)
+                finally:
+                    cursor.close()
+            finally:
+                connection.close()
+
+        def cancel():
+            connection = state.get("connection")
+            if connection is not None:
+                connection.close()
+
+        try:
+            return self.timed(call, cancel)
+        except ConnectorError:
+            raise
+        except Exception as error:  # noqa: BLE001
+            raise ConnectorError(str(error).strip()[:600]) from error
+
+    def default_schema(self):
+        return self.config.get("schema") or "dbo"
+
+    def test(self):
+        started = time.monotonic()
+
+        def probe(cursor):
+            cursor.execute("SELECT @@VERSION")
+            version = cursor.fetchone()[0]
+            cursor.execute(
+                "SELECT count(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = %s", (self.default_schema(),)
+            )
+            return version, cursor.fetchone()[0]
+
+        version, count = self._run(probe)
+        return {
+            "ok": True,
+            "status": "online",
+            "latency_ms": round((time.monotonic() - started) * 1000, 1),
+            "server_version": str(version).split("\n")[0][:120],
+            "detail": f"连接成功，模式 {self.default_schema()} 中有 {count} 张表。",
+            "table_count": int(count),
+        }
+
+    def schemas(self):
+        def load(cursor):
+            cursor.execute(
+                "SELECT s.name, count(t.object_id) FROM sys.schemas s "
+                "LEFT JOIN sys.tables t ON t.schema_id = s.schema_id "
+                "WHERE s.name NOT IN ('sys', 'INFORMATION_SCHEMA', 'guest') AND s.name NOT LIKE 'db[_]%' "
+                "GROUP BY s.name ORDER BY s.name"
+            )
+            return cursor.fetchall()
+
+        return [{"name": row[0], "table_count": int(row[1])} for row in self._run(load)]
+
+    def tables(self, schema):
+        check_identifier(schema, "模式名")
+
+        def load(cursor):
+            cursor.execute(
+                "SELECT t.name, 'table', SUM(p.rows), CAST(ep.value AS nvarchar(4000)) FROM sys.tables t "
+                "JOIN sys.schemas s ON s.schema_id = t.schema_id "
+                "LEFT JOIN sys.partitions p ON p.object_id = t.object_id AND p.index_id IN (0, 1) "
+                "LEFT JOIN sys.extended_properties ep ON ep.major_id = t.object_id AND ep.minor_id = 0 AND ep.name = 'MS_Description' "
+                "WHERE s.name = %s GROUP BY t.name, CAST(ep.value AS nvarchar(4000)) "
+                "UNION ALL SELECT v.name, 'view', NULL, NULL FROM sys.views v "
+                "JOIN sys.schemas s ON s.schema_id = v.schema_id WHERE s.name = %s ORDER BY 1",
+                (schema, schema),
+            )
+            return cursor.fetchall()
+
+        return [
+            {"schema": schema, "name": row[0], "kind": row[1], "rows": int(row[2]) if row[2] is not None else None, "comment": row[3] or ""}
+            for row in self._run(load)
+        ]
+
+    def table(self, schema, name):
+        check_identifier(schema, "模式名")
+        check_identifier(name, "表名")
+
+        def load(cursor):
+            cursor.execute(
+                "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE FROM INFORMATION_SCHEMA.COLUMNS "
+                "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s ORDER BY ORDINAL_POSITION",
+                (schema, name),
+            )
+            columns = cursor.fetchall()
+            if not columns:
+                raise ConnectorError(f"未找到表 {schema}.{name}。")
+            cursor.execute(
+                "SELECT k.COLUMN_NAME FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS c "
+                "JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE k ON k.CONSTRAINT_NAME = c.CONSTRAINT_NAME "
+                "AND k.TABLE_SCHEMA = c.TABLE_SCHEMA AND k.TABLE_NAME = c.TABLE_NAME "
+                "WHERE c.CONSTRAINT_TYPE = 'PRIMARY KEY' AND c.TABLE_SCHEMA = %s AND c.TABLE_NAME = %s",
+                (schema, name),
+            )
+            keys = {row[0] for row in cursor.fetchall()}
+            cursor.execute(f"SELECT count(*) FROM {self.qualified(schema, name)}")
+            return columns, keys, cursor.fetchone()[0]
+
+        columns, keys, count = self._run(load)
+        return {
+            "schema": schema,
+            "name": name,
+            "kind": "table",
+            "rows": int(count),
+            "columns": [
+                {"name": row[0], "type": row[1], "nullable": row[2] == "YES", "primary_key": row[0] in keys}
+                for row in columns
+            ],
+        }
+
+    def view_definition(self, schema, name):
+        check_identifier(schema, "模式名")
+        check_identifier(name, "表名")
+
+        def load(cursor):
+            cursor.execute(
+                "SELECT m.definition FROM sys.sql_modules m JOIN sys.views v ON v.object_id = m.object_id "
+                "JOIN sys.schemas s ON s.schema_id = v.schema_id WHERE s.name = %s AND v.name = %s",
+                (schema, name),
+            )
+            return cursor.fetchone()
+
+        row = self._run(load)
+        return str(row[0]) if row and row[0] else None
+
+    def prepare(self, tree, sql, limit):
+        return f"SELECT TOP ({int(limit)}) * FROM (\n{strip_statement(sql)}\n) AS lattice_q"
+
+    def execute(self, sql, limit):
+        def call(cursor):
+            cursor.execute(sql)
+            columns = [item[0] for item in cursor.description or []]
+            return columns, [list(row) for row in cursor.fetchmany(limit)]
+
+        return self._run(call)
+
+
+# ----- MongoDB ------------------------------------------------------------------------
+class MongoDBConnector(SnapshotConnector):
+    type_id = "mongodb"
+    label = "MongoDB"
+    category = "文档数据库"
+    description = "MongoDB 4.4+：数据库作为库、集合作为表，字段按抽样文档推断；查询在文档快照上以 DuckDB SQL 执行。"
+    driver = "pymongo"
+    default_port = 27017
+    fields = [
+        field("host", "主机", required=True, placeholder="127.0.0.1"),
+        field("port", "端口", "number", required=True, default=27017),
+        field("user", "用户名"),
+        field("password", "密码", "password"),
+        field("database", "默认数据库", required=True),
+        field("auth_source", "认证数据库", default="admin"),
+        field("tls", "启用 TLS", "checkbox", default=False),
+        sample_rows_field(),
+    ]
+
+    def default_schema(self):
+        return self.config.get("database") or None
+
+    def client(self):
+        pymongo = optional_driver("pymongo")
+        options: dict[str, Any] = {
+            "host": self.config["host"],
+            "port": self.config["port"],
+            "serverSelectionTimeoutMS": CONNECT_TIMEOUT * 1000,
+            "connectTimeoutMS": CONNECT_TIMEOUT * 1000,
+            "socketTimeoutMS": QUERY_TIMEOUT * 1000,
+            "tls": bool(self.config.get("tls")),
+        }
+        if self.config.get("user"):
+            options.update(
+                username=self.config["user"],
+                password=self.config.get("password") or "",
+                authSource=self.config.get("auth_source") or "admin",
+            )
+        try:
+            return pymongo.MongoClient(**options)
+        except Exception as error:  # noqa: BLE001
+            raise ConnectorError(str(error).strip()[:600]) from error
+
+    def _run(self, action):
+        def call():
+            client = self.client()
+            try:
+                return action(client)
+            finally:
+                client.close()
+
+        try:
+            return self.timed(call)
+        except ConnectorError:
+            raise
+        except Exception as error:  # noqa: BLE001
+            raise ConnectorError(str(error).strip()[:600]) from error
+
+    def load_arrow(self, schema, name, limit):
+        check_identifier(schema, "库名")
+        return rows_to_arrow(self.load_rows(schema, name, self.sample_limit(limit)))
+
+    def test(self):
+        started = time.monotonic()
+
+        def probe(client):
+            info = client.server_info()
+            names = client[self.config["database"]].list_collection_names()
+            return info.get("version", ""), len(names)
+
+        version, count = self._run(probe)
+        return {
+            "ok": True,
+            "status": "online",
+            "latency_ms": round((time.monotonic() - started) * 1000, 1),
+            "server_version": str(version),
+            "detail": f"连接成功，数据库 {self.config['database']} 中有 {count} 个集合。",
+            "table_count": int(count),
+        }
+
+    def schemas(self):
+        def load(client):
+            return [
+                {"name": name, "table_count": len(client[name].list_collection_names())}
+                for name in client.list_database_names()
+                if name not in SYSTEM_DATABASES_MONGO
+            ]
+
+        return self._run(load)
+
+    def tables(self, schema):
+        check_identifier(schema, "库名")
+
+        def load(client):
+            database = client[schema]
+            return [
+                {"schema": schema, "name": name, "kind": "collection", "rows": int(database[name].estimated_document_count()), "comment": ""}
+                for name in sorted(database.list_collection_names())
+            ]
+
+        return self._run(load)
+
+    def table(self, schema, name):
+        check_identifier(schema, "库名")
+        check_identifier(name, "表名")
+
+        def load(client):
+            collection = client[schema][name]
+            sample = [flatten_document(document) for document in collection.find({}, limit=200)]
+            return sample, int(collection.estimated_document_count())
+
+        sample, count = self._run(load)
+        if not sample and count == 0:
+            raise ConnectorError(f"未找到集合 {schema}.{name}，或集合为空。")
+        return {"schema": schema, "name": name, "kind": "collection", "rows": count, "columns": infer_columns(sample)}
+
+    def load_rows(self, schema, name, limit):
+        check_identifier(name, "表名")
+
+        def load(client):
+            if schema not in client.list_database_names():
+                raise ConnectorError(f"未找到数据库 {schema}。")
+            return [flatten_document(document) for document in client[schema][name].find({}, limit=limit)]
+
+        return self._run(load)
+
+
+# ----- Elasticsearch ------------------------------------------------------------------
+class ElasticsearchConnector(SnapshotConnector):
+    type_id = "elasticsearch"
+    label = "Elasticsearch"
+    category = "搜索引擎"
+    description = "Elasticsearch 7/8 与 OpenSearch：索引作为表、映射作为字段；查询在文档快照上以 DuckDB SQL 执行。"
+    driver = "REST API（httpx）"
+    default_port = 9200
+    schema_name = "indices"
+    fields = [
+        field("host", "主机", required=True, placeholder="127.0.0.1"),
+        field("port", "端口", "number", required=True, default=9200),
+        field("scheme", "协议", "select", default="http", options=[("http", "http"), ("https", "https")]),
+        field("user", "用户名"),
+        field("password", "密码", "password"),
+        field("api_key", "API Key", "password", help="填写后优先于用户名密码。"),
+        field("verify_ssl", "校验证书", "checkbox", default=True),
+        sample_rows_field(),
+    ]
+    #: Tests inject an ``httpx.MockTransport`` here.
+    _transport: Any = None
+
+    def summary(self):
+        return f"{self.config.get('scheme') or 'http'}://{self.config['host']}:{self.config['port']}"
+
+    def _client(self):
+        headers = {"Accept": "application/json"}
+        auth = None
+        if self.config.get("api_key"):
+            headers["Authorization"] = f"ApiKey {self.config['api_key']}"
+        elif self.config.get("user"):
+            auth = (self.config["user"], self.config.get("password") or "")
+        return httpx.Client(
+            base_url=self.summary(),
+            headers=headers,
+            auth=auth,
+            verify=bool(self.config.get("verify_ssl", True)),
+            timeout=httpx.Timeout(QUERY_TIMEOUT, connect=CONNECT_TIMEOUT),
+            transport=self._transport,
+        )
+
+    def _request(self, method: str, path: str, **kwargs) -> Any:
+        def call():
+            with self._client() as client:
+                response = client.request(method, path, **kwargs)
+            if response.status_code >= 400:
+                detail = response.text[:300]
+                try:
+                    detail = response.json().get("error", {}).get("reason") or detail
+                except (ValueError, AttributeError):
+                    pass
+                raise ConnectorError(f"Elasticsearch 返回 HTTP {response.status_code}：{detail}")
+            return response.json()
+
+        try:
+            return self.timed(call)
+        except ConnectorError:
+            raise
+        except (httpx.HTTPError, ValueError) as error:
+            raise ConnectorError(str(error).strip()[:600]) from error
+
+    def _indices(self) -> list[dict[str, Any]]:
+        listing = self._request("GET", "/_cat/indices", params={"format": "json", "h": "index,docs.count,store.size,status"})
+        rows = []
+        for item in listing if isinstance(listing, list) else []:
+            name = str(item.get("index") or "")
+            if not name or name.startswith("."):
+                continue
+            count = item.get("docs.count")
+            rows.append({"schema": self.schema_name, "name": name, "kind": "index", "rows": int(count) if str(count or "").isdigit() else None, "comment": str(item.get("store.size") or "")})
+        return sorted(rows, key=lambda row: row["name"])
+
+    def test(self):
+        started = time.monotonic()
+        root = self._request("GET", "/")
+        indices = self._indices()
+        version = ((root.get("version") or {}).get("number")) if isinstance(root, dict) else ""
+        return {
+            "ok": True,
+            "status": "online",
+            "latency_ms": round((time.monotonic() - started) * 1000, 1),
+            "server_version": str(version or ""),
+            "detail": f"连接成功，集群 {root.get('cluster_name', '') if isinstance(root, dict) else ''} 有 {len(indices)} 个索引。",
+            "table_count": len(indices),
+        }
+
+    def schemas(self):
+        return [{"name": self.schema_name, "table_count": len(self._indices())}]
+
+    def tables(self, schema):
+        if schema != self.schema_name:
+            raise ConnectorError(f"Elasticsearch 数据源只有 {self.schema_name} 一个库。")
+        return self._indices()
+
+    def table(self, schema, name):
+        check_identifier(name, "索引名")
+        mapping = self._request("GET", f"/{name}/_mapping")
+        properties = (((mapping or {}).get(name) or {}).get("mappings") or {}).get("properties") or {}
+        columns: list[dict[str, Any]] = [{"name": "_id", "type": "keyword", "nullable": False}]
+
+        def walk(items: dict[str, Any], prefix: str, depth: int) -> None:
+            for key, spec in items.items():
+                kind = str(spec.get("type") or ("object" if spec.get("properties") else "object"))
+                if spec.get("properties") and depth < 2:
+                    walk(spec["properties"], f"{prefix}{key}.", depth + 1)
+                else:
+                    columns.append({"name": f"{prefix}{key}", "type": kind, "nullable": True})
+
+        walk(properties, "", 0)
+        count = self._request("GET", f"/{name}/_count")
+        return {"schema": self.schema_name, "name": name, "kind": "index", "rows": int((count or {}).get("count") or 0), "columns": columns}
+
+    def load_rows(self, schema, name, limit):
+        check_identifier(name, "索引名")
+        size = min(limit, ELASTIC_PAGE)
+        answer = self._request("POST", f"/{name}/_search", json={"size": size, "query": {"match_all": {}}, "track_total_hits": False})
+        hits = ((answer or {}).get("hits") or {}).get("hits") or []
+        return [{"_id": hit.get("_id"), **flatten_document(hit.get("_source") or {})} for hit in hits]
+
+
+# ----- Kafka ------------------------------------------------------------------------------
+class KafkaConnector(SnapshotConnector):
+    type_id = "kafka"
+    label = "Apache Kafka"
+    category = "消息队列"
+    description = "Kafka 2.x+：主题作为表，读取最近的消息（JSON 消息展开为字段）后以 DuckDB SQL 查询；partition / offset / key / value 列需用双引号引用。"
+    driver = "kafka-python"
+    default_port = 9092
+    schema_name = "topics"
+    fields = [
+        field("bootstrap_servers", "Bootstrap 服务器", required=True, placeholder="127.0.0.1:9092,127.0.0.1:9093"),
+        field(
+            "security_protocol",
+            "安全协议",
+            "select",
+            default="PLAINTEXT",
+            options=[("PLAINTEXT", "PLAINTEXT"), ("SSL", "SSL"), ("SASL_PLAINTEXT", "SASL_PLAINTEXT"), ("SASL_SSL", "SASL_SSL")],
+        ),
+        field(
+            "sasl_mechanism",
+            "SASL 机制",
+            "select",
+            default="PLAIN",
+            options=[("PLAIN", "PLAIN"), ("SCRAM-SHA-256", "SCRAM-SHA-256"), ("SCRAM-SHA-512", "SCRAM-SHA-512")],
+        ),
+        field("sasl_username", "SASL 用户名"),
+        field("sasl_password", "SASL 密码", "password"),
+        sample_rows_field(1000),
+        field("poll_seconds", "读取等待（秒）", "number", default=5, help="消费消息时最多等待多久。"),
+    ]
+
+    def summary(self):
+        return self.config["bootstrap_servers"]
+
+    def _servers(self) -> list[str]:
+        servers = [item.strip() for item in str(self.config["bootstrap_servers"]).replace(";", ",").split(",") if item.strip()]
+        if not servers:
+            raise ConnectorError("请填写 Bootstrap 服务器。")
+        return servers
+
+    def _kwargs(self) -> dict[str, Any]:
+        options: dict[str, Any] = {
+            "bootstrap_servers": self._servers(),
+            "security_protocol": self.config.get("security_protocol") or "PLAINTEXT",
+            "request_timeout_ms": QUERY_TIMEOUT * 1000,
+            "api_version_auto_timeout_ms": CONNECT_TIMEOUT * 1000,
+        }
+        if str(options["security_protocol"]).startswith("SASL"):
+            options.update(
+                sasl_mechanism=self.config.get("sasl_mechanism") or "PLAIN",
+                sasl_plain_username=self.config.get("sasl_username") or "",
+                sasl_plain_password=self.config.get("sasl_password") or "",
+            )
+        return options
+
+    def _consumer(self, kafka):
+        return kafka.KafkaConsumer(
+            enable_auto_commit=False,
+            auto_offset_reset="earliest",
+            consumer_timeout_ms=max(1, int(self.config.get("poll_seconds") or 5)) * 1000,
+            **self._kwargs(),
+        )
+
+    def _run(self, action):
+        def call():
+            kafka = optional_driver("kafka")
+            return action(kafka)
+
+        try:
+            return self.timed(call)
+        except ConnectorError:
+            raise
+        except Exception as error:  # noqa: BLE001
+            raise ConnectorError(str(error).strip()[:600]) from error
+
+    @staticmethod
+    def _user_topics(names: Iterable[str]) -> list[str]:
+        return sorted(name for name in names if name and not name.startswith("__"))
+
+    def test(self):
+        started = time.monotonic()
+
+        def probe(kafka):
+            admin = kafka.KafkaAdminClient(**self._kwargs())
+            try:
+                return self._user_topics(admin.list_topics())
+            finally:
+                admin.close()
+
+        topics = self._run(probe)
+        return {
+            "ok": True,
+            "status": "online",
+            "latency_ms": round((time.monotonic() - started) * 1000, 1),
+            "server_version": "",
+            "detail": f"连接成功，共 {len(topics)} 个主题。",
+            "table_count": len(topics),
+        }
+
+    def schemas(self):
+        def load(kafka):
+            consumer = self._consumer(kafka)
+            try:
+                return len(self._user_topics(consumer.topics()))
+            finally:
+                consumer.close()
+
+        return [{"name": self.schema_name, "table_count": self._run(load)}]
+
+    def _offsets(self, kafka, consumer, topic: str):
+        partitions = consumer.partitions_for_topic(topic) or set()
+        assigned = [kafka.TopicPartition(topic, partition) for partition in sorted(partitions)]
+        if not assigned:
+            raise ConnectorError(f"未找到主题 {topic}。")
+        beginning = consumer.beginning_offsets(assigned)
+        end = consumer.end_offsets(assigned)
+        return assigned, beginning, end
+
+    def tables(self, schema):
+        if schema != self.schema_name:
+            raise ConnectorError(f"Kafka 数据源只有 {self.schema_name} 一个库。")
+
+        def load(kafka):
+            consumer = self._consumer(kafka)
+            try:
+                rows = []
+                for topic in self._user_topics(consumer.topics()):
+                    assigned, beginning, end = self._offsets(kafka, consumer, topic)
+                    total = sum(int(end.get(tp, 0)) - int(beginning.get(tp, 0)) for tp in assigned)
+                    rows.append({"schema": schema, "name": topic, "kind": "topic", "rows": total, "comment": f"{len(assigned)} 个分区"})
+                return rows
+            finally:
+                consumer.close()
+
+        return self._run(load)
+
+    def table(self, schema, name):
+        check_identifier(name, "主题名")
+        sample = self.load_rows(schema, name, 100)
+        total = self._message_count(name)
+        return {"schema": self.schema_name, "name": name, "kind": "topic", "rows": total, "columns": infer_columns(sample) if sample else infer_columns([self._record_row(None)])}
+
+    def _message_count(self, topic: str) -> int:
+        def load(kafka):
+            consumer = self._consumer(kafka)
+            try:
+                assigned, beginning, end = self._offsets(kafka, consumer, topic)
+                return sum(int(end.get(tp, 0)) - int(beginning.get(tp, 0)) for tp in assigned)
+            finally:
+                consumer.close()
+
+        return self._run(load)
+
+    @staticmethod
+    def _decode(value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, bytes):
+            try:
+                return value.decode("utf-8")
+            except UnicodeDecodeError:
+                return value.hex()
+        return str(value)
+
+    def _record_row(self, record: Any) -> dict[str, Any]:
+        if record is None:
+            return {"partition": 0, "offset": 0, "timestamp": None, "key": None, "value": None}
+        value = self._decode(getattr(record, "value", None))
+        row: dict[str, Any] = {
+            "partition": int(getattr(record, "partition", 0)),
+            "offset": int(getattr(record, "offset", 0)),
+            "timestamp": dt.datetime.fromtimestamp(int(getattr(record, "timestamp", 0) or 0) / 1000, tz=dt.timezone.utc).replace(tzinfo=None) if getattr(record, "timestamp", None) else None,
+            "key": self._decode(getattr(record, "key", None)),
+            "value": value,
+        }
+        if isinstance(value, str) and value[:1] in "{[":
+            try:
+                payload = json.loads(value)
+            except ValueError:
+                payload = None
+            if isinstance(payload, dict):
+                for key, item in flatten_document(payload).items():
+                    row[key if key not in row else f"value.{key}"] = item
+        return row
+
+    def load_rows(self, schema, name, limit):
+        check_identifier(name, "主题名")
+
+        def load(kafka):
+            consumer = self._consumer(kafka)
+            try:
+                assigned, beginning, end = self._offsets(kafka, consumer, name)
+                consumer.assign(assigned)
+                share = max(1, limit // len(assigned))
+                for tp in assigned:
+                    consumer.seek(tp, max(int(beginning.get(tp, 0)), int(end.get(tp, 0)) - share))
+                rows = []
+                for record in consumer:
+                    rows.append(self._record_row(record))
+                    if len(rows) >= limit:
+                        break
+                return rows
+            finally:
+                consumer.close()
+
+        return self._run(load)
+
+
 CONNECTORS: dict[str, type[Connector]] = {
     connector.type_id: connector
     for connector in (
@@ -1657,6 +2676,11 @@ CONNECTORS: dict[str, type[Connector]] = {
         HiveConnector,
         IcebergConnector,
         PaimonConnector,
+        OracleConnector,
+        SqlServerConnector,
+        MongoDBConnector,
+        ElasticsearchConnector,
+        KafkaConnector,
     )
 }
 DIALECT_LABELS = {
@@ -1667,6 +2691,8 @@ DIALECT_LABELS = {
     "starrocks": "StarRocks SQL（MySQL 兼容）",
     "doris": "Apache Doris SQL（MySQL 兼容）",
     "hive": "HiveQL",
+    "oracle": "Oracle SQL",
+    "tsql": "SQL Server T-SQL",
 }
 
 

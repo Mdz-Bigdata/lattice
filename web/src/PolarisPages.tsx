@@ -15,6 +15,7 @@ import {
   errorMessage,
   formatValue,
   type ApiSpec,
+  type ConsoleContext,
   type Operation,
   type Overview,
 } from "./api";
@@ -145,8 +146,11 @@ export function PolarisOverviewPage({
 
 export function PolarisExplorer({
   initialSearch = "",
+  initialContext = {},
 }: {
   initialSearch?: string;
+  /** Request values carried in by the page that opened the console. */
+  initialContext?: ConsoleContext;
 }) {
   const [specs, setSpecs] = useState<ApiSpec[]>([]);
   const [specId, setSpecId] = useState("");
@@ -294,6 +298,7 @@ export function PolarisExplorer({
                 key={`${spec.id}:${operation.id}`}
                 spec={spec.id}
                 operation={operation}
+                context={initialContext}
               />
             ) : (
               <Empty title="选择一项 API 操作">
@@ -316,12 +321,44 @@ function isGatewayImplemented(operation: Operation) {
   return operation.implementation === "lattice-gateway";
 }
 
+/** Values carried in for this one operation replace fields its example declares.
+ *  A spec example can only hold fixed values - a sample entity-version, a fixed
+ *  model name - and those are exactly the values a real call has to replace. */
+function initialBody(operation: Operation, context: ConsoleContext) {
+  const example = operation.request_example;
+  if (example === null || example === undefined) return "";
+  const prefill = context.body?.[operation.id];
+  if (!prefill || typeof example !== "object" || Array.isArray(example))
+    return JSON.stringify(example, null, 2);
+  const merged: Record<string, unknown> = {
+    ...(example as Record<string, unknown>),
+  };
+  for (const [name, value] of Object.entries(prefill))
+    if (name in merged) merged[name] = value;
+  return JSON.stringify(merged, null, 2);
+}
+
+/** A carried-in value wins over the spec default, for path parameters only. */
+function initialValue(
+  parameter: Operation["parameters"][number],
+  prefill: Record<string, string>,
+) {
+  const carried = parameter.in === "path" ? prefill[parameter.name] : undefined;
+  if (carried) return carried;
+  return parameter.schema?.default === undefined
+    ? ""
+    : String(parameter.schema.default);
+}
+
 function OperationForm({
   spec,
   operation,
+  context = {},
 }: {
   spec: string;
   operation: Operation;
+  /** Request values to start from, carried in by the page that opened the console. */
+  context?: ConsoleContext;
 }) {
   const visibleParameters = operation.parameters.filter(
     (parameter) =>
@@ -334,18 +371,11 @@ function OperationForm({
     Object.fromEntries(
       visibleParameters.map((parameter) => [
         `${parameter.in}:${parameter.name}`,
-        parameter.schema?.default === undefined
-          ? ""
-          : String(parameter.schema.default),
+        initialValue(parameter, context.path ?? {}),
       ]),
     ),
   );
-  const [body, setBody] = useState(
-    operation.request_example === null ||
-      operation.request_example === undefined
-      ? ""
-      : JSON.stringify(operation.request_example, null, 2),
-  );
+  const [body, setBody] = useState(() => initialBody(operation, context));
   const [response, setResponse] = useState<{
     status: number;
     body: unknown;

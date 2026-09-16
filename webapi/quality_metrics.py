@@ -43,7 +43,7 @@ already been accepted by ``guard_sql``.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable
 
 import sqlglot
@@ -52,7 +52,7 @@ from sqlglot import exp
 from .connectors import ConnectorError, check_identifier, guard_sql
 
 MAX_VALUE_LENGTH = 4096
-SCAN_LIMITED_TYPES = ("iceberg", "paimon")
+SCAN_LIMITED_TYPES = ("iceberg", "paimon", "mongodb", "elasticsearch", "kafka")
 SQL_COMMENTS = ("--", "/*", "*/", "#")
 COMPARATORS = ("=", "!=", ">", ">=", "<", "<=")
 INTERVAL_UNITS = ("minute", "hour", "day")
@@ -104,6 +104,12 @@ class MetricSql:
     invalidate_sql: str
     predicate: str
     scan_limited: bool = False
+    #: ``"aggregate"`` for a cross-source comparison: ``actual_sql`` is the source
+    #: aggregate and the service runs ``reference_sql`` on ``reference_datasource``.
+    compare: str = ""
+    reference_datasource: str = ""
+    reference_label: str = ""
+    reference_sql: str = ""
 
 
 @dataclass(frozen=True)
@@ -147,6 +153,8 @@ class Metric:
     fields: tuple[ConfigField, ...]
     sql: Callable[[_Target], tuple[str, str]]
     refine: Callable[[dict[str, Any]], None] | None = None
+    #: A metric that shapes all three statements itself (custom SQL, cross-source).
+    plan: Callable[[_Target], MetricSql] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -186,6 +194,21 @@ SCRIPTS: dict[str, DialectScript] = {
         # Hive's date_sub takes whole days, which is why the unit is restricted.
         older_than="{column} < date_sub({now}, {days})",
         day_only=True,
+    ),
+    "oracle": DialectScript(
+        quote='"',
+        not_match_regex="NOT REGEXP_LIKE({column}, '{regexp}')",
+        length="length({column})",
+        now="SYSTIMESTAMP",
+        older_than="{column} < {now} - INTERVAL '{value}' {unit_upper}",
+    ),
+    "tsql": DialectScript(
+        quote='"',
+        # SQL Server has no regular-expression predicate before 2025; the metric refuses it.
+        not_match_regex="",
+        length="len({column})",
+        now="SYSDATETIME()",
+        older_than="{column} < DATEADD({unit_upper}, -{value}, {now})",
     ),
     "duckdb": DialectScript(
         quote='"',
@@ -416,6 +439,8 @@ def _sql_blank(target: _Target) -> tuple[str, str]:
 
 def _sql_match_regex(target: _Target) -> tuple[str, str]:
     column = target.column
+    if not target.script.not_match_regex:
+        raise MetricError(400, "该数据源的 SQL 方言不支持正则表达式核查，请改用自定义 SQL。")
     regexp = _check_literal(target.config["regexp"], "正则表达式")
     not_match = target.script.not_match_regex.format(column=column, regexp=regexp)
     return f"({column} IS NOT NULL AND {not_match})", ""
@@ -465,6 +490,91 @@ def _sql_not_in_reference(target: _Target) -> tuple[str, str]:
         f" WHERE {_and_filter(predicate, target.filter)}"
     )
     return predicate, invalidate
+
+
+AGGREGATES = (("count", "行数"), ("sum", "求和"), ("avg", "平均值"), ("min", "最小值"), ("max", "最大值"))
+AGGREGATE_LABELS = dict(AGGREGATES)
+PLACEHOLDERS = ("${table}", "${column}", "${schema}")
+
+
+def _substitute(sql: str, target: _Target) -> str:
+    """Fill ``${table}`` / ``${column}`` / ``${schema}`` with quoted identifiers."""
+    text = sql
+    if "${column}" in text:
+        if not target.column:
+            raise MetricError(400, "自定义 SQL 使用了 ${column}，请指定核查字段。")
+        text = text.replace("${column}", target.column)
+    if "${schema}" in text:
+        schema = target.ctx.schema or ""
+        text = text.replace("${schema}", target.ctx.quote(_identifier(schema, "模式名")) if schema else "")
+    text = text.replace("${table}", target.table)
+    if "${" in text:
+        raise MetricError(400, "自定义 SQL 只支持 ${table}、${column} 与 ${schema} 三个占位符。")
+    return text
+
+
+def _plan_custom_sql(target: _Target) -> MetricSql:
+    """A user statement: either it lists the non-conforming rows, or it yields the value."""
+    config = target.config
+    sql = _substitute(config["sql"], target)
+    if any(marker in sql for marker in SQL_COMMENTS):
+        raise MetricError(400, "自定义 SQL 不允许包含注释。")
+    where = f" WHERE ({target.filter})" if target.filter else ""
+    total_sql = f"SELECT count(1) AS checked_count FROM {target.table}{where}"
+    if (config.get("mode") or "rows") == "value":
+        return MetricSql(
+            actual_sql=sql,
+            total_sql=total_sql,
+            invalidate_sql=sql,
+            predicate="自定义 SQL 返回的数值作为实际值",
+        )
+    invalidate_sql = f"SELECT * FROM (\n{sql}\n) {SOURCE_ALIAS}{where}"
+    return MetricSql(
+        actual_sql=f"SELECT count(1) AS actual_value FROM (\n{invalidate_sql}\n) t",
+        total_sql=total_sql,
+        invalidate_sql=invalidate_sql,
+        predicate="自定义 SQL 返回的每一行视为不合规",
+    )
+
+
+def _aggregate_expression(aggregate: str, column: str, what: str = "核查字段") -> str:
+    if aggregate not in AGGREGATE_LABELS:
+        raise MetricError(400, "聚合方式只能是 count、sum、avg、min 或 max。")
+    if aggregate == "count":
+        return "count(1)"
+    if not column:
+        raise MetricError(400, f"按{AGGREGATE_LABELS[aggregate]}比对时需要指定{what}。")
+    return f"{aggregate}({column})"
+
+
+def _plan_cross_source(target: _Target) -> MetricSql:
+    """The source side of a cross-source comparison; the reference side is built per dialect."""
+    aggregate = target.config.get("aggregate") or "count"
+    where = f" WHERE ({target.filter})" if target.filter else ""
+    source_sql = f"SELECT {_aggregate_expression(aggregate, target.column)} AS actual_value FROM {target.table}{where}"
+    return MetricSql(
+        actual_sql=source_sql,
+        total_sql=source_sql,
+        invalidate_sql=source_sql,
+        predicate=f"本库{AGGREGATE_LABELS[aggregate]}与参照库一致",
+        compare="aggregate",
+    )
+
+
+def reference_aggregate_sql(
+    dialect: str, schema: Any, table: Any, column: Any, aggregate: Any, filter_text: Any = ""
+) -> str:
+    """The reference side of a cross-source comparison, in the reference engine's dialect."""
+    schema_name = str(schema or "").strip() or None
+    if schema_name:
+        _identifier(schema_name, "参照模式名")
+    qualified = qualifier(dialect)(schema_name, _identifier(table, "参照表名"))
+    quoted = quoter(dialect)(_identifier(column, "参照字段")) if str(column or "").strip() else ""
+    condition = _check_filter(str(filter_text or ""), dialect)
+    where = f" WHERE ({condition})" if condition else ""
+    expression = _aggregate_expression(str(aggregate or "count"), quoted, "参照字段")
+    sql = f"SELECT {expression} AS checked_count FROM {qualified}{where}"
+    return _guard(sql, dialect)
 
 
 def _sql_freshness(target: _Target) -> tuple[str, str]:
@@ -642,6 +752,58 @@ METRICS: dict[str, Metric] = {
             sql=_sql_freshness,
             refine=_refine_freshness,
         ),
+        Metric(
+            id="cross_source_compare",
+            label="跨库比对",
+            dimension="consistency",
+            level="table",
+            needs_column=False,
+            fields=_fields(
+                ConfigField(
+                    "aggregate",
+                    "聚合方式",
+                    "select",
+                    required=True,
+                    default="count",
+                    options=AGGREGATES,
+                    help="按行数比对无需字段；求和、平均、最小、最大值按核查字段与参照字段计算。",
+                ),
+                ConfigField("reference_datasource", "参照数据源", "datasource", required=True, help="另一个已注册的数据源。"),
+                ConfigField("reference_schema", "参照模式名", "text", placeholder="留空使用参照库默认模式"),
+                ConfigField("reference_table", "参照表名", "text", required=True),
+                ConfigField("reference_column", "参照字段", "text", help="按行数比对时可留空。"),
+                ConfigField("reference_filter", "参照过滤条件", "text", placeholder="status = 'active'", help="作用于参照表的 SQL 布尔表达式。"),
+            ),
+            sql=lambda target: ("", ""),
+            plan=_plan_cross_source,
+        ),
+        Metric(
+            id="custom_sql",
+            label="自定义 SQL",
+            dimension="custom",
+            level="table",
+            needs_column=False,
+            fields=_fields(
+                ConfigField(
+                    "mode",
+                    "结果含义",
+                    "select",
+                    required=True,
+                    default="rows",
+                    options=(("rows", "返回的每一行都是不合规记录"), ("value", "返回的单个数值作为实际值")),
+                ),
+                ConfigField(
+                    "sql",
+                    "核查 SQL",
+                    "sql",
+                    required=True,
+                    placeholder="SELECT * FROM ${table} WHERE amount < 0",
+                    help="只读 SELECT，单条语句，可使用 ${table}、${column}、${schema} 占位符；返回数值时请给该列取别名 actual_value。",
+                ),
+            ),
+            sql=lambda target: ("", ""),
+            plan=_plan_custom_sql,
+        ),
     )
 }
 
@@ -656,6 +818,8 @@ DIMENSIONS: tuple[Dimension, ...] = (
     Dimension("standard", "数据标准校验", ("column_not_in_enums",)),
     Dimension("relation", "关联性校验", ("column_not_in_reference",)),
     Dimension("timeliness", "及时性校验", ("table_freshness",)),
+    Dimension("consistency", "一致性校验", ("cross_source_compare",)),
+    Dimension("custom", "自定义校验", ("custom_sql",)),
 )
 
 
@@ -721,11 +885,13 @@ def _metric(metric_id: Any) -> Metric:
     return metric
 
 
-def validate_config(metric_id: str, config: Any) -> dict[str, Any]:
+def validate_config(metric_id: str, config: Any, *, partial: bool = False) -> dict[str, Any]:
     """Normalise a metric's configuration, rejecting anything unsafe or incomplete.
 
     The ``filter`` expression is only checked for dangerous characters here; it is
-    parsed in :func:`build`, where the dialect is known.
+    parsed in :func:`build`, where the dialect is known. ``partial`` accepts a
+    template: required values may still be missing, and are filled in when the
+    template is applied to a target.
     """
     metric = _metric(metric_id)
     if config is None:
@@ -740,7 +906,7 @@ def validate_config(metric_id: str, config: Any) -> dict[str, Any]:
         value = config.get(item.name, item.default)
         if item.type == "number":
             if value in (None, ""):
-                if item.required:
+                if item.required and not partial:
                     raise MetricError(400, f"请填写 {item.label}。")
                 normalized[item.name] = None
                 continue
@@ -751,16 +917,19 @@ def validate_config(metric_id: str, config: Any) -> dict[str, Any]:
         if not isinstance(value, str):
             raise MetricError(400, f"{item.label} 必须是文本。")
         value = value.strip()
+        if item.type == "sql":
+            value = value.rstrip(";").strip()
         if not value and isinstance(item.default, str):
             value = item.default
-        _check_literal(value, item.label, newlines=item.type == "textarea")
+        _check_literal(value, item.label, newlines=item.type in {"textarea", "sql"})
         if item.type == "select" and value:
             if value not in {option[0] for option in item.options}:
                 raise MetricError(400, f"{item.label} 的取值无效。")
-        if item.required and not value:
+        if item.required and not value and not partial:
             raise MetricError(400, f"请填写 {item.label}。")
         normalized[item.name] = value
-    if metric.refine is not None:
+    complete = all(normalized.get(item.name) not in (None, "") for item in metric.fields if item.required)
+    if metric.refine is not None and (complete or not partial):
         metric.refine(normalized)
     return normalized
 
@@ -784,9 +953,9 @@ def build(metric_id: str, ctx: MetricContext) -> MetricSql:
         _identifier(schema, "模式名")
     table = ctx.qualified(schema, _identifier(ctx.table, "表名"))
     column = ""
-    if metric.needs_column:
-        if not ctx.column:
-            raise MetricError(400, f"{metric.label} 需要指定核查字段。")
+    if metric.needs_column and not ctx.column:
+        raise MetricError(400, f"{metric.label} 需要指定核查字段。")
+    if ctx.column:
         column = ctx.quote(_identifier(ctx.column, "核查字段"))
     target = _Target(
         ctx=ctx,
@@ -796,6 +965,11 @@ def build(metric_id: str, ctx: MetricContext) -> MetricSql:
         config=config,
         filter=_check_filter(config.get("filter", ""), ctx.dialect),
     )
+    if metric.plan is not None:
+        planned = metric.plan(target)
+        for statement in (planned.invalidate_sql, planned.actual_sql, planned.total_sql):
+            _guard(statement, ctx.dialect)
+        return replace(planned, scan_limited=ctx.source_type in SCAN_LIMITED_TYPES)
     predicate, invalidate_sql = metric.sql(target)
     if not invalidate_sql:
         invalidate_sql = f"SELECT * FROM {table} WHERE {_and_filter(predicate, target.filter)}"

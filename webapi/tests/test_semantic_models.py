@@ -23,6 +23,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from webapi import app as app_module
+from webapi import ossie_document
 from webapi import semantic_models as sm
 from webapi.semantic_models import SemanticModelError, SemanticModelService
 from webapi.specs import SpecRegistry
@@ -149,6 +150,40 @@ def test_full_lifecycle_matches_the_spec_contract(service, document):
     missing = svc.handle("loadSemanticModel", {**path, "semantic-model-name": "tpcds_retail_model"}, None, None)
     assert missing["status"] == 404
     assert missing["body"]["error"]["type"] == "NoSuchSemanticModelException"
+
+
+def test_polaris_contract_example_with_released_ossie_version_is_accepted(service):
+    """The console's default request body is the Polaris 1.7.0 contract example.
+
+    That example declares the released Apache Ossie ``0.1.1`` while the bundled
+    schema is pinned to ``0.2.0.dev0``; the gateway must accept it unchanged and
+    store the document exactly as written.
+    """
+    svc, catalog = service
+    registry = SpecRegistry(ROOT / "integrations" / "polaris" / "spec")
+    example = registry.operation("catalog", "createSemanticModel")["request_example"]
+    assert example["document"]["version"] == "0.1.1"
+    assert ossie_document.accepted_versions() == (ossie_document.schema_version(), "0.1.1")
+    assert ossie_document.schema_version() != "0.1.1"
+
+    path = {"prefix": "lattice", "namespace": "demo"}
+    created = svc.handle("createSemanticModel", path, None, example)
+    assert created["status"] == 200, created["body"]
+    assert created["body"]["document"] == example["document"]
+    loaded = svc.handle(
+        "loadSemanticModel", {**path, "semantic-model-name": example["name"]}, None, None
+    )
+    assert loaded["status"] == 200
+    assert loaded["body"]["document"] == example["document"]
+
+    unknown = svc.handle(
+        "createSemanticModel", path, None,
+        {"name": "other", "document": {**example["document"], "version": "0.1.0"}},
+    )
+    assert unknown["status"] == 400
+    message = unknown["body"]["error"]["message"]
+    assert "0.1.0" in message and "0.1.1" in message and ossie_document.schema_version() in message
+    assert set(catalog.tables) == {("lattice", "demo", sm.RECORD_PREFIX + example["name"])}
 
 
 def test_missing_namespace_and_invalid_documents_are_rejected(service, document):

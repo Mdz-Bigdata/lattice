@@ -132,7 +132,7 @@ class DataSourceRegistry:
             "id": "local-sample",
             "name": "本地示例数据 · DuckDB",
             "type": "duckdb",
-            "description": "启动时生成的六张示例业务表，用于演示问数、SQL 与语义模型。",
+            "description": "启动时生成的七张示例表（六张业务表与 TPC-DS 风格的 store_sales），用于演示问数、SQL 与语义模型。",
             "config": {"path": str(sample), "read_only": True},
         }
         credentials = self._read_private(self.polaris_runtime / "credentials.json")
@@ -173,7 +173,7 @@ class DataSourceRegistry:
             # demo schema in the project's own cluster is still seeded by the
             # engine manager, but listing it as a second PostgreSQL source only
             # produced two entries the reader had to tell apart.
-            "quality-postgres": ("quality-datasource.json", "postgresql", "PostgreSQL", "本机业务库 blog_converter；数据质量模块的质量元数据保存在其 lattice_quality 模式中。"),
+            "quality-postgres": ("quality-datasource.json", "postgresql", "PostgreSQL", "本机业务库 blog_converter；数据质量模块的质量元数据保存在其 lattice_quality 模式中，七张示例表写入其 public 模式，语义模型与指标在此同样可计算。"),
         }
         for source_id, (file_name, type_id, name, description) in engines.items():
             data = self._read_private(self.engines_runtime / file_name)

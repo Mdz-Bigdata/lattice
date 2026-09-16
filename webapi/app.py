@@ -18,12 +18,13 @@ from contextlib import asynccontextmanager
 import hashlib
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
 import duckdb
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
@@ -32,17 +33,26 @@ from pydantic import BaseModel, ConfigDict, Field
 import sqlglot
 import yaml
 
-from validation import validate as validator
 from .connectors import CONNECTORS, ConnectorError
+from .ai_api import router as ai_router
+from .ai_assist import AiAssistService
+from .auth import SESSION_COOKIE, AuthService, current_actor, parse_bearer
+from .observability import Observatory, current_trace, install_observatory, iter_components, process_health
+from .auth_api import router as auth_router
 from .datasources import DataSourceError, DataSourceRegistry
 from .ingest import IngestError, IngestService
 from .llm import LlmError, LlmSettings, SqlGenerator
+from .metadata_api import router as metadata_router, start_metadata, stop_metadata
 from .models import ModelStoreError, PolarisModelStore, parse_document
+from .ossie_document import check_document
 from .polaris import PolarisClient, PolarisError
 from .query import QUESTIONS, QueryStore
 from .quality_api import router as quality_router
 from .quality_service import QualityScheduler, QualityService
 from .quality_store import QualityStore
+from .query_cache import QueryCache, QueryCacheError
+from .semantic_query import SemanticQueryEngine, SemanticQueryError
+from .tasks import TaskRegistry, register_platform_tasks
 from .questions import QueryError, QueryService
 from .semantic_models import (
     OPERATIONS as SEMANTIC_OPERATIONS,
@@ -71,6 +81,58 @@ class QueryInput(BaseModel):
     question: str | None = Field(default=None, max_length=2000)
     sql: str | None = Field(default=None, max_length=30000)
     datasource_id: str | None = Field(default=None, max_length=64)
+    refresh: bool = False
+
+
+class InvalidateCacheInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    datasource_id: str | None = Field(default=None, max_length=64)
+    table: str | None = Field(default=None, max_length=200)
+    key: str | None = Field(default=None, max_length=64)
+
+
+class MetricDimensionInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    field: str = Field(min_length=1, max_length=200)
+    grain: str | None = Field(default=None, max_length=10)
+    alias: str | None = Field(default=None, max_length=100)
+
+
+class MetricFilterInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    field: str = Field(min_length=1, max_length=200)
+    op: str = Field(default="=", max_length=10)
+    value: Any = None
+
+
+class MetricOrderInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    field: str = Field(min_length=1, max_length=200)
+    desc: bool = False
+
+
+class MetricQueryInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    model: str = Field(min_length=1, max_length=300)
+    metrics: list[str] = Field(min_length=1, max_length=20)
+    dimensions: list[MetricDimensionInput | str] = Field(default_factory=list, max_length=10)
+    filters: list[MetricFilterInput] = Field(default_factory=list, max_length=20)
+    order_by: list[MetricOrderInput] = Field(default_factory=list, max_length=5)
+    limit: int | None = Field(default=None, ge=1, le=5000)
+    datasource_id: str | None = Field(default=None, max_length=64)
+    refresh: bool = False
+
+
+class LogLevelInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    level: str = Field(min_length=4, max_length=10)
+
+
+class CacheSettingsInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool | None = None
+    ttl_seconds: int | None = Field(default=None, ge=10, le=604800)
+    max_entries: int | None = Field(default=None, ge=10, le=5000)
 
 
 class ValidationInput(BaseModel):
@@ -145,6 +207,7 @@ class SourceQueryInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     sql: str = Field(max_length=30000)
     limit: int | None = Field(default=None, ge=1, le=5000)
+    refresh: bool = False
 
 
 class PreviewInput(BaseModel):
@@ -219,7 +282,10 @@ def model_document(tables):
                 for column in table["columns"]
             ],
         }
+        # The business tables only: the TPC-DS shaped store_sales serves the Ossie example
+        # models and is not part of the demo sales model.
         for table in tables
+        if table["name"] in primary_keys
     ]
     return {
         "version": "0.2.0.dev0",
@@ -228,27 +294,43 @@ def model_document(tables):
                 "name": "lattice_demo_sales",
                 "description": "Lattice 本地演示销售模型，数据不来自真实业务系统",
                 "datasets": datasets,
+                "relationships": [
+                    {"name": "items_to_orders", "from": "t_lattice_order_items", "to": "t_lattice_orders", "from_columns": ["order_id"], "to_columns": ["order_id"]},
+                    {"name": "orders_to_customers", "from": "t_lattice_orders", "to": "t_lattice_customers", "from_columns": ["customer_id"], "to_columns": ["customer_id"]},
+                    {"name": "items_to_products", "from": "t_lattice_order_items", "to": "t_lattice_products", "from_columns": ["product_id"], "to_columns": ["product_id"]},
+                    {"name": "items_to_sellers", "from": "t_lattice_order_items", "to": "t_lattice_sellers", "from_columns": ["seller_id"], "to_columns": ["seller_id"]},
+                    {"name": "payments_to_orders", "from": "t_lattice_payments", "to": "t_lattice_orders", "from_columns": ["order_id"], "to_columns": ["order_id"]},
+                ],
                 "metrics": [
-                    {
-                        "name": "total_sales",
-                        "datatype": "Decimal",
-                        "expression": {
-                            "dialects": [
-                                {
-                                    "dialect": "ANSI_SQL",
-                                    "expression": "SUM(t_lattice_order_items.price)",
-                                }
-                            ]
-                        },
-                    }
+                    _demo_metric("total_sales", "SUM(t_lattice_order_items.price)", "销售总额：订单明细价格之和", "Decimal"),
+                    _demo_metric("order_count", "COUNT(DISTINCT t_lattice_orders.order_id)", "订单数：去重订单编号", "Integer"),
+                    _demo_metric("item_count", "COUNT(t_lattice_order_items.product_id)", "订单明细行数", "Integer"),
+                    _demo_metric("avg_order_value", "SUM(t_lattice_order_items.price) / COUNT(DISTINCT t_lattice_orders.order_id)", "客单价：销售总额 / 订单数", "Decimal"),
+                    _demo_metric("total_payment", "SUM(t_lattice_payments.payment_value)", "支付总额：支付金额之和", "Decimal"),
+                    _demo_metric("customer_count", "COUNT(DISTINCT t_lattice_customers.customer_id)", "下单客户数", "Integer"),
                 ],
             }
         ],
     }
 
 
+def _demo_metric(name: str, expression: str, description: str, datatype: str) -> dict:
+    return {
+        "name": name,
+        "datatype": datatype,
+        "description": description,
+        "expression": {"dialects": [{"dialect": "ANSI_SQL", "expression": expression}]},
+    }
+
+
 @asynccontextmanager
 async def lifespan(app):
+    # Accounts and sessions come first: the request gate consults them for every
+    # API call, and they must work even when PostgreSQL is unreachable.
+    # Observation comes first so the startup of everything else is already logged.
+    app.state.observatory = install_observatory(Observatory())
+    app.state.observatory.log("startup", runtime=str(RUNTIME), build=build_id())
+    app.state.auth = AuthService.from_env(RUNTIME)
     app.state.store = QueryStore(RUNTIME)
     app.state.registry = SpecRegistry(ROOT / "integrations" / "polaris" / "spec")
     app.state.polaris = PolarisClient(POLARIS_RUNTIME / "credentials.json", app.state.registry)
@@ -256,21 +338,62 @@ async def lifespan(app):
     app.state.semantic = SemanticModelService(app.state.polaris)
     app.state.sources = DataSourceRegistry(RUNTIME, POLARIS_RUNTIME, ENGINES_RUNTIME)
     app.state.llm = LlmSettings(RUNTIME / "llm.json")
-    app.state.queries = QueryService(app.state.store, app.state.sources, app.state.llm)
+    app.state.query_cache = QueryCache.from_env(RUNTIME / "query-cache.json")
+    app.state.queries = QueryService(app.state.store, app.state.sources, app.state.llm, app.state.query_cache)
     app.state.ingest = IngestService(app.state.polaris, app.state.sources)
+    # Metrics are read from the semantic models themselves; the engine compiles
+    # metric queries into SQL for whichever engine holds the data.
+    app.state.semantic_engine = SemanticQueryEngine(
+        models=app.state.models,
+        semantic=app.state.semantic,
+        queries=app.state.queries,
+        builtin=lambda: model_document(app.state.store.metadata()),
+    )
     # The quality metadata lives in a real PostgreSQL database. An unreachable
     # database must not stop the rest of the platform from starting: bootstrap
     # reports through health() instead of raising out of the lifespan.
     app.state.quality_store = QualityStore()
     app.state.quality_store.bootstrap()
-    app.state.quality = QualityService(app.state.quality_store, app.state.sources)
+    # One registry of schedulable jobs: the 调度 screen dispatches by name, so
+    # every background job of the platform is registered here rather than
+    # running its own timer.
+    app.state.tasks = TaskRegistry()
+    app.state.quality = QualityService(app.state.quality_store, app.state.sources, app.state.tasks)
+    app.state.quality.ensure_templates()
     app.state.quality_scheduler = QualityScheduler(
-        app.state.quality_store, app.state.quality
+        app.state.quality_store, app.state.quality, registry=app.state.tasks
     )
+    register_platform_tasks(app.state.tasks, quality=app.state.quality, cache=app.state.query_cache)
     app.state.quality_scheduler.start()
+    # The metadata catalog (元数据管理) follows the same rule: its store falls back
+    # to a local SQLite file when PostgreSQL is unreachable, and nothing it does
+    # at startup may stop the platform from serving.
+    start_metadata(app.state, RUNTIME)
+    register_platform_tasks(
+        app.state.tasks,
+        ingestor=getattr(app.state, "metadata_ingest", None),
+        insights=getattr(app.state, "metadata_insights", None),
+        lineage=getattr(app.state, "metadata_lineage", None),
+    )
+    # AI 增强 reads from every module above; it never writes without a person.
+    app.state.ai = AiAssistService(
+        sources=app.state.sources,
+        quality=app.state.quality,
+        quality_store=app.state.quality_store,
+        metadata=getattr(app.state, "metadata", None),
+        lineage=getattr(app.state, "metadata_lineage", None),
+        context=getattr(app.state, "metadata_context", None),
+        ingestor=getattr(app.state, "metadata_ingest", None),
+        llm=app.state.llm,
+        validator=check_document,
+        catalog=app.state.quality.options,
+    )
+    app.state.observatory.log("ready", routes=len(app.routes))
     try:
         yield
     finally:
+        app.state.observatory.log("shutdown")
+        stop_metadata(app.state)
         app.state.quality_scheduler.stop()
         app.state.quality_store.close()
 
@@ -284,7 +407,10 @@ app = FastAPI(
 )
 
 
+app.include_router(auth_router)
+app.include_router(ai_router)
 app.include_router(quality_router)
+app.include_router(metadata_router)
 
 
 @app.middleware("http")
@@ -302,7 +428,9 @@ async def local_boundary(request: Request, call_next):
         origin = request.headers.get("origin")
         if origin and origin != f"{request.url.scheme}://{host}":
             return JSONResponse({"detail": "拒绝跨来源请求。"}, status_code=403)
-        if request.method not in {"GET", "HEAD", "OPTIONS"}:
+        # An MCP client ends its session with a body-less DELETE (Streamable HTTP).
+        closes_mcp_session = request.method == "DELETE" and request.url.path == "/api/metadata/mcp"
+        if request.method not in {"GET", "HEAD", "OPTIONS"} and not closes_mcp_session:
             if (
                 request.headers.get("content-type", "").split(";")[0].strip()
                 != "application/json"
@@ -324,16 +452,59 @@ async def local_boundary(request: Request, call_next):
                 return JSONResponse(
                     {"detail": "请求体不能超过 1 MB。"}, status_code=413
                 )
-    response = await call_next(request)
+    # Who is calling, and may they? With LATTICE_AUTH off this yields the local
+    # administrator; with it on, a session cookie or bearer token is required.
+    auth = getattr(request.app.state, "auth", None)
+    actor_token = None
+    if auth is not None and request.url.path.startswith("/api/"):
+        user, refusal = auth.gate(
+            request.url.path,
+            request.method,
+            request.cookies.get(SESSION_COOKIE),
+            parse_bearer(request.headers.get("authorization")),
+        )
+        if refusal is not None:
+            return JSONResponse({"detail": refusal[1]}, status_code=refusal[0])
+        request.state.user = user
+        actor_token = current_actor.set(user)
+    observatory = getattr(request.app.state, "observatory", None)
+    trace = None
+    trace_token = None
+    started = time.monotonic()
+    if observatory is not None and request.url.path.startswith("/api/"):
+        trace = observatory.start_request(request.method, request.url.path, str((getattr(request.state, "user", None) or {}).get("username") or ""))
+        trace_token = current_trace.set(trace)
+        request.state.trace_id = trace.id
+    try:
+        response = await call_next(request)
+    except Exception as error:  # noqa: BLE001 - the trace must record a failed request too
+        if trace is not None and observatory is not None:
+            observatory.finish_request(trace, 500, time.monotonic() - started, f"{type(error).__name__}: {error}", _matched_route(request))
+        raise
+    finally:
+        if trace_token is not None:
+            current_trace.reset(trace_token)
+        if actor_token is not None:
+            current_actor.reset(actor_token)
+    if trace is not None and observatory is not None:
+        observatory.finish_request(trace, response.status_code, time.monotonic() - started, "", _matched_route(request))
+        response.headers["X-Lattice-Trace-Id"] = trace.id
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
-        "img-src 'self' data:; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'"
+        "img-src 'self' data: https:; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'"
     )
     if request.url.path.startswith("/api/"):
         response.headers["Cache-Control"] = "no-store"
     return response
+
+
+def _matched_route(request: Request) -> str | None:
+    """The path template of the route that handled the request, once routing has run."""
+    route = request.scope.get("route")
+    template = getattr(route, "path_format", None) or getattr(route, "path", None)
+    return str(template) if template else None
 
 
 def failure(error: Exception) -> HTTPException:
@@ -357,6 +528,8 @@ def guarded(operation, *args, **kwargs):
         HTTPException,
         DataSourceError,
         QueryError,
+        QueryCacheError,
+        SemanticQueryError,
         IngestError,
         ModelStoreError,
         ConnectorError,
@@ -407,6 +580,93 @@ def health(request: Request):
     }
 
 
+# ----- 指标平台 / 语义层查询 ------------------------------------------------------------
+@app.get("/api/metrics/catalog")
+def metrics_catalog(request: Request, query: str | None = Query(default=None, max_length=200)):
+    return guarded(request.app.state.semantic_engine.catalog, query)
+
+
+@app.get("/api/metrics/models")
+def metrics_models(request: Request):
+    return {"items": guarded(request.app.state.semantic_engine.list_models)}
+
+
+@app.get("/api/metrics/model")
+def metrics_model(request: Request, ref: str = Query(min_length=1, max_length=300)):
+    return guarded(request.app.state.semantic_engine.describe, ref)
+
+
+@app.post("/api/metrics/compile")
+def metrics_compile(payload: MetricQueryInput, request: Request):
+    body = payload.model_dump()
+    return guarded(request.app.state.semantic_engine.compile, body.pop("model"), body, body.get("datasource_id"))
+
+
+@app.post("/api/metrics/query")
+def metrics_query(payload: MetricQueryInput, request: Request):
+    body = payload.model_dump()
+    return guarded(
+        request.app.state.semantic_engine.query,
+        body.pop("model"),
+        body,
+        datasource_id=body.get("datasource_id"),
+        refresh=payload.refresh,
+    )
+
+
+@app.post("/api/metrics/refresh")
+def metrics_refresh(payload: EmptyInput, request: Request):
+    request.app.state.semantic_engine.invalidate()
+    return {"refreshed": True, "models": len(request.app.state.semantic_engine.list_models())}
+
+
+@app.get("/api/observability/summary")
+def observability_summary(request: Request):
+    state = request.app.state
+    return {
+        "metrics": state.observatory.summary(),
+        "process": process_health(),
+        "components": list(iter_components(state)),
+        "build": build_id(),
+        "instance_id": os.environ.get("LATTICE_WEB_INSTANCE_ID", ""),
+    }
+
+
+@app.get("/api/observability/metrics")
+def observability_metrics(request: Request):
+    """Prometheus text exposition; point a scraper at this path."""
+    return Response(request.app.state.observatory.prometheus(), media_type="text/plain; version=0.0.4; charset=utf-8")
+
+
+@app.get("/api/observability/traces")
+def observability_traces(
+    request: Request,
+    limit: int = Query(default=50, ge=1, le=200),
+    route: str | None = Query(default=None, max_length=200),
+    min_ms: float = Query(default=0, ge=0, le=600000),
+    status: int | None = Query(default=None, ge=100, le=599),
+):
+    return {"items": request.app.state.observatory.trace_list(limit, route, min_ms, status)}
+
+
+@app.get("/api/observability/traces/{trace_id}")
+def observability_trace(trace_id: str, request: Request):
+    trace = request.app.state.observatory.trace(trace_id)
+    if trace is None:
+        raise HTTPException(404, "追踪记录不存在或已被新的请求挤出。")
+    return trace
+
+
+@app.post("/api/observability/reset")
+def observability_reset(payload: EmptyInput, request: Request):
+    return request.app.state.observatory.reset()
+
+
+@app.post("/api/observability/log-level")
+def observability_log_level(payload: LogLevelInput, request: Request):
+    return guarded(request.app.state.observatory.set_level, payload.level)
+
+
 @app.get("/api/bootstrap")
 def bootstrap(request: Request):
     state = request.app.state
@@ -436,6 +696,16 @@ def bootstrap(request: Request):
             "策略治理",
             "Polaris 原生语义模型接口（Lattice 网关实现）",
             "Lattice 模型存储（Generic Table 扩展）",
+            "元数据目录（OpenMetadata 实体模型）",
+            "数据血缘（表级 / 字段级，SQL 解析）",
+            "数据洞察、KPI 与告警",
+            "查询结果缓存（有效期 / LRU / 定向失效）",
+            "多用户与鉴权（角色、会话、API 令牌）",
+            "可观测性（结构化日志、指标、链路追踪）",
+            "语义层查询引擎与指标平台（以 Ossie 语义模型为唯一口径）",
+            "AI 增强（规则推荐、语义模型草稿、血缘根因分析）",
+            "通用任务调度（重试与补跑）",
+            "元数据上下文层与 MCP 服务",
             *[f"数据源：{connector.label}" for connector in CONNECTORS.values()],
         ],
     }
@@ -456,6 +726,33 @@ def query(payload: QueryInput, request: Request):
         payload.question,
         payload.sql,
         payload.datasource_id,
+        payload.refresh,
+    )
+
+
+@app.get("/api/query/cache")
+def query_cache(request: Request, datasource_id: str | None = None, limit: int = 50):
+    cache = request.app.state.query_cache
+    return {"stats": cache.stats(), "items": cache.entries(datasource_id, limit)}
+
+
+@app.post("/api/query/cache/invalidate")
+def invalidate_query_cache(payload: InvalidateCacheInput, request: Request):
+    cache = request.app.state.query_cache
+    if payload.key:
+        removed = 1 if cache.drop(payload.key) else 0
+    else:
+        removed = cache.invalidate(payload.datasource_id, payload.table)
+    return {"removed": removed, "stats": cache.stats()}
+
+
+@app.post("/api/query/cache/settings")
+def query_cache_settings(payload: CacheSettingsInput, request: Request):
+    return guarded(
+        request.app.state.query_cache.configure,
+        enabled=payload.enabled,
+        ttl_seconds=payload.ttl_seconds,
+        max_entries=payload.max_entries,
     )
 
 
@@ -470,7 +767,7 @@ def query_stream(payload: QueryInput, request: Request):
 
     def events():
         try:
-            for name, data in service.answer(payload.question, payload.sql, payload.datasource_id):
+            for name, data in service.answer(payload.question, payload.sql, payload.datasource_id, payload.refresh):
                 yield sse(name, data)
         except (
             DataSourceError,
@@ -502,22 +799,7 @@ def history(request: Request):
 def validate(payload: ValidationInput):
     try:
         data = parse_document(payload.yaml)
-        schema = json.loads((ROOT / "core-spec" / "ossie-schema.json").read_text())
-        failures = validator.validate_schema(data, schema)
-        warnings = []
-        if not failures:
-            messages = (
-                validator.validate_unique_names(data)
-                + validator.validate_references(data)
-                + validator.validate_sql(data)
-            )
-            warning_prefixes = ("[Reference] Warning:", "[SQL] Warning:")
-            warnings = [
-                value for value in messages if value.startswith(warning_prefixes)
-            ]
-            failures = [
-                value for value in messages if not value.startswith(warning_prefixes)
-            ]
+        failures, warnings = check_document(data)
         return {
             "valid": not failures,
             "errors": [str(item)[:1000] for item in failures[:50]],
@@ -558,23 +840,29 @@ def get_source(source_id: str, request: Request):
 
 @app.post("/api/datasources/{source_id}/update")
 def update_source(source_id: str, payload: SourceUpdateInput, request: Request):
-    return guarded(
+    updated = guarded(
         request.app.state.sources.update,
         source_id,
         payload.model_dump(exclude_unset=True),
     )
+    # A changed connection may point at different data: its cached results go.
+    request.app.state.query_cache.invalidate(source_id)
+    return updated
 
 
 @app.post("/api/datasources/{source_id}/delete")
 def delete_source(source_id: str, payload: EmptyInput, request: Request):
     guarded(request.app.state.sources.delete, source_id)
+    request.app.state.query_cache.invalidate(source_id)
     return {"deleted": True}
 
 
 @app.post("/api/datasources/restore")
 def restore_sources(payload: EmptyInput, request: Request):
     """Bring back builtin data sources that were removed from the list."""
-    return guarded(request.app.state.sources.restore)
+    restored = guarded(request.app.state.sources.restore)
+    request.app.state.query_cache.invalidate()
+    return restored
 
 
 @app.post("/api/datasources/{source_id}/test")
@@ -621,7 +909,7 @@ def source_preview(source_id: str, payload: PreviewInput, request: Request):
 
 @app.post("/api/datasources/{source_id}/query")
 def source_query(source_id: str, payload: SourceQueryInput, request: Request):
-    return guarded(request.app.state.queries.run_sql, source_id, payload.sql, payload.limit)
+    return guarded(request.app.state.queries.run_sql, source_id, payload.sql, payload.limit, payload.refresh)
 
 
 # ----- LLM settings ---------------------------------------------------------------
@@ -789,6 +1077,7 @@ def semantic_model_load(request: Request, name: str, catalog: str = "lattice", n
 
 @app.post("/api/semantic-models/publish")
 def semantic_model_publish(payload: SemanticPublishInput, request: Request):
+    request.app.state.semantic_engine.invalidate()
     prefix, parts = _semantic_target(payload.catalog, payload.namespace)
     service = request.app.state.semantic
     try:
@@ -817,6 +1106,7 @@ def semantic_model_publish(payload: SemanticPublishInput, request: Request):
 
 @app.post("/api/semantic-models/delete")
 def semantic_model_delete(payload: SemanticDeleteInput, request: Request):
+    request.app.state.semantic_engine.invalidate()
     prefix, parts = _semantic_target(payload.catalog, payload.namespace)
     service = request.app.state.semantic
     try:
@@ -932,6 +1222,7 @@ def models(request: Request):
 
 @app.post("/api/models")
 def create_model(payload: ModelInput, request: Request):
+    request.app.state.semantic_engine.invalidate()
     return model_call(request.app.state.models.create, payload.name, payload.yaml)
 
 
@@ -942,6 +1233,7 @@ def get_model(model_id: str, request: Request):
 
 @app.post("/api/models/{model_id}/delete")
 def delete_model(model_id: str, payload: ModelDeleteInput, request: Request):
+    request.app.state.semantic_engine.invalidate()
     return model_call(request.app.state.models.delete, model_id, payload.sha256)
 
 

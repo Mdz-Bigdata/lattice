@@ -140,11 +140,68 @@ export interface QueryResult {
   datasource_id: string;
   datasource_name: string;
   dialect: string;
+  /** True when the rows came from the query result cache; age is how old they are. */
+  cached?: boolean;
+  cache_age_seconds?: number | null;
 }
 export interface QueryRequest {
   question?: string;
   sql?: string;
   datasource_id?: string;
+  /** Bypass the result cache and execute again. */
+  refresh?: boolean;
+}
+export interface AuthUser {
+  id: string;
+  username: string;
+  display_name: string;
+  role: "admin" | "editor" | "viewer" | string;
+  role_label: string;
+  pages: string[];
+  page_override: boolean;
+  disabled: boolean;
+  created_at: number | null;
+  last_login_at: number | null;
+}
+export interface AuthStatus {
+  enabled: boolean;
+  setup_required: boolean;
+  user: AuthUser | null;
+  roles: { value: string; label: string; description: string }[];
+  pages: { id: string; label: string }[];
+  session_hours: number;
+}
+export interface CacheStats {
+  enabled: boolean;
+  ttl_seconds: number;
+  max_entries: number;
+  max_rows: number;
+  entries: number;
+  rows: number;
+  hits: number;
+  misses: number;
+  hit_rate: number;
+  evictions: number;
+  invalidations: number;
+  oldest_age_seconds: number | null;
+  last_cleared: number | null;
+  by_datasource: { datasource_id: string; entries: number; rows: number; hits: number }[];
+}
+export interface CacheEntry {
+  key: string;
+  datasource_id: string;
+  sql: string;
+  tables: string[];
+  rows: number;
+  hits: number;
+  age_seconds: number;
+  expires_in_seconds: number;
+}
+export function formatAge(seconds: number | null | undefined): string {
+  if (typeof seconds !== "number" || !Number.isFinite(seconds)) return "刚刚";
+  if (seconds < 60) return `${Math.max(0, Math.round(seconds))} 秒前`;
+  if (seconds < 3600) return `${Math.round(seconds / 60)} 分钟前`;
+  return `${(seconds / 3600).toFixed(1)} 小时前`;
 }
 export interface Health {
   status: string;
@@ -152,6 +209,15 @@ export interface Health {
   build?: string;
   services: { polaris: { status: string; version?: string; detail?: string } };
   demo: boolean;
+}
+/** What a page hands the API console so an operation opens ready to run. */
+export interface ConsoleContext {
+  /** Path-parameter values, keyed by parameter name. */
+  path?: Record<string, string>;
+  /** Request-body fields per operation id, applied where that operation's example
+   *  declares them. Keying by operation keeps a value meant for one request out
+   *  of every other request that happens to use the same field name. */
+  body?: Record<string, Record<string, unknown>>;
 }
 export interface Operation {
   id: string;
@@ -213,6 +279,9 @@ export async function request<T>(path: string, body?: unknown): Promise<T> {
     }
     if (!response.ok) {
       const detail = (data as { detail?: unknown }).detail;
+      // A session that ended (expiry, revocation) sends the shell back to the sign-in screen.
+      if (response.status === 401 && !path.startsWith("/api/auth/"))
+        window.dispatchEvent(new CustomEvent("lattice:unauthenticated"));
       throw new Error(
         typeof detail === "string" ? detail : JSON.stringify(detail ?? data),
       );

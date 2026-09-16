@@ -36,6 +36,7 @@ TABLES = {
     "t_lattice_products": "商品",
     "t_lattice_sellers": "商家",
     "t_lattice_payments": "支付",
+    "store_sales": "门店销售（TPC-DS 风格）",
 }
 QUESTIONS = [
     "月度销售额趋势",
@@ -64,6 +65,20 @@ FROM t_lattice_order_items
 GROUP BY strftime(shipping_limit_date, '%Y-%m')
 ORDER BY sales_month NULLS FIRST"""
 HISTORY_LIMIT = 50
+STORE_SALES_SQL = """CREATE TABLE store_sales AS SELECT
+    CAST(strftime(i.shipping_limit_date, '%Y%m%d') AS INTEGER) AS ss_sold_date_sk,
+    i.shipping_limit_date AS ss_sold_date,
+    i.product_id AS ss_item_sk,
+    o.customer_id AS ss_customer_sk,
+    i.seller_id AS ss_store_sk,
+    i.order_id AS ss_ticket_number,
+    1::INTEGER AS ss_quantity,
+    CAST(i.price AS DECIMAL(7,2)) AS ss_sales_price,
+    CAST(i.price AS DECIMAL(7,2)) AS ss_ext_sales_price,
+    CAST(i.price AS DECIMAL(7,2)) AS ss_net_paid
+FROM t_lattice_order_items i
+JOIN t_lattice_orders o ON o.order_id = i.order_id
+ORDER BY i.order_id"""
 
 
 class QueryStore:
@@ -122,6 +137,14 @@ class QueryStore:
                     price AS payment_value, '在线支付' AS payment_type FROM t_lattice_order_items"""
                 )
                 con.execute("COMMIT")
+            # The TPC-DS shaped fact table the Apache Ossie examples model (store_sales with
+            # ss_* columns), derived from the order items so its totals reconcile with them.
+            # It is created on its own so an existing sample file gains it on the next start.
+            has_store_sales = con.execute(
+                "SELECT count(*) FROM information_schema.tables WHERE table_name='store_sales'"
+            ).fetchone()[0]
+            if not has_store_sales:
+                con.execute(STORE_SALES_SQL)
         with sqlite3.connect(self.history_db) as con:
             con.execute(
                 "CREATE TABLE IF NOT EXISTS query_history(id TEXT PRIMARY KEY, created_at TEXT, result TEXT)"

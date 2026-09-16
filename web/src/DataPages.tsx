@@ -1,14 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   ArrowRight,
   Database,
   FileCode2,
+  Gauge,
   Layers,
   Play,
   Plug,
+  RefreshCw,
   ShieldCheck,
   Table2,
+  Trash2,
 } from "lucide-react";
 import {
   request,
@@ -16,16 +19,20 @@ import {
   quoteIdentifier,
   previewSql,
   datasourcePath,
+  formatAge,
   LOCAL_SAMPLE_ID,
   type Bootstrap,
   type BootstrapSource,
   type DataSource,
   type DataTable,
+  type CacheEntry,
+  type ConsoleContext,
+  type CacheStats,
   type Health,
   type QueryResult,
   type SourceType,
 } from "./api";
-import { DataGrid, Empty, ErrorBanner, Loading, PageTitle } from "./components";
+import { DataGrid, Drawer, Empty, ErrorBanner, Loading, PageTitle } from "./components";
 import { QueryReport } from "./QueryPage";
 import {
   SchemaTablePicker,
@@ -38,7 +45,8 @@ export interface DataPageProps {
   bootstrap: Bootstrap;
   health: Health | null;
   goTo: (page: string, sql?: string, sourceId?: string) => void;
-  explore: (search: string) => void;
+  /** Open the API console, optionally prefilling the request from a context. */
+  explore: (search: string, context?: ConsoleContext) => void;
   /** Registered data sources from GET /api/datasources (empty until loaded or on failure). */
   sources: DataSource[];
   sourceTypes: SourceType[];
@@ -397,6 +405,7 @@ export function SqlPage({
   const [result, setResult] = useState<QueryResult | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [cacheOpen, setCacheOpen] = useState(false);
   function changeSource(id: string) {
     setSelected(id);
     setSourceId(id);
@@ -407,7 +416,7 @@ export function SqlPage({
     setTable(name);
     if (name) setSql(previewSql(source, schema, name));
   }
-  async function run() {
+  async function run(refresh = false) {
     if (busy || !sql.trim()) return;
     setBusy(true);
     setError("");
@@ -416,6 +425,7 @@ export function SqlPage({
       setResult(
         await request<QueryResult>(datasourcePath(selected, "/query"), {
           sql,
+          refresh,
         }),
       );
     } catch (e) {
@@ -475,6 +485,15 @@ export function SqlPage({
             <Play size={14} />
             {busy ? "运行中…" : "运行 SQL"}
           </button>
+          <button
+            type="button"
+            className="secondary-button"
+            title="查看与管理查询结果缓存"
+            onClick={() => setCacheOpen(true)}
+          >
+            <Gauge size={14} />
+            查询缓存
+          </button>
         </div>
         <textarea
           spellCheck={false}
@@ -493,9 +512,239 @@ export function SqlPage({
       {error && <ErrorBanner message={error} />}
       {busy && <Loading text="正在执行查询…" />}
       {result && (
-        <QueryReport key={result.id} result={result} defaultMode="table" />
+        <QueryReport
+          key={result.id}
+          result={result}
+          defaultMode="table"
+          onRefresh={() => void run(true)}
+        />
+      )}
+      {cacheOpen && (
+        <CachePanel
+          sourceId={selected}
+          sources={sources}
+          onClose={() => setCacheOpen(false)}
+        />
       )}
     </div>
+  );
+}
+
+/** 查询缓存: hit statistics, the live entries of one source or all, targeted clearing and TTL. */
+function CachePanel({
+  sourceId,
+  sources,
+  onClose,
+}: {
+  sourceId: string;
+  sources: DataSource[];
+  onClose: () => void;
+}) {
+  const [scope, setScope] = useState<"source" | "all">("source");
+  const [data, setData] = useState<{ stats: CacheStats; items: CacheEntry[] } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [enabled, setEnabled] = useState(true);
+  const [ttl, setTtl] = useState(600);
+  const [dirty, setDirty] = useState(false);
+  const names = new Map(sources.map((item) => [item.id, item.name]));
+  async function load() {
+    setBusy(true);
+    setError("");
+    try {
+      const query = scope === "source" ? `?datasource_id=${encodeURIComponent(sourceId)}&limit=100` : "?limit=100";
+      const next = await request<{ stats: CacheStats; items: CacheEntry[] }>(`/api/query/cache${query}`);
+      setData(next);
+      if (!dirty) {
+        setEnabled(next.stats.enabled);
+        setTtl(next.stats.ttl_seconds);
+      }
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+  useEffect(() => {
+    void load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scope, sourceId]);
+  async function act(body: Record<string, unknown>, done: (removed: number) => string) {
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      const outcome = await request<{ removed: number }>("/api/query/cache/invalidate", body);
+      setNotice(done(outcome.removed));
+      await load();
+    } catch (e) {
+      setError(errorMessage(e));
+      setBusy(false);
+    }
+  }
+  async function saveSettings() {
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      await request<CacheStats>("/api/query/cache/settings", { enabled, ttl_seconds: ttl });
+      setDirty(false);
+      setNotice(enabled ? `已保存：缓存开启，有效期 ${ttl} 秒。` : "已保存：缓存已关闭，现有结果已清空。");
+      await load();
+    } catch (e) {
+      setError(errorMessage(e));
+      setBusy(false);
+    }
+  }
+  const stats = data?.stats;
+  const items = data?.items ?? [];
+  return (
+    <Drawer id="query-cache-panel" title="查询结果缓存" icon={<Gauge size={17} />} onClose={onClose} wide>
+      <div className="cache-panel">
+        <p className="muted">
+          智能问数、SQL 工作台与报表的只读查询结果按数据源、语句与行数上限缓存；
+          到期、超出条目上限、数据源配置变更或手动清理时失效，任何查询都可以“刷新”跳过缓存。
+        </p>
+        {error && <ErrorBanner message={error} />}
+        {notice && (
+          <div className="info-banner" role="status">
+            {notice}
+          </div>
+        )}
+        {stats && (
+          <div className="cache-stats">
+            <div>
+              <b>{stats.entries}</b>
+              <span>缓存条目 / 上限 {stats.max_entries}</span>
+            </div>
+            <div>
+              <b>{Math.round(stats.hit_rate * 100)}%</b>
+              <span>
+                命中率（命中 {stats.hits} · 未命中 {stats.misses}）
+              </span>
+            </div>
+            <div>
+              <b>{stats.rows.toLocaleString()}</b>
+              <span>缓存行数 / 单条上限 {stats.max_rows.toLocaleString()}</span>
+            </div>
+            <div>
+              <b>{stats.evictions + stats.invalidations}</b>
+              <span>
+                淘汰 {stats.evictions} · 失效 {stats.invalidations}
+              </span>
+            </div>
+          </div>
+        )}
+        <div className="cache-settings">
+          <label className="checkbox-row">
+            <input
+              type="checkbox"
+              checked={enabled}
+              onChange={(event) => {
+                setEnabled(event.target.checked);
+                setDirty(true);
+              }}
+            />
+            启用查询结果缓存
+          </label>
+          <label htmlFor="query-cache-ttl">有效期（秒）</label>
+          <input
+            id="query-cache-ttl"
+            type="number"
+            min={10}
+            max={604800}
+            value={ttl}
+            disabled={!enabled}
+            onChange={(event) => {
+              setTtl(Math.max(10, Math.min(604800, Number(event.target.value) || 600)));
+              setDirty(true);
+            }}
+          />
+          <button type="button" className="secondary-button" disabled={busy || !dirty} onClick={() => void saveSettings()}>
+            保存设置
+          </button>
+        </div>
+        <div className="cache-toolbar">
+          <div className="segmented-control" role="group" aria-label="缓存范围">
+            <button type="button" className={scope === "source" ? "selected" : ""} onClick={() => setScope("source")}>
+              当前数据源
+            </button>
+            <button type="button" className={scope === "all" ? "selected" : ""} onClick={() => setScope("all")}>
+              全部数据源
+            </button>
+          </div>
+          <button type="button" className="secondary-button" disabled={busy} onClick={() => void load()}>
+            <RefreshCw size={14} className={busy ? "spin" : ""} />
+            刷新
+          </button>
+          <button
+            type="button"
+            className="secondary-button"
+            disabled={busy || !items.length}
+            onClick={() =>
+              void act(
+                scope === "source" ? { datasource_id: sourceId } : {},
+                (removed) => `已清空 ${removed} 条缓存结果。`,
+              )
+            }
+          >
+            <Trash2 size={14} />
+            {scope === "source" ? "清空当前数据源" : "清空全部"}
+          </button>
+        </div>
+        {busy && !data ? (
+          <Loading text="正在读取缓存…" />
+        ) : items.length ? (
+          <div className="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  {scope === "all" && <th>数据源</th>}
+                  <th>SQL</th>
+                  <th>涉及表</th>
+                  <th>行数</th>
+                  <th>命中</th>
+                  <th>存入</th>
+                  <th>剩余</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                {items.map((item) => (
+                  <tr key={item.key}>
+                    {scope === "all" && <td>{names.get(item.datasource_id) ?? item.datasource_id}</td>}
+                    <td className="cache-sql">
+                      <code title={item.sql}>{item.sql}</code>
+                    </td>
+                    <td>{item.tables.join("、") || "—"}</td>
+                    <td>{item.rows.toLocaleString()}</td>
+                    <td>{item.hits}</td>
+                    <td>{formatAge(item.age_seconds)}</td>
+                    <td>{item.expires_in_seconds} 秒</td>
+                    <td>
+                      <button
+                        type="button"
+                        className="text-button"
+                        disabled={busy}
+                        onClick={() => void act({ key: item.key }, () => "已删除该缓存结果。")}
+                      >
+                        <Trash2 size={13} />
+                        删除
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <Empty title="没有缓存的查询结果">
+            {stats?.enabled ? "执行一次查询后，相同的语句在有效期内会直接返回缓存结果。" : "缓存已关闭。"}
+          </Empty>
+        )}
+      </div>
+    </Drawer>
   );
 }
 const localApis = [

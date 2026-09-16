@@ -374,7 +374,7 @@ def normalize_arrow(table):
 
 
 def load_sample() -> dict[str, dict]:
-    """Read the six sample tables (types via DESCRIBE, rows as Arrow) from the WebUI DuckDB file."""
+    """Read the sample tables (types via DESCRIBE, rows as Arrow) from the WebUI DuckDB file."""
     names = sample_table_names()
     connection = sample_connection()
     try:
@@ -1027,29 +1027,60 @@ def seed_postgres(sample: dict[str, dict]) -> dict:
     config = read_config("postgres")
     if not config:
         raise RuntimeError("缺少 .runtime/engines/postgres.json")
-    created, existing, mismatched, total = [], [], {}, 0
     with postgres_connect(config["user"], config["password"], config["database"]) as connection:
-        for name, spec in sample.items():
-            with connection.transaction():
-                exists = connection.execute("SELECT to_regclass(%s)", (f'public."{name}"',)).fetchone()[0]
-                if exists:
-                    count = int(connection.execute(f'SELECT count(*) FROM public."{name}"').fetchone()[0])
-                    if count == spec["rows"]:
-                        existing.append(name)
-                        total += count
-                        continue
-                    if count:
-                        mismatched[name] = (count, spec["rows"])
-                        continue
-                else:
-                    connection.execute(create_table_sql("postgres", name, spec["columns"]))
-                columns = ", ".join(f'"{column}"' for column, _ in spec["columns"])
-                with connection.cursor() as cursor:
-                    with cursor.copy(f'COPY public."{name}" ({columns}) FROM STDIN') as copy:
-                        for row in sample_rows(spec):
-                            copy.write_row(row)
-                created.append(name)
-                total += spec["rows"]
+        return seed_postgres_connection(connection, sample)
+
+
+BUSINESS_POSTGRES_LABEL = "PostgreSQL 业务库"
+
+
+def seed_business_postgres(sample: dict[str, dict]) -> dict:
+    """Write the sample tables into the ``public`` schema of the business database too.
+
+    ``quality-postgres`` is the PostgreSQL entry the WebUI lists, so semantic models
+    and metrics that run on every other local engine must find the same tables there.
+    Only missing tables are created (a table with other rows is reported, never
+    touched), matching how the quality and metadata modules only add objects to it.
+    """
+    import psycopg
+
+    config = read_config(QUALITY_DATASOURCE)
+    if not config or config.get("type") != "postgresql":
+        raise EngineUnavailable("未写入数据源配置，跳过示例数据。")
+    try:
+        connection = psycopg.connect(host=config["host"], port=int(config.get("port") or 5432), user=config["user"],
+                                     password=config.get("password") or "", dbname=config["database"],
+                                     sslmode=config.get("sslmode") or "prefer", connect_timeout=5, autocommit=True)
+    except psycopg.Error as error:
+        raise EngineUnavailable(f"无法连接 {config['host']}:{config.get('port') or 5432}/{config['database']}，"
+                                f"跳过示例数据：{str(error).strip()[:160]}") from error
+    with connection:
+        return seed_postgres_connection(connection, sample)
+
+
+def seed_postgres_connection(connection, sample: dict[str, dict]) -> dict:
+    created, existing, mismatched, total = [], [], {}, 0
+    for name, spec in sample.items():
+        with connection.transaction():
+            exists = connection.execute("SELECT to_regclass(%s)", (f'public."{name}"',)).fetchone()[0]
+            if exists:
+                count = int(connection.execute(f'SELECT count(*) FROM public."{name}"').fetchone()[0])
+                if count == spec["rows"]:
+                    existing.append(name)
+                    total += count
+                    continue
+                if count:
+                    mismatched[name] = (count, spec["rows"])
+                    continue
+            else:
+                connection.execute(create_table_sql("postgres", name, spec["columns"]))
+            columns = ", ".join(f'"{column}"' for column, _ in spec["columns"])
+            with connection.cursor() as cursor:
+                with cursor.copy(f'COPY public."{name}" ({columns}) FROM STDIN') as copy:
+                    for row in sample_rows(spec):
+                        copy.write_row(row)
+            created.append(name)
+            total += spec["rows"]
     return seed_summary(created, existing, mismatched, total)
 
 
@@ -1235,6 +1266,16 @@ def seed(engines: list[str]) -> list[str]:
             continue
         mark = "⚠" if summary["mismatched"] else "✓"
         say(f"  {mark} {LABELS[engine]}：{describe_seed(summary)}")
+    # The business database is not an engine this script starts, so a stopped or
+    # unconfigured one is reported and skipped rather than counted as a failure.
+    try:
+        summary = seed_business_postgres(sample)
+        mark = "⚠" if summary["mismatched"] else "✓"
+        say(f"  {mark} {BUSINESS_POSTGRES_LABEL}：{describe_seed(summary)}")
+    except EngineUnavailable as error:
+        say(f"  ⚠ {BUSINESS_POSTGRES_LABEL}：{error}")
+    except Exception as error:  # noqa: BLE001 - the business database must not block the engines
+        say(f"  ✗ {BUSINESS_POSTGRES_LABEL}：写入示例数据失败：{error}")
     record = read_json(RUNTIME / "seed.json") or {}
     record.update({engine: time.strftime("%Y-%m-%dT%H:%M:%S") for engine in engines if engine not in failed})
     write_json(RUNTIME / "seed.json", record)

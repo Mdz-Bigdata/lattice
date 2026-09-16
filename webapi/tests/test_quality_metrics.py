@@ -20,6 +20,7 @@ import pytest
 
 from webapi.connectors import CONNECTORS, guard_sql, iter_dialects
 from webapi.quality_metrics import (
+    reference_aggregate_sql,
     DIALECTS,
     DIMENSIONS,
     METRICS,
@@ -46,8 +47,13 @@ SAMPLE_CONFIG = {
         "reference_column": "code",
     },
     "table_freshness": {"interval_value": 2, "interval_unit": "day"},
+    "cross_source_compare": {"aggregate": "count", "reference_datasource": "pg", "reference_table": "orders"},
+    "custom_sql": {"mode": "rows", "sql": "SELECT * FROM ${table} WHERE amount < 0"},
 }
 METRIC_IDS = tuple(METRICS)
+#: Metrics whose three statements follow the classic count-over-invalidate shape.
+CLASSIC_IDS = tuple(metric_id for metric_id, metric in METRICS.items() if metric.plan is None)
+PLANNED_IDS = tuple(metric_id for metric_id in METRIC_IDS if metric_id not in CLASSIC_IDS)
 INJECTIONS = (
     'a"; DROP TABLE x; --',
     "a`; DROP TABLE x; --",
@@ -70,8 +76,10 @@ def sql_for(dialect, metric_id, *, config=None, schema="shop", table="orders",
 
 # ----- generation over every metric and dialect ---------------------------------------
 @pytest.mark.parametrize("dialect", DIALECTS)
-@pytest.mark.parametrize("metric_id", METRIC_IDS)
+@pytest.mark.parametrize("metric_id", CLASSIC_IDS)
 def test_every_metric_and_dialect_generates_guarded_read_only_sql(dialect, metric_id):
+    if metric_id == "column_match_regex" and dialect == "tsql":
+        pytest.skip("SQL Server 没有正则表达式谓词")
     result = sql_for(dialect, metric_id)
     quote = SCRIPTS[dialect].quote
     table = f"{quote}shop{quote}.{quote}orders{quote}"
@@ -87,8 +95,10 @@ def test_every_metric_and_dialect_generates_guarded_read_only_sql(dialect, metri
 
 
 @pytest.mark.parametrize("dialect", DIALECTS)
-@pytest.mark.parametrize("metric_id", METRIC_IDS)
+@pytest.mark.parametrize("metric_id", CLASSIC_IDS)
 def test_filter_is_guarded_and_anded_last(dialect, metric_id):
+    if metric_id == "column_match_regex" and dialect == "tsql":
+        pytest.skip("SQL Server 没有正则表达式谓词")
     result = sql_for(dialect, metric_id, config={"filter": "amount > 0"})
     for statement in (result.actual_sql, result.total_sql, result.invalidate_sql):
         guard_sql(statement, dialect)
@@ -304,7 +314,7 @@ def test_metric_error_reports_a_chinese_message_and_status():
     assert error.value.status_code == 400
     assert str(error.value).endswith("。")
     with pytest.raises(MetricError):
-        build("column_null", make_context("oracle", "shop", "orders", "email", {}))
+        build("column_null", make_context("sqlite", "shop", "orders", "email", {}))
     with pytest.raises(MetricError):
         sql_for("postgres", "table_freshness", column=None)
 
@@ -366,6 +376,8 @@ def test_catalog_lists_the_six_categories_in_product_order():
         "standard",
         "relation",
         "timeliness",
+        "consistency",
+        "custom",
     ]
     assert [item["label"] for item in payload["dimensions"]] == [
         "唯一性校验",
@@ -374,6 +386,8 @@ def test_catalog_lists_the_six_categories_in_product_order():
         "数据标准校验",
         "关联性校验",
         "及时性校验",
+        "一致性校验",
+        "自定义校验",
     ]
     listed = [metric["id"] for item in payload["dimensions"] for metric in item["metrics"]]
     assert listed == [metric_id for item in DIMENSIONS for metric_id in item.metrics]
@@ -389,7 +403,8 @@ def test_catalog_metrics_describe_their_form():
     }
     for metric_id, metric in metrics.items():
         assert metric["label"] == METRICS[metric_id].label
-        assert metric["needs_column"] is True
+        assert metric["needs_column"] is METRICS[metric_id].needs_column
+        assert metric["needs_column"] is (metric_id not in PLANNED_IDS)
         assert metric["fields"][-1]["name"] == "filter"
         assert all(field["label"] for field in metric["fields"])
     assert metrics["table_freshness"]["level"] == "table"
@@ -405,3 +420,66 @@ def test_catalog_metrics_describe_their_form():
         "<",
         "<=",
     ]
+
+
+# ----- custom SQL and cross-source comparison ------------------------------------------
+@pytest.mark.parametrize("dialect", DIALECTS)
+def test_custom_sql_rows_mode_counts_the_statement_and_fills_placeholders(dialect):
+    result = sql_for(dialect, "custom_sql", config={"mode": "rows", "sql": "SELECT * FROM ${table} WHERE ${column} < 0;", "filter": "amount > 0"})
+    quote = SCRIPTS[dialect].quote
+    table = f"{quote}shop{quote}.{quote}orders{quote}"
+    column = f"{quote}email{quote}"
+    for statement in (result.actual_sql, result.total_sql, result.invalidate_sql):
+        guard_sql(statement, dialect)
+    assert result.invalidate_sql == f"SELECT * FROM (\nSELECT * FROM {table} WHERE {column} < 0\n) lattice_src WHERE (amount > 0)"
+    assert result.actual_sql.startswith("SELECT count(1) AS actual_value FROM (") and result.invalidate_sql in result.actual_sql
+    assert result.total_sql == f"SELECT count(1) AS checked_count FROM {table} WHERE (amount > 0)"
+    assert result.compare == "" and result.predicate
+
+
+def test_custom_sql_value_mode_uses_the_statement_as_the_actual_value():
+    result = sql_for("postgres", "custom_sql", config={"mode": "value", "sql": "SELECT count(1) AS actual_value FROM ${table} WHERE amount < 0"})
+    assert result.actual_sql == result.invalidate_sql == 'SELECT count(1) AS actual_value FROM "shop"."orders" WHERE amount < 0'
+    assert result.total_sql == 'SELECT count(1) AS checked_count FROM "shop"."orders"'
+
+
+@pytest.mark.parametrize(
+    "sql, message",
+    [
+        ("SELECT * FROM ${table} -- note", "注释"),
+        ("SELECT * FROM ${other}", "占位符"),
+        ("DELETE FROM ${table}", "安全校验"),
+        ("SELECT 1; SELECT 2", "分号"),
+        ("SELECT * FROM ${table} WHERE ${column} IS NULL", "核查字段"),
+    ],
+)
+def test_custom_sql_is_guarded(sql, message):
+    ctx = make_context("postgres", "shop", "orders", None, {"mode": "rows", "sql": sql})
+    with pytest.raises(MetricError, match=message):
+        build("custom_sql", ctx)
+
+
+def test_cross_source_builds_the_source_aggregate_and_the_reference_in_its_own_dialect():
+    result = sql_for("mysql", "cross_source_compare", config={"aggregate": "sum", "reference_datasource": "pg", "reference_table": "orders", "reference_column": "amount", "filter": "status = 1"})
+    assert result.compare == "aggregate"
+    assert result.actual_sql == "SELECT sum(`email`) AS actual_value FROM `shop`.`orders` WHERE (status = 1)"
+    assert result.total_sql == result.actual_sql
+    reference = reference_aggregate_sql("postgres", "public", "orders", "amount", "sum", "status = 'paid'")
+    assert reference == 'SELECT sum("amount") AS checked_count FROM "public"."orders" WHERE (status = \'paid\')'
+    assert reference_aggregate_sql("hive", None, "orders", None, "count") == "SELECT count(1) AS checked_count FROM `orders`"
+    with pytest.raises(MetricError, match="核查字段"):
+        build("cross_source_compare", make_context("mysql", "shop", "orders", None, {"aggregate": "max", "reference_datasource": "pg", "reference_table": "orders"}))
+    with pytest.raises(MetricError, match="参照字段"):
+        reference_aggregate_sql("postgres", None, "orders", None, "avg")
+    with pytest.raises(MetricError, match="参照表名"):
+        reference_aggregate_sql("postgres", None, "orders; drop", None, "count")
+    with pytest.raises(MetricError, match="子查询"):
+        reference_aggregate_sql("postgres", None, "orders", None, "count", "(SELECT 1)")
+
+
+def test_partial_validation_keeps_templates_without_targets_valid():
+    partial = validate_config("cross_source_compare", {"aggregate": "count"}, partial=True)
+    assert partial["reference_table"] == "" and partial["reference_datasource"] == ""
+    with pytest.raises(MetricError, match="参照数据源"):
+        validate_config("cross_source_compare", {"aggregate": "count"})
+    assert validate_config("column_length", {"comparator": "<="}, partial=True)["length"] is None

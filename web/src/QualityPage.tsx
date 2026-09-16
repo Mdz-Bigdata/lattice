@@ -24,6 +24,7 @@ import {
   Code2,
   Eye,
   FileBarChart,
+  History,
   ListChecks,
   ListTree,
   Pencil,
@@ -37,6 +38,7 @@ import {
   Search,
   ShieldCheck,
   Table2,
+  Sparkles,
   Trash2,
 } from "lucide-react";
 import {
@@ -55,13 +57,15 @@ import {
   Loading,
   PageTitle,
 } from "./components";
+import { AiRulesDrawer } from "./AiPanels";
 import {
   preferredSchema,
   sourceLabel,
+  SourceSelect,
+  type GoTo,
   useApi,
   useSchemas,
   useTables,
-  type GoTo,
 } from "./SourceBrowser";
 import type { DataPageProps } from "./DataPages";
 
@@ -154,6 +158,82 @@ interface QualitySchedule {
   last_fire_time: string | null;
   next_fire_time: string | null;
   create_time: string;
+  task?: string;
+  task_label?: string;
+  retry_limit?: number;
+  retry_delay_seconds?: number;
+  misfire_policy?: string;
+  misfire_policy_label?: string;
+  max_backfill?: number;
+  last_status?: string;
+  last_status_label?: string;
+  last_message?: string;
+}
+/** A job the scheduler can dispatch; the 调度 form offers these instead of free-text bean names. */
+interface QualityTaskOption {
+  key: string;
+  bean_name: string;
+  method_name: string;
+  label: string;
+  description: string;
+  params_label: string;
+  params_hint: string;
+  params_required: boolean;
+  category: string;
+}
+interface QualityTasks {
+  items: QualityTaskOption[];
+  misfire_policies: Option[];
+  run_statuses: Option[];
+}
+interface QualityTemplate {
+  id: number;
+  name: string;
+  description: string;
+  metric: string;
+  metric_label: string;
+  dimension: string;
+  dimension_label: string;
+  level: string;
+  level_label: string;
+  config: Record<string, unknown>;
+  expected_type: string;
+  result_formula: string;
+  operator: string;
+  threshold: number;
+  builtin: boolean;
+  needs_column: boolean;
+  create_time: string;
+  update_time: string;
+}
+interface BatchOutcome {
+  total: number;
+  created: QualityRule[];
+  errors: {
+    datasource_id: string;
+    schema_name: string | null;
+    table_name: string;
+    column_name: string | null;
+    message: string;
+  }[];
+}
+interface QualityTaskRun {
+  id: number;
+  schedule_id: number | null;
+  schedule_name: string;
+  task: string;
+  task_label: string;
+  trigger_type: string;
+  trigger_label: string;
+  attempt: number;
+  status: string;
+  status_label: string;
+  planned_time: string | null;
+  start_time: string;
+  end_time: string | null;
+  elapsed_ms: number | null;
+  message: string;
+  detail: Record<string, unknown>;
 }
 interface QualityResult {
   id: number;
@@ -402,6 +482,17 @@ function RunningBadge({ state, label }: { state: number; label?: string }) {
   ) : (
     <span className="quality-warn-badge">{label || "停止"}</span>
   );
+}
+function RunStatusBadge({ status, label }: { status: string; label?: string }) {
+  const className =
+    status === "success"
+      ? "healthy-badge"
+      : status === "failed"
+        ? "failure-badge"
+        : status === "retrying" || status === "running"
+          ? "quality-warn-badge"
+          : "neutral-badge";
+  return <span className={className}>{label || status}</span>;
 }
 function ResultBadge({ state, label }: { state: number; label?: string }) {
   return state === 1 ? (
@@ -703,6 +794,9 @@ function RulesTab({
   const [busy, setBusy] = useState("");
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
+  const [templatesOpen, setTemplatesOpen] = useState(false);
+  const [aiOpen, setAiOpen] = useState(false);
+  const [batch, setBatch] = useState<{ template: QualityTemplate | null } | null>(null);
   const rules = useQualityData<Paged<QualityRule>>(
     `/api/quality/rules${queryString({ dimension, name, page, size })}`,
   );
@@ -762,6 +856,19 @@ function RulesTab({
       );
     } catch (e) {
       setError(`批量执行中断：${errorMessage(e)}`);
+    } finally {
+      setBusy("");
+    }
+  }
+  async function saveTemplate(rule: QualityRule) {
+    setBusy(`template-${rule.id}`);
+    setError("");
+    setNotice("");
+    try {
+      const saved = await request<QualityTemplate>(`/api/quality/rules/${rule.id}/template`, {});
+      setNotice(`已把规则「${rule.name}」保存为模板「${saved.name}」，可在“规则模板”里批量下发。`);
+    } catch (e) {
+      setError(`保存模板失败：${errorMessage(e)}`);
     } finally {
       setBusy("");
     }
@@ -891,6 +998,33 @@ function RulesTab({
               刷新
             </button>
             <button
+              type="button"
+              className="secondary-button"
+              disabled={!!busy}
+              onClick={() => setAiOpen(true)}
+            >
+              <Sparkles size={14} />
+              AI 推荐规则
+            </button>
+            <button
+              type="button"
+              className="secondary-button"
+              disabled={!!busy}
+              onClick={() => setTemplatesOpen(true)}
+            >
+              <ScrollText size={14} />
+              规则模板
+            </button>
+            <button
+              type="button"
+              className="secondary-button"
+              disabled={!!busy}
+              onClick={() => setBatch({ template: null })}
+            >
+              <ListTree size={14} />
+              批量下发
+            </button>
+            <button
               className="primary-button"
               onClick={() => setEditing({ rule: null })}
             >
@@ -1017,6 +1151,14 @@ function RulesTab({
                         <button
                           className="text-button"
                           disabled={!!busy}
+                          onClick={() => void saveTemplate(rule)}
+                        >
+                          <ScrollText size={13} />
+                          存为模板
+                        </button>
+                        <button
+                          className="text-button"
+                          disabled={!!busy}
                           onClick={() => void removeRule(rule)}
                         >
                           <Trash2 size={13} />
@@ -1032,8 +1174,51 @@ function RulesTab({
         )}
         {!rules.busy && !items.length && !rules.error && (
           <Empty title="还没有核查规则">
-            点击“新增”创建唯一性、完整性、准确性、数据标准、关联性或及时性核查规则。
+            点击“新增”创建核查规则，或用“规则模板”一次下发到多张表；核查类型包括唯一性、完整性、准确性、数据标准、关联性、及时性、跨库比对与自定义 SQL。
           </Empty>
+        )}
+        {aiOpen && (
+          <AiRulesDrawer
+            sources={sources}
+            sourceId={sourceId}
+            onClose={() => setAiOpen(false)}
+            onCreated={(count) => {
+              setAiOpen(false);
+              setError("");
+              setNotice(`已根据 AI 建议创建 ${count} 条核查规则。`);
+              rules.reload();
+            }}
+          />
+        )}
+        {templatesOpen && (
+          <TemplatesDrawer
+            catalog={catalog}
+            dimensions={dimensions}
+            sources={sources}
+            onClose={() => setTemplatesOpen(false)}
+            onApply={(template) => {
+              setTemplatesOpen(false);
+              setBatch({ template });
+            }}
+          />
+        )}
+        {batch && (
+          <BatchDrawer
+            template={batch.template}
+            sources={sources}
+            sourceId={sourceId}
+            onClose={() => setBatch(null)}
+            onDone={(outcome) => {
+              setBatch(null);
+              setError("");
+              setNotice(
+                outcome.errors.length
+                  ? `批量下发完成：新增 ${outcome.created.length} 条规则，${outcome.errors.length} 个目标失败（${outcome.errors.map((item) => `${item.table_name}：${item.message}`).join("；")}）。`
+                  : `批量下发完成：新增 ${outcome.created.length} 条规则。`,
+              );
+              rules.reload();
+            }}
+          />
         )}
         <QualityPagination
           total={total}
@@ -1473,6 +1658,7 @@ function RuleEditor({
             <ConfigFieldControl
               key={field.name}
               field={field}
+              sources={sources}
               value={config[field.name] ?? ""}
               onChange={(value) =>
                 setConfig((current) => ({ ...current, [field.name]: value }))
@@ -1576,14 +1762,43 @@ function ConfigFieldControl({
   field,
   value,
   onChange,
+  sources = [],
 }: {
   field: ConfigField;
   value: string;
   onChange: (value: string) => void;
+  sources?: DataSource[];
 }) {
   const id = `quality-config-${field.name}`;
   let control: ReactNode;
-  if (field.type === "select") {
+  if (field.type === "datasource") {
+    control = (
+      <select
+        id={id}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+      >
+        <option value="">请选择数据源</option>
+        {sources.map((item) => (
+          <option key={item.id} value={item.id}>
+            {item.name}（{item.id}）
+          </option>
+        ))}
+      </select>
+    );
+  } else if (field.type === "sql") {
+    control = (
+      <textarea
+        id={id}
+        rows={6}
+        className="code-editor"
+        value={value}
+        spellCheck={false}
+        placeholder={field.placeholder}
+        onChange={(event) => onChange(event.target.value)}
+      />
+    );
+  } else if (field.type === "select") {
     control = (
       <select
         id={id}
@@ -1628,13 +1843,530 @@ function ConfigFieldControl({
       label={field.label}
       required={!!field.required}
       help={field.help}
-      wide={field.type === "textarea"}
+      wide={field.type === "textarea" || field.type === "sql"}
     >
       {control}
     </QualityField>
   );
 }
 
+/* ------------------------------------------------------------------ 规则模板与批量下发 */
+
+/** Templates carry a rule definition without a target; 下发 applies one to many tables. */
+function TemplatesDrawer({
+  catalog,
+  dimensions,
+  sources,
+  onClose,
+  onApply,
+}: {
+  catalog: MetricCatalog | null;
+  dimensions: CatalogDimension[];
+  sources: DataSource[];
+  onClose: () => void;
+  onApply: (template: QualityTemplate) => void;
+}) {
+  const templates = useQualityData<Paged<QualityTemplate>>("/api/quality/templates?size=100");
+  const [editing, setEditing] = useState<{ template: QualityTemplate | null } | null>(null);
+  const [busy, setBusy] = useState("");
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const items = templates.data?.items ?? [];
+  async function remove(template: QualityTemplate) {
+    if (!window.confirm(`确认删除规则模板「${template.name}」？已下发的规则不受影响。`)) return;
+    setBusy(`delete-${template.id}`);
+    setError("");
+    try {
+      await request(`/api/quality/templates/${template.id}/delete`, {});
+      setNotice(`已删除模板「${template.name}」。`);
+      templates.reload();
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setBusy("");
+    }
+  }
+  return (
+    <Drawer id="quality-templates" title="规则模板" icon={<ScrollText size={17} />} onClose={onClose} wide>
+      <div className="quality-drawer-body">
+        <p className="muted">
+          模板是不带目标表的规则定义。内置模板可直接下发，也可以修改或删除；“存为模板”会把已有规则的定义保存到这里。
+        </p>
+        <div className="quality-toolbar">
+          <button type="button" className="primary-button" disabled={!!busy} onClick={() => setEditing({ template: null })}>
+            <Plus size={14} />
+            新建模板
+          </button>
+          <button type="button" className="secondary-button" disabled={templates.busy} onClick={templates.reload}>
+            <RefreshCw size={14} className={templates.busy ? "spin" : ""} />
+            刷新
+          </button>
+        </div>
+        {error && <ErrorBanner message={error} />}
+        {notice && (
+          <div className="info-banner" role="status">
+            {notice}
+          </div>
+        )}
+        {templates.error && <ErrorBanner message={`模板加载失败：${templates.error}`} />}
+        {templates.busy && !templates.data ? (
+          <Loading text="正在读取模板…" />
+        ) : items.length ? (
+          <div className="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>模板</th>
+                  <th>核查类型</th>
+                  <th>级别</th>
+                  <th>判定</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                {items.map((template) => (
+                  <tr key={template.id}>
+                    <td>
+                      <div className="quality-task-cell">
+                        <span>
+                          {template.name}
+                          {template.builtin && <span className="neutral-badge">内置</span>}
+                        </span>
+                        <small className="muted">{template.description}</small>
+                      </div>
+                    </td>
+                    <td>
+                      <span className="dimension-tag">{template.dimension_label}</span> {template.metric_label}
+                    </td>
+                    <td>
+                      <LevelBadge level={template.level} label={template.level_label} />
+                    </td>
+                    <td>
+                      <code>
+                        {template.result_formula === "percentage" ? "百分比" : "数量"} {template.operator} {template.threshold}
+                      </code>
+                    </td>
+                    <td>
+                      <div className="quality-actions">
+                        <button type="button" className="text-button" disabled={!!busy} onClick={() => onApply(template)}>
+                          <ListTree size={13} />
+                          下发
+                        </button>
+                        <button type="button" className="text-button" disabled={!!busy} onClick={() => setEditing({ template })}>
+                          <Pencil size={13} />
+                          编辑
+                        </button>
+                        <button type="button" className="text-button" disabled={!!busy} onClick={() => void remove(template)}>
+                          <Trash2 size={13} />
+                          删除
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <Empty title="还没有规则模板">点击“新建模板”，或在规则列表里把已有规则“存为模板”。</Empty>
+        )}
+        {editing && (
+          <TemplateEditor
+            key={editing.template ? editing.template.id : "create"}
+            template={editing.template}
+            catalog={catalog}
+            dimensions={dimensions}
+            sources={sources}
+            onCancel={() => setEditing(null)}
+            onSaved={(saved, mode) => {
+              setEditing(null);
+              setNotice(mode === "create" ? `已新建模板「${saved.name}」。` : `已更新模板「${saved.name}」。`);
+              templates.reload();
+            }}
+          />
+        )}
+      </div>
+    </Drawer>
+  );
+}
+
+function TemplateEditor({
+  template,
+  catalog,
+  dimensions,
+  sources,
+  onCancel,
+  onSaved,
+}: {
+  template: QualityTemplate | null;
+  catalog: MetricCatalog | null;
+  dimensions: CatalogDimension[];
+  sources: DataSource[];
+  onCancel: () => void;
+  onSaved: (saved: QualityTemplate, mode: "create" | "edit") => void;
+}) {
+  const [name, setName] = useState(template?.name ?? "");
+  const [description, setDescription] = useState(template?.description ?? "");
+  const [metric, setMetric] = useState(template?.metric ?? "");
+  const [level, setLevel] = useState(template?.level ?? "medium");
+  const [config, setConfig] = useState<Record<string, string>>({});
+  const [expectedType, setExpectedType] = useState(template?.expected_type ?? "fix_value");
+  const [formula, setFormula] = useState(template?.result_formula ?? "actual");
+  const [operator, setOperator] = useState(template?.operator ?? "lte");
+  const [threshold, setThreshold] = useState(String(template?.threshold ?? 0));
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const definition = metricOf(dimensions, metric);
+  const levels = toOptions(catalog?.levels, FALLBACK_LEVELS);
+  const operators = toOptions(catalog?.operators, FALLBACK_OPERATORS);
+  const expectedTypes = toOptions(catalog?.expected_types, FALLBACK_EXPECTED_TYPES);
+  const formulas = toOptions(catalog?.result_formulas, FALLBACK_FORMULAS);
+  useEffect(() => {
+    const current = metricOf(dimensions, metric)?.metric;
+    if (!current) return;
+    setConfig(configValues(current, template && template.metric === metric ? template.config : {}));
+  }, [dimensions, metric]);
+  async function save() {
+    if (!name.trim()) return setError("请填写模板名称。");
+    if (!metric) return setError("请选择核查类型。");
+    if (!Number.isFinite(Number(threshold))) return setError("阈值必须是数字。");
+    setSaving(true);
+    setError("");
+    const built: Record<string, unknown> = {};
+    for (const field of definition?.metric.fields ?? []) {
+      const value = (config[field.name] ?? "").trim();
+      if (value) built[field.name] = field.type === "number" ? Number(value) : value;
+    }
+    try {
+      const saved = await request<QualityTemplate>(
+        template ? `/api/quality/templates/${template.id}/update` : "/api/quality/templates",
+        {
+          name: name.trim(),
+          description: description.trim(),
+          metric,
+          level,
+          config: built,
+          expected_type: expectedType,
+          result_formula: formula,
+          operator,
+          threshold: Number(threshold),
+        },
+      );
+      onSaved(saved, template ? "edit" : "create");
+    } catch (e) {
+      setError(errorMessage(e));
+      setSaving(false);
+    }
+  }
+  return (
+    <form
+      className="quality-inline-form"
+      onSubmit={(event) => {
+        event.preventDefault();
+        void save();
+      }}
+    >
+      <h3>{template ? `编辑模板 · ${template.name}` : "新建模板"}</h3>
+      <QualityField id="quality-template-name" label="模板名称" required>
+        <input id="quality-template-name" value={name} maxLength={200} onChange={(event) => setName(event.target.value)} />
+      </QualityField>
+      <QualityField id="quality-template-description" label="说明">
+        <input id="quality-template-description" value={description} maxLength={2000} onChange={(event) => setDescription(event.target.value)} />
+      </QualityField>
+      <QualityField id="quality-template-metric" label="核查类型" required>
+        <select id="quality-template-metric" value={metric} onChange={(event) => setMetric(event.target.value)}>
+          <option value="">请选择核查类型</option>
+          {dimensions.map((dimension) => (
+            <optgroup key={dimension.id} label={dimension.label}>
+              {dimension.metrics.map((item) => (
+                <option key={item.id} value={item.id}>
+                  {item.label}
+                </option>
+              ))}
+            </optgroup>
+          ))}
+        </select>
+      </QualityField>
+      <QualityField id="quality-template-level" label="规则级别">
+        <select id="quality-template-level" value={level} onChange={(event) => setLevel(event.target.value)}>
+          {levels.map((option) => (
+            <option key={option.value} value={option.value}>
+              {option.label}
+            </option>
+          ))}
+        </select>
+      </QualityField>
+      <fieldset className="quality-fieldset">
+        <legend>核查配置（下发时可补充或覆盖）</legend>
+        {(definition?.metric.fields ?? []).map((field) => (
+          <ConfigFieldControl
+            key={field.name}
+            field={{ ...field, required: false }}
+            value={config[field.name] ?? ""}
+            sources={sources}
+            onChange={(value) => setConfig((current) => ({ ...current, [field.name]: value }))}
+          />
+        ))}
+        {!definition && <p className="muted">选择核查类型后显示该类型的核查参数。</p>}
+      </fieldset>
+      <div className="quality-field-row">
+        <QualityField id="quality-template-expected" label="期望值类型">
+          <select id="quality-template-expected" value={expectedType} onChange={(event) => setExpectedType(event.target.value)}>
+            {expectedTypes.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </QualityField>
+        <QualityField id="quality-template-formula" label="计算方式">
+          <select id="quality-template-formula" value={formula} onChange={(event) => setFormula(event.target.value)}>
+            {formulas.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </QualityField>
+        <QualityField id="quality-template-operator" label="比较方式">
+          <select id="quality-template-operator" value={operator} onChange={(event) => setOperator(event.target.value)}>
+            {operators.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </QualityField>
+        <QualityField id="quality-template-threshold" label="阈值">
+          <input id="quality-template-threshold" type="number" value={threshold} onChange={(event) => setThreshold(event.target.value)} />
+        </QualityField>
+      </div>
+      {error && <ErrorBanner message={error} />}
+      <div className="button-row">
+        <button type="submit" className="primary-button" disabled={saving}>
+          {saving ? "保存中…" : "保存模板"}
+        </button>
+        <button type="button" className="text-button" disabled={saving} onClick={onCancel}>
+          取消
+        </button>
+      </div>
+    </form>
+  );
+}
+
+/** 批量下发: one template, one data source, many tables, optional column and overrides. */
+function BatchDrawer({
+  template,
+  sources,
+  sourceId,
+  onClose,
+  onDone,
+}: {
+  template: QualityTemplate | null;
+  sources: DataSource[];
+  sourceId: string;
+  onClose: () => void;
+  onDone: (outcome: BatchOutcome) => void;
+}) {
+  const templates = useQualityData<Paged<QualityTemplate>>("/api/quality/templates?size=100");
+  const [templateId, setTemplateId] = useState<number | "">(template?.id ?? "");
+  const [datasource, setDatasource] = useState(sourceId);
+  const [schema, setSchema] = useState("");
+  const [tables, setTables] = useState<string[]>([]);
+  const [column, setColumn] = useState("");
+  const [overrides, setOverrides] = useState<Record<string, string>>({});
+  const [prefix, setPrefix] = useState("");
+  const [state, setState] = useState<number>(1);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [outcome, setOutcome] = useState<BatchOutcome | null>(null);
+  const catalog = useQualityData<MetricCatalog>("/api/quality/metrics");
+  const dimensions = catalog.data?.dimensions ?? [];
+  const chosen = (templates.data?.items ?? []).find((item) => item.id === templateId) ?? template;
+  const definition = chosen ? metricOf(dimensions, chosen.metric) : undefined;
+  const source = sources.find((item) => item.id === datasource);
+  const schemas = useSchemas(source);
+  const tableList = useTables(source, schema);
+  useEffect(() => {
+    if (!schemas.data) return;
+    const items = schemas.data.items;
+    if (!items.some((item) => item.name === schema)) setSchema(preferredSchema(source, items));
+  }, [schemas.data]);
+  useEffect(() => {
+    setTables([]);
+  }, [datasource, schema]);
+  useEffect(() => {
+    if (!chosen) return;
+    const values: Record<string, string> = {};
+    for (const [key, value] of Object.entries(chosen.config ?? {})) {
+      if (value !== null && value !== undefined && value !== "") values[key] = String(value);
+    }
+    setOverrides(values);
+  }, [chosen?.id]);
+  const available = tableList.data?.items ?? [];
+  function toggle(name: string) {
+    setTables((current) => (current.includes(name) ? current.filter((item) => item !== name) : [...current, name]));
+  }
+  async function submit() {
+    if (!chosen) return setError("请选择规则模板。");
+    if (!datasource) return setError("请选择数据源。");
+    if (!tables.length) return setError("请至少勾选一张数据表。");
+    if (chosen.needs_column && !column.trim()) return setError("该核查类型需要填写核查字段名。");
+    setBusy(true);
+    setError("");
+    const config: Record<string, unknown> = {};
+    for (const field of definition?.metric.fields ?? []) {
+      const value = (overrides[field.name] ?? "").trim();
+      if (value) config[field.name] = field.type === "number" ? Number(value) : value;
+    }
+    try {
+      const result = await request<BatchOutcome>("/api/quality/rules/batch", {
+        template_id: chosen.id,
+        targets: tables.map((table) => ({
+          datasource_id: datasource,
+          schema_name: schema || null,
+          table_name: table,
+          column_name: column.trim() || null,
+        })),
+        config,
+        name_prefix: prefix.trim() || null,
+        state,
+      });
+      setOutcome(result);
+      if (!result.errors.length) onDone(result);
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <Drawer id="quality-batch" title="批量下发规则" icon={<ListTree size={17} />} onClose={onClose} wide closeOnBackdrop={false}>
+      <div className="quality-drawer-body">
+        <p className="muted">
+          选择一个模板和一批数据表，每张表生成一条规则；字段级核查对所有表使用同一个字段名。每个目标单独校验，失败的目标不影响其他表。
+        </p>
+        <QualityField id="quality-batch-template" label="规则模板" required help={chosen?.description || undefined}>
+          <select
+            id="quality-batch-template"
+            value={templateId}
+            onChange={(event) => setTemplateId(event.target.value ? Number(event.target.value) : "")}
+          >
+            <option value="">请选择模板</option>
+            {(templates.data?.items ?? []).map((item) => (
+              <option key={item.id} value={item.id}>
+                {item.name}（{item.metric_label}）
+              </option>
+            ))}
+          </select>
+        </QualityField>
+        <div className="quality-field-row">
+          <QualityField id="quality-batch-source" label="数据源" required>
+            <SourceSelect id="quality-batch-source" sources={sources} value={datasource} disabled={busy} onChange={setDatasource} />
+          </QualityField>
+          <QualityField id="quality-batch-schema" label="Schema">
+            <select id="quality-batch-schema" value={schema} disabled={!schemas.data} onChange={(event) => setSchema(event.target.value)}>
+              {(schemas.data?.items ?? []).map((item) => (
+                <option key={item.name} value={item.name}>
+                  {item.name}
+                </option>
+              ))}
+            </select>
+          </QualityField>
+        </div>
+        <QualityField
+          label="数据表"
+          required
+          help={available.length ? `已选 ${tables.length} / ${available.length} 张表。` : tableList.error || "选择数据源与 Schema 后列出数据表。"}
+        >
+          <div className="quality-check-list">
+            <label className="quality-check-all">
+              <input
+                type="checkbox"
+                checked={available.length > 0 && tables.length === available.length}
+                disabled={!available.length}
+                onChange={(event) => setTables(event.target.checked ? available.map((item) => item.name) : [])}
+              />
+              全选
+            </label>
+            {available.map((item) => (
+              <label key={item.name}>
+                <input type="checkbox" checked={tables.includes(item.name)} onChange={() => toggle(item.name)} />
+                {item.name}
+              </label>
+            ))}
+            {tableList.loading && <span className="muted">加载中…</span>}
+          </div>
+        </QualityField>
+        <div className="quality-field-row">
+          <QualityField
+            id="quality-batch-column"
+            label="核查字段"
+            required={!!chosen?.needs_column}
+            help={chosen?.needs_column ? "所有选中的表都按这个字段名核查，例如 id、update_time。" : "该核查类型作用于整表，可留空；自定义 SQL 用到 ${column} 时需填写。"}
+          >
+            <input id="quality-batch-column" value={column} maxLength={200} placeholder="例如 id" onChange={(event) => setColumn(event.target.value)} />
+          </QualityField>
+          <QualityField id="quality-batch-prefix" label="规则名前缀" help="规则名为“前缀 · 表名.字段”，留空使用模板名。">
+            <input id="quality-batch-prefix" value={prefix} maxLength={200} onChange={(event) => setPrefix(event.target.value)} />
+          </QualityField>
+        </div>
+        {definition && (
+          <fieldset className="quality-fieldset">
+            <legend>核查配置（对本次下发的所有规则生效）</legend>
+            {definition.metric.fields.map((field) => (
+              <ConfigFieldControl
+                key={field.name}
+                field={field}
+                value={overrides[field.name] ?? ""}
+                sources={sources}
+                onChange={(value) => setOverrides((current) => ({ ...current, [field.name]: value }))}
+              />
+            ))}
+          </fieldset>
+        )}
+        <QualityField label="状态" required>
+          <div className="quality-radio-row">
+            <label>
+              <input type="radio" name="quality-batch-state" checked={state === 1} onChange={() => setState(1)} />
+              启用
+            </label>
+            <label>
+              <input type="radio" name="quality-batch-state" checked={state === 0} onChange={() => setState(0)} />
+              停用
+            </label>
+          </div>
+        </QualityField>
+        {error && <ErrorBanner message={error} />}
+        {outcome && outcome.errors.length > 0 && (
+          <div className="quality-batch-outcome">
+            <div className="info-banner" role="status">
+              已新增 {outcome.created.length} 条规则，{outcome.errors.length} 个目标失败：
+            </div>
+            <ul>
+              {outcome.errors.map((item) => (
+                <li key={`${item.table_name}-${item.column_name ?? ""}`}>
+                  <code>{item.schema_name ? `${item.schema_name}.${item.table_name}` : item.table_name}</code> {item.message}
+                </li>
+              ))}
+            </ul>
+            <button type="button" className="secondary-button" onClick={() => onDone(outcome)}>
+              关闭并查看规则
+            </button>
+          </div>
+        )}
+        <div className="button-row">
+          <button type="button" className="primary-button" disabled={busy} onClick={() => void submit()}>
+            {busy ? "下发中…" : `下发到 ${tables.length} 张表`}
+          </button>
+          <button type="button" className="text-button" disabled={busy} onClick={onClose}>
+            取消
+          </button>
+        </div>
+      </div>
+    </Drawer>
+  );
+}
 /* ------------------------------------------------------------------ 质量调度管理 */
 
 function SchedulesTab() {
@@ -1648,6 +2380,7 @@ function SchedulesTab() {
   const [busy, setBusy] = useState("");
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
+  const [runs, setRuns] = useState<QualitySchedule | "all" | null>(null);
   const schedules = useQualityData<Paged<QualitySchedule>>(
     `/api/quality/schedules${queryString({ name, page, size })}`,
   );
@@ -1733,6 +2466,14 @@ function SchedulesTab() {
             刷新
           </button>
           <button
+            type="button"
+            className="secondary-button"
+            onClick={() => setRuns("all")}
+          >
+            <History size={14} />
+            执行记录
+          </button>
+          <button
             className="primary-button"
             onClick={() => setForm({ schedule: null })}
           >
@@ -1759,11 +2500,12 @@ function SchedulesTab() {
               <tr>
                 <th>序号</th>
                 <th>任务名称</th>
-                <th>bean名称</th>
-                <th>方法名称</th>
-                <th>方法参数</th>
+                <th>任务</th>
+                <th>参数</th>
                 <th>cron表达式</th>
+                <th>重试与补跑</th>
                 <th>状态</th>
+                <th>上次结果</th>
                 <th>操作</th>
               </tr>
             </thead>
@@ -1777,20 +2519,40 @@ function SchedulesTab() {
                     {schedule.name}
                   </td>
                   <td>
-                    <code>{schedule.bean_name}</code>
-                  </td>
-                  <td>
-                    <code>{schedule.method_name}</code>
+                    <div className="quality-task-cell">
+                      <span>{schedule.task_label || `${schedule.bean_name}.${schedule.method_name}`}</span>
+                      <code>{schedule.task || `${schedule.bean_name}.${schedule.method_name}`}</code>
+                    </div>
                   </td>
                   <td>{schedule.method_params || "—"}</td>
                   <td>
                     <code>{schedule.cron_expression}</code>
                   </td>
                   <td>
+                    <span className="quality-policy-cell">
+                      {schedule.retry_limit
+                        ? `失败重试 ${schedule.retry_limit} 次，间隔 ${schedule.retry_delay_seconds ?? 60} 秒`
+                        : "失败不重试"}
+                      <br />
+                      {`错过时${schedule.misfire_policy_label || "跳过"}`}
+                      {schedule.misfire_policy === "all" ? `，最多 ${schedule.max_backfill ?? 10} 次` : ""}
+                    </span>
+                  </td>
+                  <td>
                     <RunningBadge
                       state={schedule.state}
                       label={schedule.state_label}
                     />
+                  </td>
+                  <td>
+                    {schedule.last_status ? (
+                      <span className="quality-outcome-cell" title={schedule.last_message || ""}>
+                        <RunStatusBadge status={schedule.last_status} label={schedule.last_status_label} />
+                        <small>{schedule.last_message || ""}</small>
+                      </span>
+                    ) : (
+                      "—"
+                    )}
                   </td>
                   <td>
                     <div className="quality-actions">
@@ -1817,6 +2579,14 @@ function SchedulesTab() {
                       >
                         <Play size={13} />
                         {busy === `run-${schedule.id}` ? "执行中…" : "执行"}
+                      </button>
+                      <button
+                        className="text-button"
+                        disabled={!!busy}
+                        onClick={() => setRuns(schedule)}
+                      >
+                        <History size={13} />
+                        记录
                       </button>
                       <button
                         className="text-button"
@@ -1850,6 +2620,12 @@ function SchedulesTab() {
           setPage(1);
         }}
       />
+      {runs && (
+        <TaskRunsDrawer
+          schedule={runs === "all" ? null : runs}
+          onClose={() => setRuns(null)}
+        />
+      )}
       {form && (
         <ScheduleFormDrawer
           key={form.schedule ? form.schedule.id : "create"}
@@ -1886,11 +2662,28 @@ function ScheduleFormDrawer({
   const [params, setParams] = useState(schedule?.method_params ?? "");
   const [cron, setCron] = useState(schedule?.cron_expression ?? "0 0 12 * * ?");
   const [state, setState] = useState<number>(schedule?.state ?? 0);
+  const [retryLimit, setRetryLimit] = useState<number>(schedule?.retry_limit ?? 0);
+  const [retryDelay, setRetryDelay] = useState<number>(schedule?.retry_delay_seconds ?? 60);
+  const [policy, setPolicy] = useState(schedule?.misfire_policy ?? "skip");
+  const [maxBackfill, setMaxBackfill] = useState<number>(schedule?.max_backfill ?? 10);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  const tasks = useQualityData<QualityTasks>("/api/quality/tasks");
+  const options = tasks.data?.items ?? [];
+  const selected = options.find((item) => item.bean_name === bean && item.method_name === method);
+  function pickTask(key: string) {
+    const task = options.find((item) => item.key === key);
+    if (!task) return;
+    setBean(task.bean_name);
+    setMethod(task.method_name);
+  }
   async function save() {
     if (!name.trim()) {
       setError("请填写任务名称。");
+      return;
+    }
+    if (selected?.params_required && !params.trim()) {
+      setError(`请填写${selected.params_label}：${selected.params_hint}`);
       return;
     }
     if (!cron.trim()) {
@@ -1911,6 +2704,10 @@ function ScheduleFormDrawer({
           method_params: params.trim(),
           cron_expression: cron.trim(),
           state,
+          retry_limit: retryLimit,
+          retry_delay_seconds: retryDelay,
+          misfire_policy: policy,
+          max_backfill: maxBackfill,
         },
       );
       onSaved(saved, schedule ? "edit" : "create");
@@ -1959,34 +2756,107 @@ function ScheduleFormDrawer({
           />
         </QualityField>
         <QualityField
-          id="quality-schedule-bean"
-          label="bean名称"
-          help="当前仅支持内置的 QualityTask。"
+          id="quality-schedule-task"
+          label="任务"
+          required
+          help={selected?.description || "选择调度器要执行的任务；任务由平台各模块注册。"}
         >
-          <input
-            id="quality-schedule-bean"
-            value={bean}
-            maxLength={120}
-            onChange={(event) => setBean(event.target.value)}
-          />
+          <select
+            id="quality-schedule-task"
+            value={selected?.key ?? `${bean}.${method}`}
+            onChange={(event) => pickTask(event.target.value)}
+          >
+            {!selected && <option value={`${bean}.${method}`}>{`${bean}.${method}`}</option>}
+            {options.map((task) => (
+              <option key={task.key} value={task.key}>
+                {task.category} · {task.label}（{task.key}）
+              </option>
+            ))}
+          </select>
         </QualityField>
-        <QualityField id="quality-schedule-method" label="方法名称">
-          <input
-            id="quality-schedule-method"
-            value={method}
-            maxLength={120}
-            onChange={(event) => setMethod(event.target.value)}
-          />
-        </QualityField>
-        <QualityField id="quality-schedule-params" label="方法参数">
+        <QualityField
+          id="quality-schedule-params"
+          label={selected?.params_label || "方法参数"}
+          required={!!selected?.params_required}
+          help={selected?.params_hint || "可选。"}
+        >
           <input
             id="quality-schedule-params"
             value={params}
             maxLength={500}
-            placeholder="可选"
+            placeholder={selected?.params_required ? "" : "可选"}
             onChange={(event) => setParams(event.target.value)}
           />
         </QualityField>
+        <div className="quality-field-row">
+          <QualityField
+            id="quality-schedule-retry"
+            label="失败重试次数"
+            help="0 表示失败后不自动重试；最多 10 次。"
+          >
+            <input
+              id="quality-schedule-retry"
+              type="number"
+              min={0}
+              max={10}
+              value={retryLimit}
+              onChange={(event) => setRetryLimit(Math.max(0, Math.min(10, Number(event.target.value) || 0)))}
+            />
+          </QualityField>
+          <QualityField
+            id="quality-schedule-retry-delay"
+            label="重试间隔（秒）"
+            help="两次尝试之间的等待时间，1 到 3600 秒。"
+          >
+            <input
+              id="quality-schedule-retry-delay"
+              type="number"
+              min={1}
+              max={3600}
+              value={retryDelay}
+              disabled={retryLimit === 0}
+              onChange={(event) => setRetryDelay(Math.max(1, Math.min(3600, Number(event.target.value) || 60)))}
+            />
+          </QualityField>
+        </div>
+        <div className="quality-field-row">
+          <QualityField
+            id="quality-schedule-misfire"
+            label="错过触发时"
+            help="服务停机期间错过的触发：跳过并从现在重新计算，补跑一次，或按错过的每个时间点逐次补跑。"
+          >
+            <select
+              id="quality-schedule-misfire"
+              value={policy}
+              onChange={(event) => setPolicy(event.target.value)}
+            >
+              {(tasks.data?.misfire_policies ?? [
+                { value: "skip", label: "跳过" },
+                { value: "once", label: "补跑一次" },
+                { value: "all", label: "逐次补跑" },
+              ]).map((item) => (
+                <option key={item.value} value={item.value}>
+                  {item.label}
+                </option>
+              ))}
+            </select>
+          </QualityField>
+          <QualityField
+            id="quality-schedule-backfill"
+            label="补跑上限"
+            help="逐次补跑时最多补跑多少个错过的时间点，1 到 50。"
+          >
+            <input
+              id="quality-schedule-backfill"
+              type="number"
+              min={1}
+              max={50}
+              value={maxBackfill}
+              disabled={policy !== "all"}
+              onChange={(event) => setMaxBackfill(Math.max(1, Math.min(50, Number(event.target.value) || 10)))}
+            />
+          </QualityField>
+        </div>
         <QualityField label="状态" required>
           <div className="quality-radio-row">
             <label>
@@ -2024,6 +2894,126 @@ function ScheduleFormDrawer({
           </button>
         </div>
       </form>
+    </Drawer>
+  );
+}
+
+function TaskRunsDrawer({
+  schedule,
+  onClose,
+}: {
+  schedule: QualitySchedule | null;
+  onClose: () => void;
+}) {
+  const [status, setStatus] = useState("");
+  const [page, setPage] = useState(1);
+  const [size, setSize] = useState(20);
+  const runs = useQualityData<Paged<QualityTaskRun>>(
+    `/api/quality/task-runs${queryString({
+      schedule_id: schedule ? schedule.id : "",
+      status,
+      page,
+      size,
+    })}`,
+  );
+  const items = runs.data?.items ?? [];
+  return (
+    <Drawer
+      id="quality-task-runs"
+      title={schedule ? `执行记录 · ${schedule.name}` : "任务执行记录"}
+      icon={<History size={17} />}
+      onClose={onClose}
+      wide
+    >
+      <div className="quality-drawer-body">
+        <div className="quality-toolbar">
+          <label htmlFor="quality-task-run-status">状态</label>
+          <select
+            id="quality-task-run-status"
+            value={status}
+            onChange={(event) => {
+              setStatus(event.target.value);
+              setPage(1);
+            }}
+          >
+            <option value="">全部</option>
+            <option value="success">成功</option>
+            <option value="failed">失败</option>
+            <option value="retrying">等待重试</option>
+            <option value="running">运行中</option>
+          </select>
+          <button
+            type="button"
+            className="secondary-button"
+            disabled={runs.busy}
+            onClick={runs.reload}
+          >
+            <RefreshCw size={14} className={runs.busy ? "spin" : ""} />
+            刷新
+          </button>
+        </div>
+        {runs.error && <ErrorBanner message={`执行记录加载失败：${runs.error}`} />}
+        {runs.busy && !runs.data ? (
+          <Loading text="正在读取执行记录…" />
+        ) : (
+          <div className="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>开始时间</th>
+                  {!schedule && <th>调度任务</th>}
+                  <th>任务</th>
+                  <th>触发</th>
+                  <th>次序</th>
+                  <th>状态</th>
+                  <th>耗时</th>
+                  <th>结果</th>
+                </tr>
+              </thead>
+              <tbody>
+                {items.map((run) => (
+                  <tr key={run.id}>
+                    <td title={run.planned_time ? `计划时间：${formatTime(run.planned_time)}` : ""}>
+                      {formatTime(run.start_time)}
+                    </td>
+                    {!schedule && <td>{run.schedule_name || run.schedule_id || "—"}</td>}
+                    <td>
+                      <div className="quality-task-cell">
+                        <span>{run.task_label || run.task}</span>
+                        <code>{run.task}</code>
+                      </div>
+                    </td>
+                    <td>
+                      <span className="neutral-badge">{run.trigger_label || run.trigger_type}</span>
+                    </td>
+                    <td>第 {run.attempt} 次</td>
+                    <td>
+                      <RunStatusBadge status={run.status} label={run.status_label} />
+                    </td>
+                    <td>{formatElapsed(run.elapsed_ms)}</td>
+                    <td className="quality-run-message">{run.message || "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+        {!runs.busy && !items.length && !runs.error && (
+          <Empty title="还没有执行记录">
+            调度触发、手动执行、失败重试与停机补跑都会记录在这里。
+          </Empty>
+        )}
+        <QualityPagination
+          total={runs.data?.total ?? 0}
+          page={page}
+          size={size}
+          onPage={setPage}
+          onSize={(next) => {
+            setSize(next);
+            setPage(1);
+          }}
+        />
+      </div>
     </Drawer>
   );
 }

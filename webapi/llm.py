@@ -49,6 +49,8 @@ import re
 import tempfile
 import threading
 import time
+
+from .observability import observe
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -620,13 +622,36 @@ class SqlGenerator:
         data = self.settings.load()
         prompt = self.user_prompt(question, dialect_label, source_label, schema_text)
         protocol = provider_entry(data["provider"])["protocol"]
+        with observe("generate_sql", "llm", provider=data["provider"], model=data.get("model", "")):
+            if protocol == "anthropic":
+                text = self._anthropic(data, prompt)
+            elif protocol == "openai":
+                text = self._openai(data, prompt)
+            else:
+                raise LlmError("未配置模型。")
+        return normalize_plan(extract_json(text))
+
+    def complete_text(self, prompt: str, *, system: str) -> str:
+        """A free-form answer from the configured provider, under a caller-chosen system prompt."""
+        data = self.settings.load()
+        protocol = provider_entry(data["provider"])["protocol"]
         if protocol == "anthropic":
-            text = self._anthropic(data, prompt)
+            return self._anthropic(data, prompt, schema=None, system=system)
+        if protocol == "openai":
+            return self._openai(data, prompt, json_mode=False, system=system)
+        raise LlmError("未配置模型。")
+
+    def complete_json(self, prompt: str, *, system: str, schema: dict[str, Any]) -> dict[str, Any]:
+        """A JSON object from the configured provider; Anthropic is held to ``schema``."""
+        data = self.settings.load()
+        protocol = provider_entry(data["provider"])["protocol"]
+        if protocol == "anthropic":
+            text = self._anthropic(data, prompt, schema=schema, system=system)
         elif protocol == "openai":
-            text = self._openai(data, prompt)
+            text = self._openai(data, prompt, json_mode=True, system=system)
         else:
             raise LlmError("未配置模型。")
-        return normalize_plan(extract_json(text))
+        return extract_json(text)
 
     def test(self) -> dict[str, Any]:
         data = self.settings.load()
@@ -657,7 +682,9 @@ class SqlGenerator:
         }
 
     # ----- providers -----------------------------------------------------------------
-    def _anthropic(self, data: dict[str, str], prompt: str, schema: dict | None = OUTPUT_SCHEMA) -> str:
+    def _anthropic(
+        self, data: dict[str, str], prompt: str, schema: dict | None = OUTPUT_SCHEMA, system: str = SYSTEM_PROMPT
+    ) -> str:
         import anthropic
 
         api_key = data["api_key"] or os.environ.get("ANTHROPIC_API_KEY", "")
@@ -673,7 +700,7 @@ class SqlGenerator:
         request: dict[str, Any] = {
             "model": model,
             "max_tokens": 8192,
-            "system": SYSTEM_PROMPT,
+            "system": system,
             "messages": [{"role": "user", "content": prompt}],
         }
         if schema is not None:
@@ -709,7 +736,9 @@ class SqlGenerator:
             raise LlmError("模型没有返回文本内容。")
         return text
 
-    def _openai(self, data: dict[str, str], prompt: str, json_mode: bool = True) -> str:
+    def _openai(
+        self, data: dict[str, str], prompt: str, json_mode: bool = True, system: str = SYSTEM_PROMPT
+    ) -> str:
         base_url = data["base_url"].rstrip("/")
         api_key = data["api_key"]
         if not base_url or not data["model"]:
@@ -721,7 +750,7 @@ class SqlGenerator:
             "model": data["model"],
             "temperature": 0,
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": system},
                 {"role": "user", "content": prompt},
             ],
         }

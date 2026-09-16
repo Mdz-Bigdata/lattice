@@ -17,6 +17,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+import yaml
 from fastapi.testclient import TestClient
 
 from webapi import app as app_module
@@ -49,7 +50,7 @@ def test_sample_query_aggregates_actual_rows_and_persists_history(store):
     assert len(result["rows"]) == 11
     assert [row[1] for row in result["rows"]] == MONTHLY
     assert result["source"] == "本地示例数据 · DuckDB"
-    assert sum(table["rows"] for table in store.metadata()) == 3390
+    assert sum(table["rows"] for table in store.metadata()) == 4490
     reopened = QueryStore(store.db.parent)
     assert reopened.history()[0]["id"] == result["id"]
 
@@ -126,7 +127,7 @@ def test_numeric_metric_can_precede_a_trailing_text_column(store):
 
 def test_api_query_and_model_validation(client):
     boot = client.get("/api/bootstrap").json()
-    assert len(boot["tables"]) == 6
+    assert len(boot["tables"]) == 7
     assert client.post("/api/validate", json={"yaml": boot["model_yaml"]}).json()[
         "valid"
     ]
@@ -175,6 +176,31 @@ def test_browser_boundary_requires_json_and_limits_size(client):
         == 413
     )
     assert client.get("/api/not-a-route").status_code == 404
+
+
+def test_validation_accepts_the_released_ossie_version_with_a_note(client):
+    """A model created through the Polaris API with Apache Ossie 0.1.1 (the version
+    in the Polaris contract example) validates in the editor too, with a note; an
+    unknown version fails and names the accepted ones."""
+    boot = client.get("/api/bootstrap").json()
+    data = yaml.safe_load(boot["model_yaml"])
+    assert data["version"] == "0.2.0.dev0"
+    current = client.post("/api/validate", json={"yaml": boot["model_yaml"]}).json()
+    assert current["valid"] is True
+    assert not any(item.startswith("[Schema] Warning") for item in current["warnings"])
+
+    released = client.post(
+        "/api/validate", json={"yaml": yaml.safe_dump({**data, "version": "0.1.1"})}
+    ).json()
+    assert released["valid"] is True and released["errors"] == []
+    assert any("0.1.1" in item and "0.2.0.dev0" in item for item in released["warnings"])
+
+    unknown = client.post(
+        "/api/validate", json={"yaml": yaml.safe_dump({**data, "version": "0.1.0"})}
+    ).json()
+    assert unknown["valid"] is False
+    assert "0.1.0" in unknown["errors"][0] and "0.1.1" in unknown["errors"][0]
+    assert "0.2.0.dev0" in unknown["errors"][0]
 
 
 @pytest.mark.parametrize("document", ["null", "[]", "version: 1\nversion: 2", "a: ["])

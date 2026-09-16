@@ -55,6 +55,7 @@ class Verification:
         self.cleanups: list[tuple[str, str, dict[str, Any]]] = []
         self.cleanup_errors: list[str] = []
         self.advertised: set[tuple[str, str]] = set()
+        self.examples: dict[tuple[str, str], Any] = {}
 
     def check(self, condition: Any, description: str) -> None:
         if not condition:
@@ -133,6 +134,11 @@ class Verification:
         specs.raise_for_status()
         self.advertised = {
             (spec["id"], op["id"])
+            for spec in specs.json()["specs"]
+            for op in spec["operations"]
+        }
+        self.examples = {
+            (spec["id"], op["id"]): op.get("request_example")
             for spec in specs.json()["specs"]
             for op in spec["operations"]
         }
@@ -676,6 +682,23 @@ class Verification:
                 "document": {"version": "0.1.1", "semantic_model": "{not json"},
             },
         )
+        # The console's default request body is the Polaris contract's own example,
+        # which declares the released Apache Ossie 0.1.1 rather than the bundled
+        # in-development schema version; it must be accepted exactly as published.
+        example = self.examples.get(("catalog", "createSemanticModel"))
+        self.check(
+            isinstance(example, dict)
+            and example.get("document", {}).get("version") == "0.1.1",
+            "Polaris contract example still declares Apache Ossie 0.1.1",
+        )
+        example_path = {**path, "semantic-model-name": example["name"]}
+        self.later("catalog", "dropSemanticModel", path_params=example_path)
+        from_example = c("createSemanticModel", path_params=path, body=example)
+        self.check(
+            from_example.get("document") == example["document"],
+            "createSemanticModel accepts the Polaris contract example unchanged",
+        )
+        c("dropSemanticModel", path_params=example_path, expect=(204,))
         self.semantic_rest_identity(prefix["prefix"], path["namespace"], document)
         c("dropSemanticModel", path_params=semantic, expect=(204,))
         c("loadSemanticModel", path_params=semantic, expect=(404,))
