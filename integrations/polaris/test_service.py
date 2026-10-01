@@ -170,7 +170,9 @@ class LifecycleSafetyTests(unittest.TestCase):
     def test_linux_ownership_uses_proc_executable_instead_of_ps_comm(self):
         data = self.root / "postgres"
         data.mkdir()
-        timestamp = 1789107935
+        # A single-digit day: ps pads it with a space ("Oct  1"), not a zero.
+        started = service.datetime(2026, 10, 1, 6, 16, 36)
+        timestamp = int(started.timestamp())
         (data / "PG_VERSION").write_text("16")
         (data / "postmaster.pid").write_text(f"42\n{data}\n{timestamp}\n")
         executable = str(self.root / "bin" / "postgres")
@@ -180,7 +182,7 @@ class LifecycleSafetyTests(unittest.TestCase):
                 self.fail("Linux must not use ps comm as an executable path")
             if command[-1] == "command=":
                 return f"{executable} -D {data}"
-            return service.datetime.fromtimestamp(timestamp).strftime("%a %b %d %H:%M:%S %Y")
+            return f"{started:%a %b} {started.day:>2} {started:%H:%M:%S %Y}    "
         with patch.object(service, "PGDATA", data), \
                 patch.object(service.platform, "system", return_value="Linux"), \
                 patch.object(service.os, "readlink", side_effect=lambda path, **kwargs: executable if str(path) == "/proc/42/exe" else real_readlink(path, **kwargs)) as readlink, \

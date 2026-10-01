@@ -377,11 +377,12 @@ def database_identity() -> dict | None:
                   else run(["ps", "-p", str(pid), "-o", "comm="], env=ps_env))
     command = run(["ps", "-p", str(pid), "-o", "command="], env=ps_env)
     started = run(["ps", "-p", str(pid), "-o", "lstart="], env=ps_env)
-    normalized_start = " ".join(started.split())
-    same_start = any(
-        normalized_start == " ".join(datetime.fromtimestamp(int(lines[2]) + offset).strftime("%a %b %d %H:%M:%S %Y").split())
-        for offset in range(-2, 3)
-    )
+    # ps does not zero-pad the day ("Oct  1"), so compare parsed times instead of strings.
+    try:
+        started_at = datetime.strptime(" ".join(started.split()), "%a %b %d %H:%M:%S %Y")
+    except ValueError:
+        started_at = None
+    same_start = started_at is not None and abs(started_at.timestamp() - int(lines[2])) <= 2
     if (Path(executable).resolve() != (pg_bin() / "postgres").resolve()
             or not command.endswith(" -D " + str(PGDATA)) or not same_start):
         raise RuntimeError("PostgreSQL PID record does not match the project process; no process was stopped")
