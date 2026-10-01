@@ -255,7 +255,50 @@ def test_custom_properties_validate_the_extension(catalog):
     expect_error(400, catalog.update, "table", table["fqn"], {"extension": {"sensitivity": "medium"}})
     expect_error(400, catalog.update, "table", table["fqn"], {"extension": {"undefined": 1}})
     assert catalog.update("table", table["fqn"], {"extension": {"sensitivity": "high"}})["extension"] == {"sensitivity": "high"}
-    assert catalog.remove_property("table", "sensitivity") == {"deleted": True}
+    assert catalog.remove_property("table", "sensitivity") == {"deleted": True, "cleared": 1}
+
+
+def test_removing_a_property_clears_its_values_so_later_saves_still_work(catalog):
+    table = make_table(catalog)
+    catalog.define_property("table", {"name": "owner", "property_type": "string"})
+    catalog.define_property("table", {"name": "days", "property_type": "integer"})
+    catalog.update("table", table["fqn"], {"extension": {"owner": "ops", "days": 7}})
+    catalog.remove_property("table", "owner")
+    stored = catalog.get("table", table["fqn"])["extension"]
+    assert stored == {"days": 7}
+    assert catalog.update("table", table["fqn"], {"extension": {**stored, "days": 30}})["extension"] == {"days": 30}
+
+
+def test_redefining_a_property_is_rejected_and_edits_keep_values_valid(catalog):
+    table = make_table(catalog)
+    catalog.define_property("table", {"name": "level", "property_type": "enum", "config": {"values": ["low", "high"]}})
+    expect_error(409, catalog.define_property, "table", {"name": "level", "property_type": "boolean"})
+    catalog.update("table", table["fqn"], {"extension": {"level": "high"}})
+    edited = catalog.update_property("table", "level", {"display_name": "等级", "config": {"values": ["low", "high", "top"]}})
+    assert edited["property_type"] == "enum" and edited["config"]["values"] == ["low", "high", "top"]
+    expect_error(400, catalog.update_property, "table", "level", {"config": {"values": ["low"]}})
+    assert catalog.update_property("table", "level", {"config": {"values": ["low", "high"], "multi_select": True}})
+    assert catalog.get("table", table["fqn"])["extension"] == {"level": ["high"]}
+    expect_error(404, catalog.update_property, "table", "missing", {})
+
+
+def test_entity_reference_properties_only_accept_the_configured_types(catalog):
+    table = make_table(catalog)
+    user = catalog.create("user", {"name": "alice"})
+    catalog.define_property("table", {"name": "steward", "property_type": "entityReference", "config": {"entity_types": ["user"]}})
+    assert "不属于允许的类型（用户）" in expect_error(400, catalog.update, "table", table["fqn"], {"extension": {"steward": table["fqn"]}})
+    stored = catalog.update("table", table["fqn"], {"extension": {"steward": user["fqn"]}})["extension"]["steward"]
+    assert stored == {"entity_type": "user", "fqn": "alice", "name": "alice"}
+
+
+def test_custom_property_values_reject_lossy_numbers_and_impossible_dates(catalog):
+    table = make_table(catalog)
+    catalog.define_property("table", {"name": "n", "property_type": "integer"})
+    catalog.define_property("table", {"name": "x", "property_type": "number"})
+    catalog.define_property("table", {"name": "d", "property_type": "date"})
+    for extension in ({"n": 1.5}, {"n": True}, {"x": "nan"}, {"x": "inf"}, {"d": "2026-02-30"}):
+        expect_error(400, catalog.update, "table", table["fqn"], {"extension": extension})
+    assert catalog.update("table", table["fqn"], {"extension": {"n": "42", "x": "2.5", "d": "2026-10-01"}})["extension"] == {"n": 42, "x": 2.5, "d": "2026-10-01"}
 
 
 def test_openmetadata_export_imports_entities_tags_and_lineage(catalog):

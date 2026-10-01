@@ -1179,7 +1179,12 @@ interface PropertyDefinition {
   display_name: string;
   property_type: string;
   description: string;
-  config: { values?: string[]; multi_select?: boolean };
+  config: { values?: string[]; multi_select?: boolean; entity_types?: string[] };
+}
+
+function referenceHint(types: string[]) {
+  if (!types.length) return "数据资产";
+  return types.length > 3 ? `${types.slice(0, 3).map(typeLabel).join("、")} 等 ${types.length} 类` : types.map(typeLabel).join("、");
 }
 
 function PropertiesTab({ entity, onSave }: { entity: Entity; onSave: (extension: Record<string, unknown>) => Promise<void> }) {
@@ -1187,6 +1192,13 @@ function PropertiesTab({ entity, onSave }: { entity: Entity; onSave: (extension:
   const [values, setValues] = useState<Record<string, unknown>>(entity.extension ?? {});
   const [saved, setSaved] = useState(false);
   const items = definitions.data?.items ?? [];
+  // A save returns the normalized values (numbers, resolved references).
+  useEffect(() => setValues(entity.extension ?? {}), [entity.extension]);
+  function save() {
+    // Only defined properties are sent: a value left over from a deleted definition would be rejected.
+    const extension = Object.fromEntries(items.filter((item) => values[item.name] !== undefined).map((item) => [item.name, values[item.name]]));
+    void onSave(extension).then(() => setSaved(true), () => undefined);
+  }
   function set(name: string, value: unknown) {
     setSaved(false);
     setValues((current) => ({ ...current, [name]: value }));
@@ -1213,7 +1225,7 @@ function PropertiesTab({ entity, onSave }: { entity: Entity; onSave: (extension:
               ) : definition.property_type === "enum" ? (
                 <select
                   multiple={definition.config.multi_select}
-                  value={definition.config.multi_select ? ((value as string[] | undefined) ?? []) : String(value ?? "")}
+                  value={definition.config.multi_select ? (Array.isArray(value) ? value.map(String) : value ? [String(value)] : []) : String(value ?? "")}
                   onChange={(event) =>
                     set(definition.name, definition.config.multi_select ? [...event.target.selectedOptions].map((option) => option.value) : event.target.value)
                   }
@@ -1231,7 +1243,11 @@ function PropertiesTab({ entity, onSave }: { entity: Entity; onSave: (extension:
                 <input
                   type={definition.property_type === "date" ? "date" : ["integer", "number"].includes(definition.property_type) ? "number" : "text"}
                   value={typeof value === "object" && value ? String((value as { fqn?: string }).fqn ?? "") : String(value ?? "")}
-                  placeholder={definition.property_type === "entityReference" ? "资产的完整名称" : definition.description}
+                  placeholder={
+                    definition.property_type === "entityReference"
+                      ? `对象的完整名称（${referenceHint(definition.config.entity_types ?? [])}）`
+                      : definition.description
+                  }
                   onChange={(event) => set(definition.name, event.target.value)}
                 />
               )}
@@ -1243,7 +1259,7 @@ function PropertiesTab({ entity, onSave }: { entity: Entity; onSave: (extension:
         {items.length > 0 && (
           <div className="md-form-actions">
             {saved && <span className="healthy-badge">已保存</span>}
-            <button type="button" className="primary-button" onClick={() => void onSave(values).then(() => setSaved(true), () => undefined)}>
+            <button type="button" className="primary-button" onClick={save}>
               保存属性
             </button>
           </div>

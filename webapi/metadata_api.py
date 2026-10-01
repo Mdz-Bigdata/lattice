@@ -355,6 +355,15 @@ class DefinePropertyInput(BaseModel):
     config: dict[str, Any] = Field(default_factory=dict)
 
 
+class UpdatePropertyInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    entity_type: str = Field(min_length=1, max_length=TYPE)
+    name: str = Field(min_length=1, max_length=64)
+    display_name: str | None = Field(default=None, max_length=256)
+    description: str | None = Field(default=None, max_length=4000)
+    config: dict[str, Any] | None = None
+
+
 class DeletePropertyInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     entity_type: str = Field(min_length=1, max_length=TYPE)
@@ -939,6 +948,12 @@ def define_property(payload: DefinePropertyInput, request: Request):
     body = payload.model_dump()
     entity_type = body.pop("entity_type")
     return guarded(_service(request).define_property, entity_type, body)
+
+
+@router.post("/properties/update")
+def update_property(payload: UpdatePropertyInput, request: Request):
+    body = payload.model_dump(exclude={"entity_type", "name"})
+    return guarded(_service(request).update_property, payload.entity_type, payload.name, body)
 
 
 @router.post("/properties/delete")

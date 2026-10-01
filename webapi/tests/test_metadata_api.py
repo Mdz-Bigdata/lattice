@@ -160,6 +160,11 @@ def test_import_export_properties_and_insights(client):
     defined = client.post("/api/metadata/properties", json={"entity_type": "table", "name": "owner_email", "property_type": "string"})
     assert defined.status_code == 200
     assert client.get("/api/metadata/properties", params={"entity_type": "table"}).json()["items"][0]["name"] == "owner_email"
+    assert client.post("/api/metadata/properties", json={"entity_type": "table", "name": "owner_email", "property_type": "integer"}).status_code == 409
+    edited = client.post("/api/metadata/properties/update", json={"entity_type": "table", "name": "owner_email", "display_name": "负责人邮箱"})
+    assert edited.status_code == 200 and edited.json()["display_name"] == "负责人邮箱" and edited.json()["property_type"] == "string"
+    assert client.post("/api/metadata/properties/update", json={"entity_type": "table", "name": "owner_email", "property_type": "integer"}).status_code == 422
+    assert client.post("/api/metadata/properties/delete", json={"entity_type": "table", "name": "owner_email"}).json() == {"deleted": True, "cleared": 0}
     today = dt.date.today()
     kpi = {
         "entity_type": "kpi", "name": "desc", "display_name": "描述覆盖率",

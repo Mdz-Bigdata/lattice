@@ -31,6 +31,7 @@ versioning across the several store calls one mutation needs.
 from __future__ import annotations
 
 import datetime as dt
+import math
 import re
 import threading
 
@@ -178,6 +179,21 @@ def _as_list(value: Any) -> list[Any]:
     if isinstance(value, (list, tuple)):
         return list(value)
     return [value]
+
+
+def _property_config(property_type: str, config: Any) -> dict[str, Any]:
+    """The stored config of a custom property definition of ``property_type``."""
+    if not isinstance(config, dict):
+        raise _bad("属性配置必须是对象。")
+    if property_type == "enum":
+        values = [check_text(str(v), "枚举值", 128) for v in _as_list(config.get("values")) if str(v).strip()]
+        if not values:
+            raise _bad("枚举属性必须提供取值列表。")
+        return {"values": list(dict.fromkeys(values)), "multi_select": _bool(config.get("multi_select"))}
+    if property_type == "entityReference":
+        types = [t for t in _as_list(config.get("entity_types")) if t in ENTITY_TYPES]
+        return {"entity_types": list(dict.fromkeys(types)) or DATA_ASSET_TYPES}
+    return {}
 
 
 def _bool(value: Any) -> bool:
@@ -1890,36 +1906,85 @@ class MetadataService:
         property_type = payload.get("property_type") or "string"
         if property_type not in CUSTOM_PROPERTY_TYPES:
             raise _bad("属性类型无效。")
-        config = payload.get("config") or {}
-        if not isinstance(config, dict):
-            raise _bad("属性配置必须是对象。")
-        if property_type == "enum":
-            values = [check_text(str(v), "枚举值", 128) for v in _as_list(config.get("values")) if str(v).strip()]
-            if not values:
-                raise _bad("枚举属性必须提供取值列表。")
-            config = {"values": values, "multi_select": _bool(config.get("multi_select"))}
-        elif property_type == "entityReference":
-            types = [t for t in _as_list(config.get("entity_types")) if t in ENTITY_TYPES]
-            config = {"entity_types": types or DATA_ASSET_TYPES}
-        else:
-            config = {}
         definition = {
             "entity_type": entity_type,
             "name": name,
             "display_name": check_text(payload.get("display_name"), "显示名称", 256),
             "property_type": property_type,
             "description": check_text(payload.get("description"), "描述", 4000),
-            "config": config,
+            "config": _property_config(property_type, payload.get("config") or {}),
             "created_at": now_ms(),
         }
-        self.store.upsert_property(definition)
+        with self._lock:
+            # Redefining a name would silently change the type of values already stored.
+            if self._property(entity_type, name) is not None:
+                raise MetadataError(409, f"{type_label(entity_type)}已有自定义属性 {name}，如需修改请编辑该属性。")
+            self.store.upsert_property(definition)
+        return definition
+
+    def update_property(self, entity_type: str, name: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Edit a definition in place; the type is fixed and every stored value must stay valid."""
+        check_entity_type(entity_type)
+        with self._lock:
+            current = self._property(entity_type, name)
+            if current is None:
+                raise MetadataError(404, "自定义属性不存在。")
+            config = payload.get("config")
+            definition = {
+                **current,
+                "display_name": check_text(payload.get("display_name"), "显示名称", 256),
+                "description": check_text(payload.get("description"), "描述", 4000),
+                "config": _property_config(current["property_type"], current["config"] if config is None else config),
+            }
+            rows = self._rows_with_property(entity_type, name)
+            normalized: dict[str, Any] = {}
+            invalid: list[str] = []
+            for row in rows:
+                stored = row["json"]["extension"][name]
+                try:
+                    value = self._property_value(definition, stored)
+                except MetadataError:
+                    invalid.append(row["fqn"])
+                    continue
+                if value != stored:
+                    normalized[row["id"]] = value
+            if invalid:
+                raise _bad(
+                    f"有 {len(invalid)} 个{type_label(entity_type)}填写的值不符合修改后的定义（例如 {invalid[0]}），"
+                    "请先修改或清空这些值。"
+                )
+            self.store.upsert_property(definition)
+            self._rewrite_property_values(rows, name, normalized)
         return definition
 
     def remove_property(self, entity_type: str, name: str) -> dict[str, Any]:
         check_entity_type(entity_type)
-        if not self.store.delete_property(entity_type, name):
-            raise MetadataError(404, "自定义属性不存在。")
-        return {"deleted": True}
+        with self._lock:
+            if not self.store.delete_property(entity_type, name):
+                raise MetadataError(404, "自定义属性不存在。")
+            # Stale values would make every later save of those entities fail validation.
+            rows = self._rows_with_property(entity_type, name)
+            self._rewrite_property_values(rows, name, {row["id"]: None for row in rows})
+        return {"deleted": True, "cleared": len(rows)}
+
+    def _property(self, entity_type: str, name: str) -> dict[str, Any] | None:
+        return next((d for d in self.store.properties(entity_type) if d["name"] == name), None)
+
+    def _rows_with_property(self, entity_type: str, name: str) -> list[dict[str, Any]]:
+        rows = self.store.all_entities(entity_type, deleted=None, limit=1_000_000)
+        return [row for row in rows if isinstance(row["json"].get("extension"), dict) and name in row["json"]["extension"]]
+
+    def _rewrite_property_values(self, rows: list[dict[str, Any]], name: str, values: dict[str, Any]) -> None:
+        """Replace (or, for None, drop) one property's stored values; a definition change is not an entity version."""
+        for row in rows:
+            if row["id"] not in values:
+                continue
+            document = {**row["json"], "extension": dict(row["json"]["extension"])}
+            if values[row["id"]] is None:
+                document["extension"].pop(name)
+            else:
+                document["extension"][name] = values[row["id"]]
+            self.store.update_entity({**row, "json": document, "search_text": search_text(document, row["entity_type"], row["fqn"])})
 
     def validate_extension(self, entity_type: str, value: Any) -> dict[str, Any]:
         if value is None:
@@ -1932,37 +1997,61 @@ class MetadataService:
             definition = definitions.get(key)
             if definition is None:
                 raise _bad(f"{type_label(entity_type)}没有定义自定义属性 {key}。")
-            if item is None or item == "":
+            if item is None or item == "" or item == []:
                 continue
-            kind = definition["property_type"]
-            try:
-                if kind in {"string", "markdown"}:
-                    result[key] = check_text(str(item), key, 20000)
-                elif kind == "integer":
-                    result[key] = int(item)
-                elif kind == "number":
-                    result[key] = float(item)
-                elif kind == "boolean":
-                    result[key] = _bool(item)
-                elif kind == "date":
-                    if not ISO_DATE.match(str(item)):
-                        raise ValueError
-                    result[key] = str(item)
-                elif kind == "enum":
-                    allowed = definition["config"].get("values", [])
-                    chosen = _as_list(item) if definition["config"].get("multi_select") else [item]
-                    if any(c not in allowed for c in chosen):
-                        raise ValueError
-                    result[key] = chosen if definition["config"].get("multi_select") else chosen[0]
-                elif kind == "entityReference":
-                    ref = item if isinstance(item, dict) else {"fqn": str(item)}
-                    found = self.resolve_asset(str(ref.get("fqn") or "")) if not ref.get("entity_type") else self.store.get_entity(ref["entity_type"], fqn=str(ref.get("fqn") or ""))
-                    if found is None:
-                        raise ValueError
-                    result[key] = {"entity_type": found["entity_type"], "fqn": found["fqn"], "name": found["name"]}
-            except (TypeError, ValueError) as error:
-                raise _bad(f"自定义属性 {key} 的取值不符合类型 {kind}。") from error
+            result[key] = self._property_value(definition, item)
         return result
+
+    def _property_value(self, definition: dict[str, Any], item: Any) -> Any:
+        """One custom property value, normalized to its definition's type."""
+        key = definition["name"]
+        kind = definition["property_type"]
+        config = definition["config"]
+        if kind == "entityReference":
+            return self._property_reference(definition, item)
+        try:
+            if kind in {"string", "markdown"}:
+                return check_text(str(item), key, 20000)
+            if kind == "integer":
+                if isinstance(item, bool) or (isinstance(item, float) and not item.is_integer()):
+                    raise ValueError
+                return int(item)
+            if kind == "number":
+                number = float(item)
+                if isinstance(item, bool) or not math.isfinite(number):
+                    raise ValueError
+                return number
+            if kind == "boolean":
+                return _bool(item)
+            if kind == "date":
+                if not ISO_DATE.match(str(item)):
+                    raise ValueError
+                dt.date.fromisoformat(str(item))
+                return str(item)
+            if kind == "enum":
+                allowed = config.get("values", [])
+                chosen = _as_list(item) if config.get("multi_select") else [item]
+                if not chosen or any(c not in allowed for c in chosen):
+                    raise ValueError
+                return list(dict.fromkeys(chosen)) if config.get("multi_select") else chosen[0]
+        except (TypeError, ValueError) as error:
+            raise _bad(f"自定义属性 {key} 的取值不符合类型 {kind}。") from error
+        return item
+
+    def _property_reference(self, definition: dict[str, Any], item: Any) -> dict[str, Any]:
+        allowed = definition["config"].get("entity_types") or DATA_ASSET_TYPES
+        ref = item if isinstance(item, dict) else {"fqn": str(item)}
+        fqn = str(ref.get("fqn") or "").strip()
+        wanted = ref.get("entity_type")
+        rows = [
+            row for row in (self.store.get_entities_by_fqn([fqn]) if fqn else [])
+            if row["entity_type"] in allowed and (not wanted or row["entity_type"] == wanted)
+        ]
+        if not rows:
+            labels = "、".join(type_label(t) for t in allowed)
+            raise _bad(f"自定义属性 {definition['name']} 引用的对象 {fqn or '（空）'} 不存在，或不属于允许的类型（{labels}）。")
+        found = min(rows, key=lambda row: allowed.index(row["entity_type"]))
+        return {"entity_type": found["entity_type"], "fqn": found["fqn"], "name": found["name"]}
 
     # =====================================================================================
     # governance helpers for the screens

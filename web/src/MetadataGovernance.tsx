@@ -633,6 +633,9 @@ function ClassificationDetail({ classification, onChanged }: { classification: C
             <Plus size={14} />
             添加标签
           </button>
+          <button type="button" className="small-button" onClick={() => openEntity("classification", classification.fqn)}>
+            详情与版本
+          </button>
           {!system && (
             <button
               type="button"
@@ -1161,36 +1164,71 @@ interface PropertyDefinition {
 
 const PROPERTY_ENTITY_TYPES = Object.keys(TYPE_LABELS).filter((type) => !["kpi", "eventSubscription"].includes(type));
 
+function referenceTypesLabel(types: string[], dataAssets: string[]) {
+  if (dataAssets.length && types.length === dataAssets.length && dataAssets.every((type) => types.includes(type))) return "全部数据资产";
+  return types.map((type) => TYPE_LABELS[type] ?? type).join("、");
+}
+
 export function PropertiesPage(_props: MetadataViewProps) {
   const types = useApi<TypesResponse>(metadataPath("/types"));
   const [entityType, setEntityType] = useState("table");
   const definitions = useApi<{ items: PropertyDefinition[] }>(metadataPath("/properties", { entity_type: entityType }));
+  const dataAssets = (types.data?.entity_types ?? []).filter((type) => type.data_asset).map((type) => type.id);
+  const [editing, setEditing] = useState<PropertyDefinition | null>(null);
   const [name, setName] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [propertyType, setPropertyType] = useState("string");
   const [description, setDescription] = useState("");
   const [values, setValues] = useState("");
   const [multi, setMulti] = useState(false);
+  const [refTypes, setRefTypes] = useState<string[] | null>(null);
   const action = useAction(definitions.reload);
+  const chosenRefTypes = refTypes ?? dataAssets;
+  function reset() {
+    setEditing(null);
+    setName("");
+    setDisplayName("");
+    setPropertyType("string");
+    setDescription("");
+    setValues("");
+    setMulti(false);
+    setRefTypes(null);
+  }
   useEffect(() => {
     action.setError("");
+    reset();
   }, [entityType]);
-  async function add() {
+  function edit(item: PropertyDefinition) {
+    action.setError("");
+    setEditing(item);
+    setName(item.name);
+    setDisplayName(item.display_name);
+    setPropertyType(item.property_type);
+    setDescription(item.description);
+    setValues((item.config.values ?? []).join("，"));
+    setMulti(!!item.config.multi_select);
+    setRefTypes(item.config.entity_types ?? null);
+  }
+  function config() {
+    if (propertyType === "enum") return { values: values.split(/[,，\n]+/).map((item) => item.trim()).filter(Boolean), multi_select: multi };
+    if (propertyType === "entityReference") return { entity_types: chosenRefTypes };
+    return {};
+  }
+  async function save() {
     await action.run(async () => {
-      await mdPost("/properties", {
-        entity_type: entityType,
-        name: name.trim(),
-        display_name: displayName,
-        property_type: propertyType,
-        description,
-        config: propertyType === "enum" ? { values: values.split(/[,，\n]+/).map((item) => item.trim()).filter(Boolean), multi_select: multi } : {},
-      });
-      setName("");
-      setDisplayName("");
-      setDescription("");
-      setValues("");
+      if (editing) {
+        await mdPost("/properties/update", { entity_type: entityType, name: editing.name, display_name: displayName, description, config: config() });
+      } else {
+        await mdPost("/properties", { entity_type: entityType, name: name.trim(), display_name: displayName, property_type: propertyType, description, config: config() });
+      }
+      reset();
     });
   }
+  function toggleRefType(type: string, checked: boolean) {
+    setRefTypes(checked ? [...chosenRefTypes, type] : chosenRefTypes.filter((item) => item !== type));
+  }
+  const missingValues = propertyType === "enum" && !values.trim();
+  const missingRefTypes = propertyType === "entityReference" && !chosenRefTypes.length;
   return (
     <div className="page-content md-page">
       <div className="md-page-head">
@@ -1241,16 +1279,33 @@ export function PropertiesPage(_props: MetadataViewProps) {
                         <td>{item.display_name || "--"}</td>
                         <td>{item.property_type}</td>
                         <td>{item.description || "—"}</td>
-                        <td>{item.config.values?.join("、") ?? (item.config.entity_types ? item.config.entity_types.join("、") : "—")}</td>
                         <td>
-                          <button
-                            type="button"
-                            className="md-edit"
-                            aria-label={`删除属性 ${item.name}`}
-                            onClick={() => window.confirm(`删除属性定义 ${item.name}？已填写的值会在下次保存时被拒绝。`) && void action.run(() => mdPost("/properties/delete", { entity_type: entityType, name: item.name }))}
-                          >
-                            <Trash2 size={13} />
-                          </button>
+                          {item.config.values
+                            ? `${item.config.values.join("、")}${item.config.multi_select ? "（多选）" : ""}`
+                            : item.config.entity_types
+                              ? referenceTypesLabel(item.config.entity_types, dataAssets)
+                              : "—"}
+                        </td>
+                        <td>
+                          <div className="md-actions">
+                            <button type="button" className="md-edit" aria-label={`编辑属性 ${item.name}`} onClick={() => edit(item)}>
+                              <Pencil size={13} />
+                            </button>
+                            <button
+                              type="button"
+                              className="md-edit"
+                              aria-label={`删除属性 ${item.name}`}
+                              onClick={() =>
+                                window.confirm(`删除属性定义 ${item.name}？所有${TYPE_LABELS[entityType]}上已填写的该属性值会一并清除。`) &&
+                                void action.run(async () => {
+                                  await mdPost("/properties/delete", { entity_type: entityType, name: item.name });
+                                  if (editing?.name === item.name) reset();
+                                })
+                              }
+                            >
+                              <Trash2 size={13} />
+                            </button>
+                          </div>
                         </td>
                       </tr>
                     ))}
@@ -1263,19 +1318,19 @@ export function PropertiesPage(_props: MetadataViewProps) {
           </section>
           <section className="panel">
             <div className="panel-heading">
-              <h2>添加属性</h2>
+              <h2>{editing ? `编辑属性 ${editing.name}` : "添加属性"}</h2>
             </div>
             <div className="panel-body md-properties">
               <div className="md-form-inline">
-                <FormRow label="属性名" htmlFor="property-name" required help="字母开头，只含字母、数字和下划线">
-                  <input id="property-name" value={name} onChange={(event) => setName(event.target.value)} placeholder="retention_days" />
+                <FormRow label="属性名" htmlFor="property-name" required help={editing ? "属性名创建后不能修改" : "字母开头，只含字母、数字和下划线"}>
+                  <input id="property-name" value={name} disabled={!!editing} onChange={(event) => setName(event.target.value)} placeholder="retention_days" />
                 </FormRow>
                 <FormRow label="显示名称" htmlFor="property-display">
                   <input id="property-display" value={displayName} onChange={(event) => setDisplayName(event.target.value)} placeholder="保留天数" />
                 </FormRow>
               </div>
-              <FormRow label="类型" htmlFor="property-type">
-                <select id="property-type" value={propertyType} onChange={(event) => setPropertyType(event.target.value)}>
+              <FormRow label="类型" htmlFor="property-type" help={editing ? "类型创建后不能修改，如需更换请删除后重新添加" : undefined}>
+                <select id="property-type" value={propertyType} disabled={!!editing} onChange={(event) => setPropertyType(event.target.value)}>
                   {(types.data?.custom_property_types ?? ["string", "markdown", "integer", "number", "boolean", "date", "enum", "entityReference"]).map((type) => (
                     <option key={type} value={type}>
                       {type}
@@ -1285,11 +1340,23 @@ export function PropertiesPage(_props: MetadataViewProps) {
               </FormRow>
               {propertyType === "enum" && (
                 <>
-                  <FormRow label="可选值" htmlFor="property-values" required help="逗号分隔">
+                  <FormRow label="可选值" htmlFor="property-values" required help={editing ? "逗号分隔；已被资产使用的取值不能删除" : "逗号分隔"}>
                     <input id="property-values" value={values} onChange={(event) => setValues(event.target.value)} placeholder="公开, 内部, 机密" />
                   </FormRow>
                   <Toggle checked={multi} onChange={setMulti} label="允许多选" />
                 </>
+              )}
+              {propertyType === "entityReference" && (
+                <FormRow label="可引用的类型" required help="属性值只能引用这些类型的对象；默认是全部数据资产">
+                  <div className="md-checks">
+                    {PROPERTY_ENTITY_TYPES.map((type) => (
+                      <label key={type}>
+                        <input type="checkbox" checked={chosenRefTypes.includes(type)} onChange={(event) => toggleRefType(type, event.target.checked)} />
+                        {TYPE_LABELS[type]}
+                      </label>
+                    ))}
+                  </div>
+                </FormRow>
               )}
               <FormRow label="描述" htmlFor="property-description">
                 <input id="property-description" value={description} onChange={(event) => setDescription(event.target.value)} />
@@ -1299,9 +1366,14 @@ export function PropertiesPage(_props: MetadataViewProps) {
                 <span className="muted">
                   <Info size={12} /> 属性值会随资产一起导出，并出现在 AI 上下文中。
                 </span>
-                <button type="button" className="primary-button" disabled={!name.trim()} onClick={() => void add()}>
-                  <Plus size={14} />
-                  添加
+                {editing && (
+                  <button type="button" className="small-button" onClick={reset}>
+                    取消
+                  </button>
+                )}
+                <button type="button" className="primary-button" disabled={!name.trim() || missingValues || missingRefTypes} onClick={() => void save()}>
+                  {editing ? <Pencil size={14} /> : <Plus size={14} />}
+                  {editing ? "保存修改" : "添加"}
                 </button>
               </div>
             </div>

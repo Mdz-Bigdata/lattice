@@ -101,6 +101,9 @@
   align-items: center;
   gap: 8px;
 }
+td > .md-actions {
+  flex-wrap: nowrap;
+}
 .md-form-layout {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 320px;
@@ -122,6 +125,7 @@
 }
 .md-form-row {
   display: grid;
+  align-content: start;
   gap: 6px;
 }
 .md-form-row > label {
