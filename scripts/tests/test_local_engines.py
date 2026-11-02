@@ -229,6 +229,27 @@ def test_foreign_volume_is_never_mounted(monkeypatch):
         docker_engines.ensure_volume("lattice-doris-be-storage")
 
 
+def test_volume_from_a_declared_former_location_is_adopted(monkeypatch, tmp_path):
+    declared = tmp_path / "former-roots.json"
+    monkeypatch.setattr(docker_engines, "FORMER_ROOTS", declared)
+    monkeypatch.setattr(docker_engines, "docker", lambda *args, **kwargs: str(tmp_path / "old"))
+    # Not declared: refused, and the refusal says how to declare it.
+    with pytest.raises(RuntimeError, match="former-roots"):
+        docker_engines.ensure_volume("lattice-doris-be-storage")
+    declared.write_text(json.dumps([str(tmp_path / "old")]))
+    assert docker_engines.ensure_volume("lattice-doris-be-storage") == "lattice-doris-be-storage"
+    # A checkout still living there keeps its own volumes, declared or not.
+    checkout = tmp_path / "old" / "scripts"
+    checkout.mkdir(parents=True)
+    (checkout / "lattice_docker_engines.py").write_text("")
+    with pytest.raises(RuntimeError, match="不属于本项目"):
+        docker_engines.ensure_volume("lattice-doris-be-storage")
+    # Any other label is still foreign.
+    declared.write_text(json.dumps(["/somewhere/else-entirely"]))
+    with pytest.raises(RuntimeError, match="不属于本项目"):
+        docker_engines.ensure_volume("lattice-doris-be-storage")
+
+
 def test_missing_volume_is_created_with_the_project_label(monkeypatch):
     created = []
 

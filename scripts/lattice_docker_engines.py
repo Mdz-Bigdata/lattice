@@ -50,6 +50,8 @@ ROOT = Path(__file__).resolve().parent.parent
 RUNTIME = ROOT / ".runtime" / "engines"
 PIN_FILE = ROOT / "integrations" / "engines" / "docker.json"
 LABEL = "lattice.project"
+#: Directories this project used to live in; see is_former_root().
+FORMER_ROOTS = ROOT / ".runtime" / "engines" / "former-roots.json"
 CONFIG_LABEL = "lattice.config"
 NETWORK = "lattice-engines"
 SUBNETS = ("172.29.250.0/24", "172.30.250.0/24", "10.213.250.0/24")
@@ -350,6 +352,23 @@ def volume_users(name: str) -> list[str]:
     return [line.strip() for line in output.splitlines() if line.strip()]
 
 
+def is_former_root(label: str) -> bool:
+    """Whether a volume label names a directory this project was explicitly moved from.
+
+    A label holds the absolute path of the checkout that created the volume and
+    Docker cannot change it, so moving the project would otherwise strand its data.
+    The old path has to be declared in ``FORMER_ROOTS``, and it must no longer hold
+    a checkout: a second copy of the project still running there keeps its volumes.
+    """
+    try:
+        declared = json.loads(FORMER_ROOTS.read_text())
+    except (OSError, ValueError):
+        return False
+    if not isinstance(declared, list) or label not in declared or not label.startswith("/"):
+        return False
+    return not (Path(label) / "scripts" / "lattice_docker_engines.py").exists()
+
+
 def ensure_volume(name: str, owner: str | None = None, image: str | None = None) -> str:
     """Create a labelled volume, or adopt one this project demonstrably created.
 
@@ -373,7 +392,7 @@ def ensure_volume(name: str, owner: str | None = None, image: str | None = None)
                    "-v", f"{name}:/lattice-volume", "--entrypoint", "chown",
                    image, "-R", owner, "/lattice-volume", timeout=180)
         return name
-    if label == str(ROOT):
+    if label == str(ROOT) or is_former_root(label):
         return name
     if label in ("", "<no value>"):
         users = volume_users(name)
@@ -382,7 +401,8 @@ def ensure_volume(name: str, owner: str | None = None, image: str | None = None)
             # Created by an earlier run of this script, before volumes were labelled.
             return name
     raise RuntimeError(
-        f"Docker 卷 {name} 不属于本项目，未挂载也未修改。请重命名该卷或删除后重试。"
+        f"Docker 卷 {name} 不属于本项目（标签：{label or '无'}），未挂载也未修改。请重命名该卷或删除后重试；"
+        f"如果它来自本项目搬迁前的目录，请把旧路径写入 {FORMER_ROOTS} 后重试。"
     )
 
 
