@@ -307,7 +307,7 @@ def test_default_schema_aliases_follow_the_data_source():
     assert set(NATIVE_DEFAULT_SCHEMAS.values()) <= set(DEFAULT_SCHEMA_ALIASES)
     # Iceberg and Paimon are read through DuckDB, yet ``main`` is not a namespace there:
     # both the Ossie ``public`` and the demo model's ``main`` go to the configured namespace.
-    lake = {"name": "m", "datasets": [{"name": "a", "source": "main.t_lattice_orders"}, {"name": "b", "source": "public.store_sales"}], "metrics": [{"name": "n", "expression": "COUNT(a.order_id) + COUNT(b.ss_ticket_number)"}],
+    lake = {"name": "m", "datasets": [{"name": "a", "source": "main.t_lattice_orders"}, {"name": "b", "source": "public.store_sales"}], "metrics": [{"name": "n", "expression": "COUNT(a.order_id) + COUNT(DISTINCT b.ss_ticket_number)"}],
             "relationships": [{"name": "r", "from": "a", "to": "b", "from_columns": ["order_id"], "to_columns": ["ss_ticket_number"]}]}
     engine = SemanticQueryEngine(queries=Queries({"id": "iceberg-local", "type": "iceberg"}, "demo"), builtin=lambda: lake)
     sql = engine.compile("builtin", {"metrics": ["n"]}, "iceberg-local")["sql"]

@@ -35,6 +35,9 @@ from .llm import LlmError, LlmSettings, SqlGenerator
 from .query import QueryStore
 from .observability import observe
 from .query_cache import QueryCache
+from .semantic_planner import Plan, catalog_text, plan_locally, plan_with_model
+from .semantic_query import SemanticQueryError
+from .sql_audit import AuditReport, audit_sql, duplicate_key_probe_sql, parse_schema_context
 
 LOCAL_SAMPLE = "local-sample"
 #: Tables every local demo engine is seeded with; the built-in rules need them.
@@ -75,6 +78,9 @@ class QueryService:
         self.observers: list[Callable[[dict[str, Any]], Any]] = []
         # Returns business semantics for a data source, appended to the model's schema.
         self.annotator: Callable[[dict[str, Any]], str] | None = None
+        # The semantic query engine: when a model covers the source, its metric definitions
+        # answer the question and the language model only maps words onto them.
+        self.semantic: Any = None
 
     # ----- execution ---------------------------------------------------------------
     def _record(self, source_id: str | None) -> dict[str, Any]:
@@ -119,6 +125,7 @@ class QueryService:
         steps: list[str],
         chart: dict[str, str] | None = None,
         started: float | None = None,
+        extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         columns, rows = result["columns"], result["rows"]
         hint = chart_hint(columns, rows)
@@ -153,6 +160,7 @@ class QueryService:
             "dialect": CONNECTORS[record["type"]].dialect,
             "cached": cached,
             "cache_age_seconds": age if cached else None,
+            **(extra or {}),
         }
         self.store.record(payload)
         for observer in list(self.observers):
@@ -213,14 +221,33 @@ class QueryService:
         label = source_label(record)
         started = time.monotonic()
         yield "step", {"text": f"数据源：{label}；目标方言：{dialect_label}。"}
+        governed = yield from self._answer_from_model(record, question, refresh, label)
+        if governed is True:
+            return
+        context = governed if isinstance(governed, str) else ""
         if self.llm.configured():
             status = self.llm.status()
             yield "step", {"text": f"读取表结构，交给模型 {status['model']} 生成 SQL。"}
             try:
                 schema_text = self._schema_context(record)
+                if context:
+                    schema_text = f"{schema_text}\n\n已定义的业务口径，涉及这些指标时必须按此计算：\n{context}"
                 plan = self.generator.generate(question, dialect_label, label, schema_text)
+                audit = self._audit(record, plan["sql"], dialect)
+                if audit.errors:
+                    yield "step", {"text": "模型生成的 SQL 未通过校验，要求其修正：" + "；".join(audit.errors)[:300]}
+                    feedback = (
+                        f"{question}\n\n你上一次生成的 SQL：\n{plan['sql']}\n存在以下问题，请修正：\n- "
+                        + "\n- ".join(audit.errors)
+                    )
+                    plan = self.generator.generate(feedback, dialect_label, label, schema_text)
+                    audit = self._audit(record, plan["sql"], dialect)
+                    if audit.errors:
+                        raise QueryError(422, "模型生成的 SQL 未通过校验，已拒绝执行：" + "；".join(audit.errors)[:600])
             except LlmError as error:
-                if record["id"] != LOCAL_SAMPLE:
+                # A question the semantic layer already set aside must not fall through to
+                # the keyword rules, which would answer 月度环比 as plain monthly sales.
+                if record["id"] != LOCAL_SAMPLE or context:
                     raise QueryError(502, f"模型生成 SQL 失败：{error}") from error
                 yield "step", {"text": f"模型不可用（{error}），改用本地规则回答示例问题。"}
             except (DataSourceError, ConnectorError) as error:
@@ -231,13 +258,16 @@ class QueryService:
                 yield "sql", {"sql": plan["sql"], "title": plan["title"]}
                 result, repaired = self.run_generated(record, plan["sql"], dialect, dialect_label, refresh)
                 steps = list(plan["steps"])
+                steps.append("这条 SQL 由模型直接生成，未经过语义层：" + ("结果中的指标口径请结合 SQL 确认。" if not context else "已要求其按语义模型的指标定义计算，请结合 SQL 确认。"))
+                yield "step", {"text": steps[-1]}
                 if repaired:
                     steps.append(f"模型返回的 SQL 不能在该引擎直接执行，已按 {dialect_label} 方言转换后重试。")
                     yield "step", {"text": steps[-1]}
                     yield "sql", {"sql": repaired, "title": plan["title"]}
                 steps.append(f"执行只读 SQL，返回 {len(result['rows'])} 行" + ("（已截断）。" if result.get("truncated") else "。"))
                 chart = {"dimension": plan["dimension"], "metric": plan["metric"], "type": plan["chart_type"]}
-                yield "result", self.payload(record, plan["title"], result, "llm", steps, chart, started)
+                extra = {"verification": self._verification_of(audit)}
+                yield "result", self.payload(record, plan["title"], result, "llm", steps, chart, started, extra=extra)
                 return
         try:
             title, proposed = QueryStore.translate(question)
@@ -255,6 +285,99 @@ class QueryService:
             + ("（已截断至 1000 行）。" if result.get("truncated") else "。"),
         ]
         yield "result", self.payload(record, title, result, "rules", steps, started=started)
+
+    # ----- the semantic layer ----------------------------------------------------------
+    def _answer_from_model(
+        self, record: dict[str, Any], question: str, refresh: bool, label: str
+    ) -> Iterator[tuple[str, Any]]:
+        """Answer from a semantic model when one covers the source.
+
+        Returns True when answered, a catalog text when the question needs a computation
+        the semantic layer lacks (free SQL is then told the definitions), and None when
+        no model covers the source. A concept the model does not define is refused: it
+        must not reach free SQL, where a language model would make up a definition.
+        """
+        if self.semantic is None:
+            return None
+        models = self.semantic.models_for(record)
+        if not models:
+            return None
+        attempts: list[tuple[Any, dict[str, list[str]], Plan]] = []
+        for model in models:
+            values = self.semantic.dimension_values(model, record)
+            plan = plan_locally(question, model, values)
+            if plan.status == "ok":
+                yield from self._run_plan(record, model, plan, question, refresh)
+                return True
+            attempts.append((model, values, plan))
+        # Words that need interpreting go to the model most of the question matched.
+        # With no word matched anywhere, the richest model is the one most likely to define it.
+        model, values, local = max(attempts, key=lambda item: (item[2].score, len(item[0].metrics)))
+        supported = "、".join(sorted((metric.description.split("：")[0] or metric.name) for metric in model.metrics.values()))
+        if not self.llm.configured():
+            raise QueryError(
+                422,
+                f"无法按已定义的口径回答：{local.reason}语义模型 {model.name} 现有指标：{supported}。"
+                "请换用这些指标提问，或配置模型后再试。其他分析请使用 SQL 工作台。",
+            )
+        yield "step", {"text": f"问题需要进一步解读（{local.reason}），由模型 {self.llm.status()['model']} 映射到语义模型 {model.name}。"}
+        try:
+            plan = plan_with_model(self.generator, question, model, values)
+        except LlmError as error:
+            raise QueryError(
+                502,
+                f"模型不可用（{error}），而规则无法解读这个问题：{local.reason}语义模型 {model.name} 现有指标：{supported}。",
+            ) from error
+        if plan.status == "ok":
+            yield from self._run_plan(record, model, plan, question, refresh)
+            return True
+        if plan.status == "unmapped":
+            raise QueryError(422, f"无法按已定义的口径回答：{plan.reason} 语义模型 {model.name} 现有指标：{supported}。没有猜测口径，请先在语义模型中定义它。")
+        yield "step", {"text": f"这个问题需要语义层之外的计算（{plan.reason}），将生成 SQL 并按语义模型的指标定义校验。"}
+        return catalog_text(model, values) + "\n" + "\n".join(
+            f"- {item['name']} = {item['expression']}" for item in self.semantic.definitions(model, list(model.metrics))
+        ) + "\n关系（多的一侧 → 一的一侧）：\n" + "\n".join(
+            f"- {r.from_dataset}({', '.join(r.from_columns)}) → {r.to_dataset}({', '.join(r.to_columns)})" for r in model.relationships
+        )
+
+    def _run_plan(self, record: dict[str, Any], model: Any, plan: Plan, question: str, refresh: bool) -> Iterator[tuple[str, Any]]:
+        for step in plan.steps:
+            yield "step", {"text": step}
+        try:
+            compiled = self.semantic.compile(model.id, plan.request, record["id"])
+            yield "sql", {"sql": compiled["sql"], "title": plan.title}
+            yield "result", self.semantic.query(
+                model.id, plan.request, datasource_id=record["id"], refresh=refresh,
+                title=plan.title, steps=plan.steps, planner=plan.planner, question=question,
+            )
+        except SemanticQueryError as error:
+            raise QueryError(error.status_code, str(error)) from error
+
+    def _known_tables(self, record: dict[str, Any]) -> dict[str, set[str]] | None:
+        try:
+            if record["id"] == LOCAL_SAMPLE:
+                return {table["name"].lower(): {column["name"].lower() for column in table["columns"]} for table in self.store.metadata()}
+            known = parse_schema_context(self.registry.schema_context(record["id"]))
+        except (DataSourceError, ConnectorError):
+            return None
+        # The listing stops at 40 tables, so absence from a full list proves nothing.
+        return known if known and len(known) < 40 else None
+
+    def _audit(self, record: dict[str, Any], sql: str, dialect: str) -> AuditReport:
+        def probe(schema: str | None, table: str, columns: list[str]) -> bool | None:
+            try:
+                statement = duplicate_key_probe_sql(schema, table, columns, dialect)
+                return not self.execute(record, statement, 1)["rows"]
+            except QueryError:
+                return None
+
+        return audit_sql(sql, dialect, self._known_tables(record), probe)
+
+    @staticmethod
+    def _verification_of(audit: AuditReport) -> dict[str, Any]:
+        checks = [{"name": "SQL 静态与关联键校验", "status": "passed", "detail": text} for text in audit.passed]
+        checks += [{"name": "未能完成的校验", "status": "skipped", "detail": text} for text in audit.warnings]
+        return {"governed": False, "status": "skipped" if audit.warnings else "passed", "checks": checks}
 
     def run_generated(
         self, record: dict[str, Any], sql: str, dialect: str, dialect_label: str, refresh: bool = False

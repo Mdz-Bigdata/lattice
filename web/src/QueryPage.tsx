@@ -16,6 +16,8 @@ import {
   RefreshCw,
   Send,
   Settings2,
+  ShieldAlert,
+  ShieldCheck,
   Sparkles,
   Table2,
   TrendingUp,
@@ -59,6 +61,7 @@ function providerLabel(provider?: string) {
   if (provider === "sql") return "用户 SQL";
   if (provider === "rules") return "本地规则";
   if (provider === "llm") return "模型生成";
+  if (provider === "semantic") return "语义层";
   return provider ? "未知生成方式" : "待查询";
 }
 function linkPort(link: string) {
@@ -156,6 +159,7 @@ export function QueryReport({
           </div>
         </div>
       )}
+      <TrustPanel result={result} />
       <button
         className="sql-toggle"
         onClick={() => setSqlOpen(!sqlOpen)}
@@ -179,6 +183,108 @@ export function QueryReport({
         {new Date(result.created_at).toLocaleString("zh-CN")}
       </div>
     </section>
+  );
+}
+/** Says what the numbers mean and how far they can be trusted. */
+function TrustPanel({ result }: { result: QueryResult }) {
+  const verification = result.verification;
+  const semantic = result.semantic;
+  const [open, setOpen] = useState(false);
+  if (!verification) return null;
+  const warnings = semantic?.warnings ?? [];
+  const incomplete = verification.status !== "passed";
+  const trusted = verification.governed && !incomplete;
+  const summary = verification.governed
+    ? incomplete
+      ? "按语义模型口径计算，部分校验未完成"
+      : "按语义模型口径计算，校验通过"
+    : "模型直接生成的 SQL，未经语义层，请核对口径";
+  return (
+    <div className={`trust-panel${trusted ? " trusted" : " caution"}`}>
+      <button
+        className="trust-summary"
+        onClick={() => setOpen(!open)}
+        aria-expanded={open}
+      >
+        {trusted ? <ShieldCheck size={14} /> : <ShieldAlert size={14} />}
+        <span>{summary}</span>
+        {warnings.length > 0 && (
+          <span className="trust-count">{warnings.length} 条提示</span>
+        )}
+        <ChevronDown size={13} className={open ? "rotate" : ""} />
+      </button>
+      {open && (
+        <div className="trust-detail">
+          {semantic?.definitions && semantic.definitions.length > 0 && (
+            <section>
+              <h4>指标口径（语义模型 {semantic.model}）</h4>
+              <ul>
+                {semantic.definitions.map((item) => (
+                  <li key={item.name}>
+                    <strong>{item.description || item.name}</strong>
+                    <code>{item.expression}</code>
+                    {item.time_field && (
+                      <small>统计日期：{item.time_field}</small>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+          {semantic && semantic.joins.length > 0 && (
+            <section>
+              <h4>表关联</h4>
+              <ul>
+                {semantic.joins.map((join) => (
+                  <li key={join}>
+                    <code>{join}</code>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+          {semantic?.filters && semantic.filters.length > 0 && (
+            <section>
+              <h4>筛选条件</h4>
+              <ul>
+                {semantic.filters.map((item) => (
+                  <li key={`${item.field}-${item.op}`}>
+                    <code>
+                      {item.field} {item.op} {JSON.stringify(item.value)}
+                    </code>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+          {warnings.length > 0 && (
+            <section>
+              <h4>阅读提示</h4>
+              <ul>
+                {warnings.map((text) => (
+                  <li key={text}>{text}</li>
+                ))}
+              </ul>
+            </section>
+          )}
+          {verification.checks.length > 0 && (
+            <section>
+              <h4>校验记录</h4>
+              <ul>
+                {verification.checks.map((check) => (
+                  <li key={check.name + check.detail}>
+                    <span className={`trust-check ${check.status}`}>
+                      {check.status === "passed" ? "通过" : "未完成"}
+                    </span>
+                    {check.name}：{check.detail}
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+        </div>
+      )}
+    </div>
   );
 }
 function DatabaseMark() {

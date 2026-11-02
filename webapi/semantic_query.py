@@ -25,6 +25,25 @@ hands back a result the existing report component can draw.
 Metrics are never defined anywhere else: the registry is read from the models
 themselves (the built-in demo model, the Lattice model store and the native
 Polaris interface), so the semantic model stays the single source of truth.
+
+Joining is where a correct definition turns into a wrong number, so the compiler
+reasons about it instead of emitting every join it can find. An Ossie relationship
+points from the many side to the one side, which gives each join a direction:
+
+* Following it never repeats a row. Against it repeats a row once per match (a
+  fan-out), and SUM, AVG and plain COUNT then count those rows again. Only
+  COUNT(DISTINCT), MIN and MAX survive that, so those metrics may cross such a join
+  (with a warning, since a record can then fall into several groups) and the others
+  are refused rather than answered with an inflated number.
+* Metrics measured on different datasets (sales on order items, payments on
+  payments) are aggregated separately and combined afterwards, so asking for two
+  together gives each the same value it has when asked alone.
+* Two equally short routes between datasets are two possible meanings, so they are
+  refused until the request names the relationships to use.
+
+``SemanticQueryEngine.query`` then checks the outcome: the groups of an additive
+metric have to add up to its total, which also catches a key the model declares
+unique but whose data is not.
 """
 
 from __future__ import annotations
@@ -42,6 +61,7 @@ from sqlglot import exp
 
 from .connectors import CONNECTORS, DIALECT_LABELS
 from .observability import observe
+from .sql_audit import parse_schema_context
 
 LOCAL_SAMPLE = "local-sample"
 #: Which Ossie dialect expression to prefer for a sqlglot dialect, in order.
@@ -60,6 +80,9 @@ MAX_DIMENSIONS = 10
 MAX_FILTERS = 20
 MAX_JOINS = 8
 CACHE_SECONDS = 60
+#: Text dimensions read into the value dictionary, and how many values one may have.
+MAX_VALUE_COLUMNS = 40
+MAX_DIMENSION_VALUES = 200
 SEMANTIC_STORE_CATALOG = "lattice"
 SEMANTIC_STORE_NAMESPACE = ["demo"]
 #: Schema names that models use to mean "the engine's default": DuckDB's ``main``, the
@@ -120,6 +143,8 @@ class Metric:
     datatype: str = ""
     description: str = ""
     synonyms: list[str] = field(default_factory=list)
+    #: The date a question about this metric means by "per month" (``dataset.field``).
+    time_field: str = ""
 
 
 @dataclass
@@ -162,6 +187,11 @@ def _synonyms(node: Any) -> list[str]:
     if isinstance(context, dict) and isinstance(context.get("synonyms"), list):
         return [str(item) for item in context["synonyms"] if item][:20]
     return []
+
+
+def _time_field(node: Any) -> str:
+    context = node.get("ai_context") if isinstance(node, dict) else None
+    return str(context.get("time_field") or "") if isinstance(context, dict) else ""
 
 
 def extract_document(loaded: Any) -> dict[str, Any] | None:
@@ -248,7 +278,7 @@ def parse_model(document: dict[str, Any], *, model_id: str = "", storage: str = 
         expressions = _expressions(raw.get("expression"))
         if not expressions:
             continue
-        metrics[str(raw["name"])] = Metric(str(raw["name"]), expressions, str(raw.get("datatype") or ""), str(raw.get("description") or ""), _synonyms(raw))
+        metrics[str(raw["name"])] = Metric(str(raw["name"]), expressions, str(raw.get("datatype") or ""), str(raw.get("description") or ""), _synonyms(raw), _time_field(raw))
     name = str(document["name"])
     return Model(id=model_id or name, name=name, storage=storage or "document", description=str(document.get("description") or ""), datasets=datasets, relationships=relationships, metrics=metrics)
 
@@ -269,9 +299,53 @@ class Compiled:
     joins: list[str]
     columns: list[dict[str, Any]]
     chart: dict[str, str]
+    #: What the reader must know to read the numbers correctly.
+    warnings: list[str] = field(default_factory=list)
+    #: Result aliases of the metrics whose groups must add up to their total.
+    additive: list[str] = field(default_factory=list)
+    #: Metrics aggregated apart from each other because they measure different datasets.
+    branches: list[dict[str, Any]] = field(default_factory=list)
 
     def view(self) -> dict[str, Any]:
-        return {"sql": self.sql, "dialect": self.dialect, "dialect_label": DIALECT_LABELS.get(self.dialect, self.dialect), "datasets": self.datasets, "joins": self.joins, "columns": self.columns, "chart": self.chart}
+        return {"sql": self.sql, "dialect": self.dialect, "dialect_label": DIALECT_LABELS.get(self.dialect, self.dialect), "datasets": self.datasets, "joins": self.joins, "columns": self.columns, "chart": self.chart, "warnings": self.warnings, "branches": self.branches}
+
+
+@dataclass
+class MetricShape:
+    """How a metric aggregates, which decides the joins it can safely cross."""
+
+    name: str
+    #: Dataset the metric's rows are counted on; its branch starts here.
+    home: str
+    #: Datasets whose rows must not repeat: the grains of SUM, AVG and plain COUNT.
+    grains: list[str]
+    additive: bool
+
+
+@dataclass
+class JoinStep:
+    relationship: Relationship
+    parent: str
+    child: str
+    fans_out: bool
+
+
+def _is_repeat_safe(aggregate: exp.Expression) -> bool:
+    """Whether an aggregate returns the same value when its input rows repeat."""
+    if isinstance(aggregate, (exp.Min, exp.Max, exp.ApproxDistinct)):
+        return True
+    return isinstance(aggregate, exp.Count) and isinstance(aggregate.this, exp.Distinct)
+
+
+def _null_type(metric: Metric) -> str:
+    """The type a metric has in every branch when metrics are combined across datasets."""
+    if metric.datatype == "Integer":
+        return "BIGINT"
+    if metric.datatype == "Float":
+        return "DOUBLE"
+    if metric.datatype == "String":
+        return "VARCHAR"
+    return "DECIMAL(38, 6)"
 
 
 def _literal(value: Any) -> exp.Expression:
@@ -296,6 +370,8 @@ class Compiler:
         #: Model schemas that mean "the engine's default" on this data source (DuckDB's ``main``).
         self.schema_map = {key.lower(): value for key, value in (schema_map or {}).items()}
         self.used: list[str] = []
+        #: Relationship names a request narrowed the joins to; None means all of them.
+        self.allowed: set[str] | None = None
 
     # ----- references -------------------------------------------------------------------
     def _alias(self, dataset: str) -> exp.Identifier:
@@ -409,43 +485,252 @@ class Compiler:
         table = exp.Table(this=exp.to_identifier(table_name, quoted=True), db=exp.to_identifier(schema, quoted=True) if schema else None)
         return exp.alias_(table, self._alias(dataset.name), table=True)
 
-    def _joins(self, root: str) -> list[tuple[Relationship, str, str]]:
-        """Relationships that connect every used dataset to the root, breadth first."""
-        needed = [name for name in self.used if name != root]
-        if not needed:
-            return []
-        edges: dict[str, list[tuple[Relationship, str]]] = {}
+    # ----- how datasets connect -------------------------------------------------------------
+    def _one_to_one(self, relationship: Relationship) -> bool:
+        """The many side's foreign key is its own primary key, so neither side repeats."""
+        key = self.model.datasets[relationship.from_dataset].primary_key
+        return bool(key) and set(key) == set(relationship.from_columns)
+
+    def _steps_from(self, dataset: str) -> list[JoinStep]:
+        """Every join leaving a dataset; ``fans_out`` when it runs against the relationship."""
+        steps = []
         for relationship in self.model.relationships:
-            edges.setdefault(relationship.from_dataset, []).append((relationship, relationship.to_dataset))
-            edges.setdefault(relationship.to_dataset, []).append((relationship, relationship.from_dataset))
-        reached = {root}
-        order: list[tuple[Relationship, str, str]] = []
-        frontier = [root]
-        while frontier and not set(needed) <= reached:
-            current = frontier.pop(0)
-            for relationship, other in edges.get(current, []):
-                if other in reached:
-                    continue
-                reached.add(other)
-                order.append((relationship, current, other))
-                frontier.append(other)
-        missing = [name for name in needed if name not in reached]
+            if self.allowed is not None and relationship.name not in self.allowed:
+                continue
+            if relationship.from_dataset == dataset:
+                steps.append(JoinStep(relationship, dataset, relationship.to_dataset, False))
+            elif relationship.to_dataset == dataset:
+                steps.append(JoinStep(relationship, dataset, relationship.from_dataset, not self._one_to_one(relationship)))
+        return steps
+
+    def _shortest_routes(self, root: str, target: str, *, repeat_free: bool) -> list[list[JoinStep]]:
+        """All the shortest routes between two datasets; more than one means an ambiguity."""
+        layer: list[list[JoinStep]] = [[]]
+        for _ in range(MAX_JOINS):
+            found: list[list[JoinStep]] = []
+            following: list[list[JoinStep]] = []
+            for route in layer:
+                visited = {root, *(step.child for step in route)}
+                for step in self._steps_from(route[-1].child if route else root):
+                    if step.child in visited or (repeat_free and step.fans_out):
+                        continue
+                    (found if step.child == target else following).append([*route, step])
+            if found:
+                return found
+            if not following:
+                return []
+            layer = following
+        return []
+
+    def _reaches_without_repeat(self, dataset: str, others: set[str]) -> bool:
+        return all(other == dataset or self._shortest_routes(dataset, other, repeat_free=True) for other in others)
+
+    def _grain_of(self, datasets: set[str]) -> str:
+        """The dataset whose rows an expression over these datasets is computed on."""
+        return next((name for name in self.model.datasets if name in datasets and self._reaches_without_repeat(name, datasets)), "")
+
+    def _shape(self, metric: Metric, expression: exp.Expression) -> MetricShape:
+        datasets = {column.table for column in expression.find_all(exp.Column) if column.table}
+        grains: list[str] = []
+        repeat_sensitive = False
+        for aggregate in expression.find_all(exp.AggFunc):
+            if _is_repeat_safe(aggregate):
+                continue
+            repeat_sensitive = True
+            inputs = {column.table for column in aggregate.find_all(exp.Column) if column.table}
+            if not inputs:
+                continue  # COUNT(*): counts the rows of the metric's own dataset, resolved below.
+            grain = self._grain_of(inputs)
+            if not grain:
+                raise _bad(f"指标 {metric.name} 的聚合跨越了 {'、'.join(sorted(inputs))}，它们之间没有多对一关系，无法确定按哪张表的行计算。")
+            if grain not in grains:
+                grains.append(grain)
+        home = grains[0] if grains else (self._grain_of(datasets) or next(iter(sorted(datasets)), ""))
+        if not home:
+            if len(self.model.datasets) > 1:
+                raise _bad(f"指标 {metric.name} 没有引用任何字段，无法确定统计的是哪张表的行；请写明数据集，例如 COUNT(数据集.主键)。")
+            home = next(iter(self.model.datasets))
+        if repeat_sensitive and not grains:
+            grains = [home]
+        root = expression.unalias() if isinstance(expression, exp.Alias) else expression
+        additive = isinstance(root, exp.Sum) or (isinstance(root, exp.Count) and not _is_repeat_safe(root))
+        return MetricShape(metric.name, home, grains, additive)
+
+    def _join_tree(self, root: str, needed: list[str]) -> list[JoinStep]:
+        """The joins connecting every dataset in use to the root.
+
+        A route that never repeats a row wins over a shorter one that does; among
+        equals there is no telling which one the question meant, so it is refused.
+        """
+        tree: dict[str, JoinStep] = {}
+        missing = []
+        for target in needed:
+            if target == root or target in tree:
+                continue
+            routes = self._shortest_routes(root, target, repeat_free=True) or self._shortest_routes(root, target, repeat_free=False)
+            if not routes:
+                missing.append(target)
+                continue
+            if len(routes) > 1:
+                described = "；".join(" → ".join(step.relationship.name for step in route) for route in routes)
+                raise _bad(f"从 {root} 到 {target} 有多条关联路径（{described}），口径不确定。请在请求的 relationships 中指定要使用的关系。")
+            for step in routes[0]:
+                existing = tree.get(step.child)
+                if existing and existing.relationship.name != step.relationship.name:
+                    raise _bad(f"{step.child} 同时经由 {existing.relationship.name} 和 {step.relationship.name} 关联，口径不确定。请在请求的 relationships 中指定要使用的关系。")
+                tree[step.child] = step
         if missing:
             raise _bad(f"数据集 {root} 与 {'、'.join(missing)} 之间没有定义关系（relationships），无法关联查询。")
-        # Only joins on the paths to the datasets in use are emitted.
-        keep: set[str] = set(needed)
-        parents = {other: current for _, current, other in order}
-        for name in needed:
-            cursor = name
-            while cursor in parents:
-                keep.add(cursor)
-                cursor = parents[cursor]
-        result = [(relationship, current, other) for relationship, current, other in order if other in keep]
-        if len(result) > MAX_JOINS:
+        if len(tree) > MAX_JOINS:
             raise _bad(f"一次查询最多关联 {MAX_JOINS} 个数据集。")
-        return result
+        return list(tree.values())
 
-    def compile(self, request: dict[str, Any]) -> Compiled:
+    @staticmethod
+    def _fan_out_seen_from(dataset: str, tree: list[JoinStep], *, one_to_one: Callable[[Relationship], bool]) -> JoinStep | None:
+        """The join that repeats this dataset's rows anywhere in the tree, if any."""
+        reached = {dataset}
+        remaining = list(tree)
+        progress = True
+        while remaining and progress:
+            progress = False
+            for step in list(remaining):
+                ends = {step.parent, step.child}
+                near = ends & reached
+                if not near:
+                    continue
+                remaining.remove(step)
+                progress = True
+                current = next(iter(near))
+                reached |= ends
+                if len(near) == 2:
+                    continue
+                relationship = step.relationship
+                if current == relationship.to_dataset and not one_to_one(relationship):
+                    return step
+        return None
+
+    # ----- the statement ------------------------------------------------------------------
+    def _branch(
+        self,
+        metric_names: list[str],
+        root: str,
+        dimensions: list[dict[str, Any]],
+        filters: list[dict[str, Any]],
+        shapes: dict[str, MetricShape],
+    ) -> dict[str, Any]:
+        """One aggregation: the metrics of one dataset over the shared dimensions and filters."""
+        self.used = [root]
+        expressions = {name: self._metric_expression(self.model.metrics[name]) for name in metric_names}
+        grouped: list[dict[str, Any]] = []
+        for item in dimensions:
+            dataset, column = self._find_field(item.get("field"))
+            expression = self._field_expression(dataset, column)
+            grain = str(item.get("grain") or "").lower()
+            if grain:
+                if grain not in GRAINS:
+                    raise _bad("时间粒度只能是 day、week、month、quarter 或 year。")
+                if not column.is_time:
+                    raise _bad(f"字段 {dataset.name}.{column.name} 不是时间维度，不能按 {GRAIN_LABELS[grain]}聚合。")
+                expression = self._truncate(expression, grain)
+            grouped.append({"dataset": dataset, "column": column, "grain": grain, "expression": expression, "alias": str(item.get("alias") or "")})
+        where: list[exp.Expression] = []
+        having: list[exp.Expression] = []
+        for item in filters:
+            target = str(item.get("field") or "")
+            operator = str(item.get("op") or "=").lower()
+            if operator not in OPERATORS:
+                raise _bad("筛选条件的比较方式只能是 " + "、".join(OPERATORS) + "。")
+            if target in self.model.metrics:
+                having.append(self._condition(self._metric_expression(self.model.metrics[target]), operator, item.get("value")))
+            else:
+                dataset, column = self._find_field(target)
+                where.append(self._condition(self._field_expression(dataset, column), operator, item.get("value")))
+        tree = self._join_tree(root, [name for name in self.used if name != root])
+        for name in metric_names:
+            for grain in shapes[name].grains:
+                culprit = self._fan_out_seen_from(grain, tree, one_to_one=self._one_to_one)
+                if culprit is not None:
+                    relationship = culprit.relationship
+                    raise _bad(
+                        f"无法按当前维度或筛选计算指标 {name}：{relationship.to_dataset} 与 {relationship.from_dataset} 是一对多关系（{relationship.name}），"
+                        f"关联后 {grain} 的一行会对应多行，{name} 会被重复累计而偏大，已拒绝执行。请改用这个指标自身所在数据集可以多对一到达的维度。"
+                    )
+        warnings = []
+        fan_targets = {step.child for step in tree if step.fans_out}
+        for step in tree:
+            if step.parent in fan_targets:
+                fan_targets.add(step.child)
+        for item in grouped:
+            if item["dataset"].name in fan_targets:
+                for name in metric_names:
+                    warnings.append(f"指标 {name} 按 {item['dataset'].name}.{item['column'].name} 分组时，同一条记录可能同时归入多个分组（去重计数不重复累计），各分组之和可能大于总数。")
+        return {"root": root, "metrics": expressions, "grouped": grouped, "where": where, "having": having, "tree": tree, "warnings": warnings}
+
+    def _ordered(self, alias: str, desc: bool) -> exp.Ordered:
+        """Order by a result column, leaving NULLs where this engine puts them by itself.
+
+        Without an explicit choice sqlglot emulates a fixed NULL position with
+        ``CASE WHEN x IS NULL``, and MySQL's ONLY_FULL_GROUP_BY rejects that for a column
+        that is only grouped through an expression.
+        """
+        ordering = sqlglot.Dialect.get_or_raise(self.dialect).NULL_ORDERING
+        if ordering == "nulls_are_small":
+            nulls_first = not desc
+        elif ordering == "nulls_are_large":
+            nulls_first = desc
+        else:
+            nulls_first = False
+        return exp.Ordered(this=exp.to_identifier(alias, quoted=True), desc=desc, nulls_first=nulls_first)
+
+    def _truncate(self, expression: exp.Expression, grain: str) -> exp.Expression:
+        """The start of the period.
+
+        Hive has no DATE_TRUNC, and its TRUNC is not an option: inside GROUP BY, Hive 4.0.1
+        returns 1970-01-01 for every row of a DATE column, with no error. DATE_FORMAT groups
+        correctly, so Hive's periods are built from it and come back as ``YYYY-MM-DD`` text.
+        """
+        if self.dialect != "hive":
+            return exp.DateTrunc(unit=exp.Literal.string(grain), this=expression)
+
+        def call(name: str, *arguments: exp.Expression) -> exp.Expression:
+            return exp.Anonymous(this=name, expressions=list(arguments))
+
+        if grain == "quarter":
+            first_month = sqlglot.parse_one("(QUARTER(x) - 1) * 3 + 1", read="hive").transform(lambda node: expression.copy() if isinstance(node, exp.Column) else node)
+            text = exp.cast(first_month, "STRING")
+            return call("CONCAT", call("YEAR", expression.copy()), exp.Literal.string("-"), call("LPAD", text, exp.Literal.number(2), exp.Literal.string("0")), exp.Literal.string("-01"))
+        if grain == "week":
+            monday = call("DATE_SUB", call("NEXT_DAY", expression, exp.Literal.string("MO")), exp.Literal.number(7))
+            return call("DATE_FORMAT", monday, exp.Literal.string("yyyy-MM-dd"))
+        pattern = {"day": "yyyy-MM-dd", "month": "yyyy-MM-01", "year": "yyyy-01-01"}[grain]
+        return call("DATE_FORMAT", expression, exp.Literal.string(pattern))
+
+    def distinct_values_sql(self, dataset: Dataset, item: Field, limit: int) -> str:
+        expression = self._field_expression(dataset, item)
+        select = exp.Select(expressions=[exp.alias_(expression, exp.to_identifier("value", quoted=True))]).from_(self._table(dataset))
+        return select.group_by(expression.copy()).limit(limit).sql(dialect=self.dialect)
+
+    def _from(self, branch: dict[str, Any]) -> exp.Select:
+        select = exp.Select().from_(self._table(self.model.datasets[branch["root"]]))
+        for step in branch["tree"]:
+            relationship = step.relationship
+            if relationship.from_dataset == step.parent:
+                near_columns, far_columns = relationship.from_columns, relationship.to_columns
+            else:
+                near_columns, far_columns = relationship.to_columns, relationship.from_columns
+            condition = exp.and_(*[
+                exp.EQ(this=exp.Column(this=exp.to_identifier(a, quoted=True), table=self._alias(step.parent)), expression=exp.Column(this=exp.to_identifier(b, quoted=True), table=self._alias(step.child)))
+                for a, b in zip(near_columns, far_columns)
+            ])
+            # Following a relationship keeps fact rows whose dimension is missing, so the
+            # groups still add up to the total. A fan-out keeps only rows that have a match:
+            # a customer without orders is not a customer of any product category.
+            select = select.join(self._table(self.model.datasets[step.child]), on=condition, join_type="INNER" if step.fans_out else "LEFT")
+        if branch["where"]:
+            select = select.where(exp.and_(*branch["where"]))
+        return select
+
+    def compile(self, request: dict[str, Any], *, ordered: bool = True) -> Compiled:
         metric_names = [str(name) for name in request.get("metrics") or []]
         if not metric_names:
             raise _bad("请至少选择一个指标。")
@@ -457,109 +742,165 @@ class Compiler:
         filters = [dict(item) for item in request.get("filters") or [] if isinstance(item, dict)]
         if len(filters) > MAX_FILTERS:
             raise _bad(f"一次最多 {MAX_FILTERS} 个筛选条件。")
+        chosen = request.get("relationships")
+        self.allowed = {str(name) for name in chosen} if chosen else None
 
-        selects: list[exp.Expression] = []
+        for name in metric_names:
+            if name not in self.model.metrics:
+                raise _bad(f"语义模型中没有指标 {name}。")
+        metric_filters = [item for item in filters if str(item.get("field") or "") in self.model.metrics]
+        dimension_filters = [item for item in filters if item not in metric_filters]
+        hidden = [str(item["field"]) for item in metric_filters if str(item["field"]) not in metric_names]
+        shapes: dict[str, MetricShape] = {}
+        for name in [*metric_names, *hidden]:
+            metric = self.model.metrics[name]
+            self.used = []
+            shapes[name] = self._shape(metric, self._metric_expression(metric))
+        homes: list[str] = []
+        for name in [*metric_names, *hidden]:
+            if shapes[name].home not in homes:
+                homes.append(shapes[name].home)
+        if len(homes) == 1:
+            plan = [self._branch(metric_names, homes[0], dimensions, filters, shapes)]
+        else:
+            plan = [self._branch([name for name in [*metric_names, *hidden] if shapes[name].home == home], home, dimensions, dimension_filters, shapes) for home in homes]
+
+        # Result columns: dimensions first, then the metrics asked for.
         columns: list[dict[str, Any]] = []
-        group_by: list[exp.Expression] = []
-        aliases: dict[str, exp.Expression] = {}
         seen_aliases: set[str] = set()
         time_alias = ""
-        # Metrics are resolved first so the dataset they measure becomes the root of
-        # the joins; dimensions and filters then hang off it with LEFT JOINs.
-        metric_expressions: dict[str, exp.Expression] = {}
-        for name in metric_names:
-            metric = self.model.metrics.get(name)
-            if metric is None:
-                raise _bad(f"语义模型中没有指标 {name}。")
-            metric_expressions[name] = self._metric_expression(metric)
-        for item in dimensions:
-            dataset, column = self._find_field(item.get("field"))
-            expression = self._field_expression(dataset, column)
-            grain = str(item.get("grain") or "").lower()
-            if grain:
-                if grain not in GRAINS:
-                    raise _bad("时间粒度只能是 day、week、month、quarter 或 year。")
-                if not column.is_time:
-                    raise _bad(f"字段 {dataset.name}.{column.name} 不是时间维度，不能按 {GRAIN_LABELS[grain]}聚合。")
-                expression = exp.DateTrunc(unit=exp.Literal.string(grain), this=expression)
-            alias = str(item.get("alias") or column.name)
+        dimension_aliases: list[str] = []
+        for item in plan[0]["grouped"]:
+            dataset, column = item["dataset"], item["column"]
+            alias = item["alias"] or column.name
             if alias in seen_aliases:
                 alias = f"{dataset.name}_{column.name}"
             seen_aliases.add(alias)
-            aliases[alias] = expression
-            group_by.append(expression.copy())
-            selects.append(exp.alias_(expression, exp.to_identifier(alias, quoted=True)))
-            columns.append({"name": alias, "kind": "dimension", "field": f"{dataset.name}.{column.name}", "grain": grain or None, "datatype": column.datatype})
+            dimension_aliases.append(alias)
+            columns.append({"name": alias, "kind": "dimension", "field": f"{dataset.name}.{column.name}", "grain": item["grain"] or None, "datatype": column.datatype})
             if column.is_time and not time_alias:
                 time_alias = alias
+        metric_aliases: dict[str, str] = {}
         for name in metric_names:
-            metric = self.model.metrics[name]
-            expression = metric_expressions[name]
             alias = name if name not in seen_aliases else f"metric_{name}"
             seen_aliases.add(alias)
-            aliases[alias] = expression
-            selects.append(exp.alias_(expression, exp.to_identifier(alias, quoted=True)))
-            columns.append({"name": alias, "kind": "metric", "metric": name, "datatype": metric.datatype})
+            metric_aliases[name] = alias
+            columns.append({"name": alias, "kind": "metric", "metric": name, "datatype": self.model.metrics[name].datatype})
 
-        where: list[exp.Expression] = []
-        having: list[exp.Expression] = []
-        for item in filters:
-            target = str(item.get("field") or "")
-            operator = str(item.get("op") or "=").lower()
-            if operator not in OPERATORS:
-                raise _bad("筛选条件的比较方式只能是 " + "、".join(OPERATORS) + "。")
-            if target in self.model.metrics:
-                expression = self._metric_expression(self.model.metrics[target])
-                bucket = having
-            else:
-                dataset, column = self._find_field(target)
-                expression = self._field_expression(dataset, column)
-                bucket = where
-            bucket.append(self._condition(expression, operator, item.get("value")))
+        if len(plan) == 1:
+            branch = plan[0]
+            select = self._from(branch)
+            for item, alias in zip(branch["grouped"], dimension_aliases):
+                select = select.select(exp.alias_(item["expression"], exp.to_identifier(alias, quoted=True)), append=True)
+            for name in metric_names:
+                select = select.select(exp.alias_(branch["metrics"][name], exp.to_identifier(metric_aliases[name], quoted=True)), append=True)
+            if branch["grouped"]:
+                select = select.group_by(*[item["expression"].copy() for item in branch["grouped"]])
+            if branch["having"]:
+                select = select.having(exp.and_(*branch["having"]))
+        else:
+            select = self._across(plan, metric_names, hidden, dimension_aliases, metric_aliases, metric_filters)
 
-        root = self.used[0] if self.used else next(iter(self.model.datasets))
-        joins = self._joins(root)
-        select = exp.Select(expressions=selects).from_(self._table(self.model.datasets[root]))
-        join_names = []
-        for relationship, current, other in joins:
-            if relationship.from_dataset == current:
-                left, right = current, other
-                left_columns, right_columns = relationship.from_columns, relationship.to_columns
-            else:
-                left, right = current, other
-                left_columns, right_columns = relationship.to_columns, relationship.from_columns
-            condition = exp.and_(*[
-                exp.EQ(this=exp.Column(this=exp.to_identifier(a, quoted=True), table=self._alias(left)), expression=exp.Column(this=exp.to_identifier(b, quoted=True), table=self._alias(right)))
-                for a, b in zip(left_columns, right_columns)
-            ])
-            select = select.join(self._table(self.model.datasets[other]), on=condition, join_type="LEFT")
-            join_names.append(f"{relationship.name}: {current} → {other}")
-        if where:
-            select = select.where(exp.and_(*where))
-        if group_by:
-            select = select.group_by(*group_by)
-        if having:
-            select = select.having(exp.and_(*having))
+        aliases = {*dimension_aliases, *metric_aliases.values()}
         orders = [dict(item) if isinstance(item, dict) else {"field": str(item)} for item in request.get("order_by") or []]
-        if orders:
-            for item in orders:
-                alias = str(item.get("field") or "")
-                if alias not in aliases:
-                    raise _bad(f"排序字段 {alias} 不在查询结果中。")
-                select = select.order_by(exp.Ordered(this=exp.to_identifier(alias, quoted=True), desc=bool(item.get("desc"))))
-        elif time_alias:
-            select = select.order_by(exp.Ordered(this=exp.to_identifier(time_alias, quoted=True), desc=False))
-        elif group_by:
-            select = select.order_by(exp.Ordered(this=exp.to_identifier(metric_names[0], quoted=True), desc=True))
-        limit = request.get("limit")
-        if limit:
-            select = select.limit(int(limit))
+        for item in orders:
+            if str(item.get("field") or "") not in aliases:
+                raise _bad(f"排序字段 {item.get('field') or ''} 不在查询结果中。")
+        if ordered:
+            first_metric = metric_aliases[metric_names[0]]
+            if orders:
+                for item in orders:
+                    select = select.order_by(self._ordered(str(item["field"]), bool(item.get("desc"))))
+            elif time_alias:
+                select = select.order_by(self._ordered(time_alias, False))
+            elif dimensions:
+                select = select.order_by(self._ordered(first_metric, True))
+            # Equal values have no order of their own, and LIMIT would then pick among them
+            # differently from one run to the next. The dimensions settle it.
+            placed = {str(item["field"]) for item in orders} | ({time_alias} if not orders and time_alias else set())
+            for alias in dimension_aliases:
+                if alias not in placed:
+                    select = select.order_by(self._ordered(alias, False))
+            limit = request.get("limit")
+            if limit:
+                select = select.limit(int(limit))
         try:
             sql = select.sql(dialect=self.dialect, pretty=True)
         except sqlglot.errors.SqlglotError as error:
             raise _bad(f"无法为 {DIALECT_LABELS.get(self.dialect, self.dialect)} 生成语句：{str(error)[:160]}") from error
-        chart = {"dimension": columns[0]["name"] if dimensions else "", "metric": metric_names[0], "type": "line" if time_alias and columns[0]["name"] == time_alias else "bar"}
-        return Compiled(sql=sql, dialect=self.dialect, datasets=list(self.used), joins=join_names, columns=columns, chart=chart)
+
+        datasets: list[str] = []
+        joins: list[str] = []
+        warnings: list[str] = []
+        for branch in plan:
+            for name in [branch["root"], *(step.child for step in branch["tree"])]:
+                if name not in datasets:
+                    datasets.append(name)
+            for step in branch["tree"]:
+                text = f"{step.relationship.name}: {step.parent} → {step.child}"
+                if text not in joins:
+                    joins.append(text)
+            for text in branch["warnings"]:
+                if text not in warnings:
+                    warnings.append(text)
+        self.used = datasets
+        # One axis cannot show two dimensions: the same month would appear once per region.
+        chart_type = "table" if len(dimension_aliases) > 1 else ("line" if time_alias and dimension_aliases[0] == time_alias else "bar")
+        chart = {"dimension": dimension_aliases[0] if dimension_aliases else "", "metric": metric_aliases[metric_names[0]], "type": chart_type}
+        branches = []
+        if len(plan) > 1:
+            branches = [{"dataset": branch["root"], "metrics": [name for name in metric_names if name in branch["metrics"]]} for branch in plan]
+            warnings.append("这些指标分别来自不同的事实表（" + "、".join(branch["root"] for branch in plan) + "），已各自聚合后再按维度合并，避免相互放大。")
+        additive = [metric_aliases[name] for name in metric_names if shapes[name].additive]
+        return Compiled(sql=sql, dialect=self.dialect, datasets=datasets, joins=joins, columns=columns, chart=chart, warnings=warnings, additive=additive, branches=branches)
+
+    def _across(
+        self,
+        plan: list[dict[str, Any]],
+        metric_names: list[str],
+        hidden: list[str],
+        dimension_aliases: list[str],
+        metric_aliases: dict[str, str],
+        metric_filters: list[dict[str, Any]],
+    ) -> exp.Select:
+        """Combine separately aggregated metrics by their dimensions.
+
+        UNION ALL with an outer GROUP BY is used instead of FULL OUTER JOIN because
+        MySQL has no FULL OUTER JOIN and a NULL dimension would not match itself in one.
+        Inner columns have neutral names: ClickHouse lets an alias shadow a column inside
+        the aggregate that defines it, which ``MAX(total_sales) AS total_sales`` would hit.
+        """
+        every_metric = [*metric_names, *hidden]
+        inner = {name: f"lattice_m{index}" for index, name in enumerate(every_metric)}
+        dimension_columns = [f"lattice_d{index}" for index in range(len(dimension_aliases))]
+        combined: exp.Expression | None = None
+        for branch in plan:
+            part = self._from(branch)
+            for item, column in zip(branch["grouped"], dimension_columns):
+                part = part.select(exp.alias_(item["expression"], exp.to_identifier(column, quoted=True)), append=True)
+            for name in every_metric:
+                # The branches must agree on a type: ClickHouse has no common type for its
+                # UInt64 counts and a NULL Int64, and a smaller scale could round a decimal.
+                value = branch["metrics"].get(name)
+                value = exp.cast(exp.Null() if value is None else value, _null_type(self.model.metrics[name]))
+                part = part.select(exp.alias_(value, exp.to_identifier(inner[name], quoted=True)), append=True)
+            if branch["grouped"]:
+                part = part.group_by(*[item["expression"].copy() for item in branch["grouped"]])
+            combined = part if combined is None else exp.union(combined, part, distinct=False)
+        outer = exp.Select().from_(combined.subquery("lattice_metrics"))
+        for column, alias in zip(dimension_columns, dimension_aliases):
+            outer = outer.select(exp.alias_(exp.column(exp.to_identifier(column, quoted=True)), exp.to_identifier(alias, quoted=True)), append=True)
+        for name in metric_names:
+            outer = outer.select(exp.alias_(exp.Max(this=exp.column(exp.to_identifier(inner[name], quoted=True))), exp.to_identifier(metric_aliases[name], quoted=True)), append=True)
+        if dimension_columns:
+            outer = outer.group_by(*[exp.column(exp.to_identifier(column, quoted=True)) for column in dimension_columns])
+        conditions = [
+            self._condition(exp.Max(this=exp.column(exp.to_identifier(inner[str(item["field"])], quoted=True))), str(item.get("op") or "=").lower(), item.get("value"))
+            for item in metric_filters
+        ]
+        if conditions:
+            outer = outer.having(exp.and_(*conditions))
+        return outer
 
     @staticmethod
     def _condition(expression: exp.Expression, operator: str, value: Any) -> exp.Expression:
@@ -605,11 +946,13 @@ class SemanticQueryEngine:
         self._lock = threading.RLock()
         self._listing: tuple[float, list[dict[str, Any]]] | None = None
         self._cache: dict[str, tuple[float, Model]] = {}
+        self._values: dict[tuple[str, str], tuple[float, dict[str, list[str]]]] = {}
 
     def invalidate(self) -> None:
         with self._lock:
             self._listing = None
             self._cache.clear()
+            self._values.clear()
 
     # ----- discovery --------------------------------------------------------------------
     def list_models(self) -> list[dict[str, Any]]:
@@ -771,9 +1114,12 @@ class SemanticQueryEngine:
         return self.queries._record(datasource_id or LOCAL_SAMPLE)
 
     def _compile(self, model: Model, request: dict[str, Any], record: dict[str, Any]) -> Compiled:
+        return self._compiler(model, record).compile(request)
+
+    def _compiler(self, model: Model, record: dict[str, Any]) -> Compiler:
         dialect = CONNECTORS[record["type"]].dialect if record.get("type") in CONNECTORS else "duckdb"
         if record["id"] == LOCAL_SAMPLE:
-            return Compiler(model, dialect, bare_schemas=DEFAULT_SCHEMA_ALIASES).compile(request)
+            return Compiler(model, dialect, bare_schemas=DEFAULT_SCHEMA_ALIASES)
         # A model written against DuckDB's ``main`` or the Ossie examples' ``public`` runs
         # against the data source's own default schema elsewhere (lattice_demo on the local
         # engines, public on PostgreSQL); the dialect's own default-schema name stays as is.
@@ -783,23 +1129,179 @@ class SemanticQueryEngine:
         except Exception:  # noqa: BLE001 - an unreachable engine still gets a statement
             default = ""
         aliases = tuple(name for name in DEFAULT_SCHEMA_ALIASES if name != NATIVE_DEFAULT_SCHEMAS.get(str(record.get("type") or "")))
-        return Compiler(model, dialect, schema_map={name: default for name in aliases}, bare_schemas=() if default else aliases).compile(request)
+        return Compiler(model, dialect, schema_map={name: default for name in aliases}, bare_schemas=() if default else aliases)
 
-    def query(self, reference: Any, request: dict[str, Any], *, datasource_id: str | None = None, refresh: bool = False) -> dict[str, Any]:
+    def models_for(self, record: dict[str, Any], question: str = "") -> list[Model]:
+        """Models whose every table exists on this data source; user-defined ones come first."""
+        tables = self._source_tables(record)
+        if not tables:
+            return []
+        found: list[Model] = []
+        for item in self.list_models():
+            if not item.get("id"):
+                continue
+            try:
+                model = self.load_model(item["id"])
+            except (SemanticQueryError, ValueError):
+                continue
+            if model.metrics and all(self._source_table_name(dataset.source) in tables for dataset in model.datasets.values()):
+                found.append(model)
+        found.sort(key=lambda model: model.storage == "builtin")
+        return found
+
+    @staticmethod
+    def _source_table_name(source: str) -> str:
+        text = source.strip()
+        if re.match(r"^\s*(select|with)\b", text, re.IGNORECASE):
+            return ""  # A query as a dataset: its tables cannot be matched by name.
+        return text.rsplit(".", 1)[-1].lower()
+
+    def _source_tables(self, record: dict[str, Any]) -> set[str]:
+        if self.queries is None:
+            return set()
+        try:
+            if record["id"] == LOCAL_SAMPLE:
+                return {str(table["name"]).lower() for table in self.queries.store.metadata()}
+            return set(parse_schema_context(self.queries.registry.schema_context(record["id"])))
+        except Exception:  # noqa: BLE001 - an unreachable source simply has no model to offer
+            return set()
+
+    def dimension_values(self, model: Model, record: dict[str, Any]) -> dict[str, list[str]]:
+        """The real values of low-cardinality text dimensions on this data source.
+
+        A filter can only be right if it uses a value the data contains, so these are
+        what question words are matched against and what a language model must choose
+        from. A column with too many values is left out rather than truncated: seeing
+        only part of it would make a real value look unknown.
+        """
+        key = (model.id, record["id"])
+        with self._lock:
+            cached = self._values.get(key)
+            if cached and self._clock() - cached[0] < CACHE_SECONDS:
+                return cached[1]
+        compiler = self._compiler(model, record)
+        values: dict[str, list[str]] = {}
+        count = 0
+        for dataset in model.datasets.values():
+            for item in dataset.fields.values():
+                if not item.is_dimension or item.is_time or item.datatype not in {"String", ""} or count >= MAX_VALUE_COLUMNS:
+                    continue
+                count += 1
+                try:
+                    result = self.queries.execute(record, compiler.distinct_values_sql(dataset, item, MAX_DIMENSION_VALUES + 1), MAX_DIMENSION_VALUES + 1)
+                except Exception:  # noqa: BLE001 - no dictionary for this column; its filters are unchecked
+                    continue
+                options = [str(row[0]) for row in result["rows"] if row and row[0] not in (None, "")]
+                if options and len(options) <= MAX_DIMENSION_VALUES:
+                    values[f"{dataset.name}.{item.name}"] = sorted(options)
+        with self._lock:
+            self._values[key] = (self._clock(), values)
+        return values
+
+    def definitions(self, model: Model, metric_names: list[str]) -> list[dict[str, str]]:
+        return [
+            {"name": name, "description": model.metrics[name].description, "expression": expression_for(model.metrics[name].expressions, "duckdb"), "time_field": model.metrics[name].time_field}
+            for name in metric_names
+            if name in model.metrics
+        ]
+
+    def _verify(self, model: Model, request: dict[str, Any], compiled: Compiled, record: dict[str, Any], result: dict[str, Any], refresh: bool) -> list[dict[str, Any]]:
+        """Check the answer against what the metric definitions promise.
+
+        The groups of an additive metric must add up to its total computed without any
+        grouping. A difference means a join repeated or dropped rows, typically a key the
+        model declares unique that has duplicates in the data, so it is an error: a number
+        known to be wrong is not an answer. Failing to run the check is reported as such.
+        """
+        checks: list[dict[str, Any]] = []
+        if compiled.joins:
+            checks.append({"name": "关联路径", "status": "passed", "detail": "按语义模型声明的关系生成：" + "；".join(compiled.joins)})
+        if compiled.branches:
+            checks.append({"name": "多事实表口径", "status": "passed", "detail": "；".join(f"{item['dataset']}：{'、'.join(item['metrics'])}" for item in compiled.branches) + "，各自聚合后合并。"})
+        dimensions = request.get("dimensions") or []
+        filters = request.get("filters") or []
+        metric_filtered = any(str(item.get("field")) in model.metrics for item in filters if isinstance(item, dict))
+        if not dimensions or not compiled.additive or metric_filtered:
+            return checks
+        names = [str(column["metric"]) for column in compiled.columns if column["kind"] == "metric" and column["name"] in compiled.additive]
+        aliases = {str(column["metric"]): column["name"] for column in compiled.columns if column["kind"] == "metric"}
+        try:
+            compiler = self._compiler(model, record)
+            whole = compiler.compile({"metrics": names, "filters": filters, "relationships": request.get("relationships")}, ordered=False)
+            baseline = self.queries.execute(record, whole.sql, refresh=refresh)
+            totals = dict(zip(baseline["columns"], baseline["rows"][0])) if baseline["rows"] else {}
+            if request.get("limit") or result.get("truncated"):
+                grouped = compiler.compile({**request, "limit": None, "order_by": None}, ordered=False)
+                tree = sqlglot.parse_one(grouped.sql, read=compiled.dialect)
+                wrapper = exp.Select(expressions=[exp.alias_(exp.Sum(this=exp.column(exp.to_identifier(aliases[name], quoted=True))), exp.to_identifier(aliases[name], quoted=True)) for name in names]).from_(tree.subquery("lattice_total"))
+                summed = self.queries.execute(record, wrapper.sql(dialect=compiled.dialect), refresh=refresh)
+                parts = dict(zip(summed["columns"], summed["rows"][0])) if summed["rows"] else {}
+            else:
+                parts = {aliases[name]: sum(float(row[result["columns"].index(aliases[name])] or 0) for row in result["rows"]) for name in names}
+        except Exception as error:  # noqa: BLE001 - the answer stands, and says it was not reconciled
+            checks.append({"name": "分组合计与总数核对", "status": "skipped", "detail": f"核对未能执行：{str(error)[:200]}"})
+            return checks
+        for name in names:
+            alias = aliases[name]
+            expected, actual = totals.get(name), parts.get(alias)
+            if expected is None and actual in (None, 0, 0.0):
+                continue  # Nothing matched the filters on either side.
+            expected_value, actual_value = float(expected or 0), float(actual or 0)
+            if abs(expected_value - actual_value) > max(0.01, abs(expected_value) * 1e-9):
+                raise SemanticQueryError(
+                    409,
+                    f"结果未通过口径校验，已拒绝返回：指标 {name} 各分组合计 {actual_value:,.2f}，不分组的总数为 {expected_value:,.2f}。"
+                    "这通常表示关联键在数据中不唯一（语义模型声明的主键与实际数据不符）。请检查相关维表后重试。",
+                )
+            checks.append({"name": f"{name} 分组合计与总数核对", "status": "passed", "detail": f"各分组合计 {actual_value:,.2f} = 总数 {expected_value:,.2f}"})
+        return checks
+
+    def query(
+        self,
+        reference: Any,
+        request: dict[str, Any],
+        *,
+        datasource_id: str | None = None,
+        refresh: bool = False,
+        title: str | None = None,
+        steps: list[str] | None = None,
+        planner: str | None = None,
+        question: str | None = None,
+    ) -> dict[str, Any]:
         model = self.load_model(reference)
         record = self._record(datasource_id)
         started = time.monotonic()
         compiled = self._compile(model, request, record)
         with observe("semantic_query", "semantic", model=model.name, datasource=record["id"]):
             result = self.queries.execute(record, compiled.sql, request.get("limit"), refresh=refresh)
+        checks = self._verify(model, request, compiled, record, result, refresh)
         metrics = ", ".join(str(name) for name in request.get("metrics") or [])
         dims = ", ".join(str(item.get("field") if isinstance(item, dict) else item) for item in request.get("dimensions") or [])
-        title = f"{model.name}：{metrics}" + (f" 按 {dims}" if dims else "")
-        steps = [
+        heading = title or f"{model.name}：{metrics}" + (f" 按 {dims}" if dims else "")
+        reasoning = [
+            *(steps or []),
             f"读取语义模型 {model.name}（{len(model.datasets)} 个数据集，{len(model.metrics)} 个指标）。",
             f"关联数据集 {' → '.join(compiled.datasets)}" + ("，关系：" + "；".join(compiled.joins) if compiled.joins else "") + "。",
+            *compiled.warnings,
             f"按 {DIALECT_LABELS.get(compiled.dialect, compiled.dialect)} 生成聚合语句并在 {record.get('name') or record['id']} 上执行，返回 {len(result['rows'])} 行。",
+            *(f"校验通过：{check['detail']}" for check in checks if check["status"] == "passed" and "核对" in check["name"]),
         ]
-        payload = self.queries.payload(record, title, result, "semantic", steps, compiled.chart, started)
-        payload["semantic"] = {"model": model.name, "model_id": model.id, "datasets": compiled.datasets, "joins": compiled.joins, "columns": compiled.columns, "metrics": list(request.get("metrics") or []), "dimensions": list(request.get("dimensions") or [])}
-        return payload
+        names = [str(name) for name in request.get("metrics") or []]
+        extra = {
+            "semantic": {
+                "model": model.name,
+                "model_id": model.id,
+                "datasets": compiled.datasets,
+                "joins": compiled.joins,
+                "columns": compiled.columns,
+                "metrics": list(request.get("metrics") or []),
+                "dimensions": list(request.get("dimensions") or []),
+                "filters": list(request.get("filters") or []),
+                "definitions": self.definitions(model, names),
+                "warnings": compiled.warnings,
+                "planner": planner,
+                **({"question": question} if question else {}),
+            },
+            "verification": {"governed": True, "status": "skipped" if any(check["status"] == "skipped" for check in checks) else "passed", "checks": checks},
+        }
+        return self.queries.payload(record, heading, result, "semantic", reasoning, compiled.chart, started, extra=extra)

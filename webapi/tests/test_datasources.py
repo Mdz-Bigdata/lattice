@@ -518,7 +518,7 @@ def test_api_query_stream_emits_steps_sql_and_result(client):
     events = [line.split(": ", 1)[1] for line in text.splitlines() if line.startswith("event: ")]
     assert events[:2] == ["step", "step"] and "sql" in events and events[-2:] == ["result", "done"]
     result = json.loads(next(line for line in text.splitlines() if line.startswith("data: {\"id\"")).split(": ", 1)[1])
-    assert result["provider"] == "rules" and len(result["rows"]) == 11 and result["datasource_id"] == "local-sample"
+    assert result["provider"] == "semantic" and result["semantic"]["planner"] == "rules" and len(result["rows"]) == 11 and result["datasource_id"] == "local-sample"
     with client.stream("POST", "/api/query/stream", json={"question": "无法识别的问题"}) as response:
         text = "".join(response.iter_text())
     assert "event: error" in text and "event: done" in text

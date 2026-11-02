@@ -244,13 +244,31 @@ class IngestUnregisterInput(BaseModel):
 
 def model_document(tables):
     primary_keys = {
-        "t_lattice_order_items": "order_id",
-        "t_lattice_orders": "order_id",
-        "t_lattice_customers": "customer_id",
-        "t_lattice_products": "product_id",
-        "t_lattice_sellers": "seller_id",
-        "t_lattice_payments": "order_id",
+        # An order may hold several items and be paid in several ways, so neither table's
+        # key is order_id alone: that is what makes joining through them repeat rows.
+        "t_lattice_order_items": ["order_id", "product_id"],
+        "t_lattice_orders": ["order_id"],
+        "t_lattice_customers": ["customer_id"],
+        "t_lattice_products": ["product_id"],
+        "t_lattice_sellers": ["seller_id"],
+        "t_lattice_payments": ["order_id", "payment_type"],
     }
+    # The words people use for these columns, which is how a question finds them.
+    field_terms = {
+        ("t_lattice_customers", "region"): ("客户所在地区", ["地区", "区域", "大区"]),
+        ("t_lattice_customers", "customer_name"): ("客户名称", ["客户", "客户名称", "买家"]),
+        ("t_lattice_products", "category"): ("商品类别", ["类别", "商品类别", "品类", "分类", "商品分类"]),
+        ("t_lattice_products", "product_name"): ("商品名称", ["商品", "商品名称", "产品"]),
+        ("t_lattice_sellers", "seller_name"): ("商家名称", ["商家", "商家名称", "卖家", "店铺"]),
+        ("t_lattice_orders", "status"): ("订单状态", ["状态", "订单状态"]),
+        ("t_lattice_orders", "order_date"): ("下单日期，所有销售口径的统计日期", ["下单日期", "下单时间"]),
+        ("t_lattice_order_items", "shipping_limit_date"): ("商家发货截止日期", ["发货日期", "发货时间", "发货截止日期"]),
+        ("t_lattice_payments", "payment_type"): ("支付方式", ["支付方式", "支付类型", "付款方式"]),
+    }
+
+    def field_context(table_name, column_name):
+        description, synonyms = field_terms.get((table_name, column_name), ("", []))
+        return ({"description": description, "ai_context": {"synonyms": synonyms}} if synonyms else {})
 
     def datatype(value):
         return (
@@ -268,7 +286,7 @@ def model_document(tables):
             "name": table["name"],
             "source": "local.main." + table["name"],
             "description": table["label"] + "（本地生成的示例数据）",
-            "primary_key": [primary_keys[table["name"]]],
+            "primary_key": primary_keys[table["name"]],
             "fields": [
                 {
                     "name": column["name"],
@@ -278,6 +296,7 @@ def model_document(tables):
                             {"dialect": "ANSI_SQL", "expression": column["name"]}
                         ]
                     },
+                    **field_context(table["name"], column["name"]),
                 }
                 for column in table["columns"]
             ],
@@ -302,24 +321,26 @@ def model_document(tables):
                     {"name": "payments_to_orders", "from": "t_lattice_payments", "to": "t_lattice_orders", "from_columns": ["order_id"], "to_columns": ["order_id"]},
                 ],
                 "metrics": [
-                    _demo_metric("total_sales", "SUM(t_lattice_order_items.price)", "销售总额：订单明细价格之和", "Decimal"),
-                    _demo_metric("order_count", "COUNT(DISTINCT t_lattice_orders.order_id)", "订单数：去重订单编号", "Integer"),
-                    _demo_metric("item_count", "COUNT(t_lattice_order_items.product_id)", "订单明细行数", "Integer"),
-                    _demo_metric("avg_order_value", "SUM(t_lattice_order_items.price) / COUNT(DISTINCT t_lattice_orders.order_id)", "客单价：销售总额 / 订单数", "Decimal"),
-                    _demo_metric("total_payment", "SUM(t_lattice_payments.payment_value)", "支付总额：支付金额之和", "Decimal"),
-                    _demo_metric("customer_count", "COUNT(DISTINCT t_lattice_customers.customer_id)", "下单客户数", "Integer"),
+                    _demo_metric("total_sales", "SUM(t_lattice_order_items.price)", "销售总额：订单明细价格之和", "Decimal", ["销售额", "销售总额", "销售金额", "成交额", "gmv", "营业额"]),
+                    _demo_metric("order_count", "COUNT(DISTINCT t_lattice_orders.order_id)", "订单数：去重订单编号", "Integer", ["订单量", "订单数", "单量", "订单数量"]),
+                    _demo_metric("item_count", "COUNT(t_lattice_order_items.product_id)", "订单明细行数", "Integer", ["明细数", "明细行数", "销售件数", "商品件数"]),
+                    _demo_metric("avg_order_value", "ROUND(SUM(t_lattice_order_items.price) / COUNT(DISTINCT t_lattice_orders.order_id), 2)", "客单价：销售总额 / 订单数", "Decimal", ["客单价", "平均订单金额", "平均客单价", "笔单价"]),
+                    _demo_metric("total_payment", "SUM(t_lattice_payments.payment_value)", "支付总额：支付金额之和", "Decimal", ["支付额", "支付总额", "支付金额", "实付金额", "付款金额"]),
+                    _demo_metric("customer_count", "COUNT(DISTINCT t_lattice_orders.customer_id)", "下单客户数：有订单的去重客户", "Integer", ["客户数", "下单客户数", "买家数", "客户数量"]),
                 ],
             }
         ],
     }
 
 
-def _demo_metric(name: str, expression: str, description: str, datatype: str) -> dict:
+def _demo_metric(name: str, expression: str, description: str, datatype: str, synonyms: list[str]) -> dict:
     return {
         "name": name,
         "datatype": datatype,
         "description": description,
         "expression": {"dialects": [{"dialect": "ANSI_SQL", "expression": expression}]},
+        # Every demo metric is reported by the day the order was placed.
+        "ai_context": {"synonyms": synonyms, "time_field": "t_lattice_orders.order_date"},
     }
 
 
@@ -349,6 +370,7 @@ async def lifespan(app):
         queries=app.state.queries,
         builtin=lambda: model_document(app.state.store.metadata()),
     )
+    app.state.queries.semantic = app.state.semantic_engine
     # The quality metadata lives in a real PostgreSQL database. An unreachable
     # database must not stop the rest of the platform from starting: bootstrap
     # reports through health() instead of raising out of the lifespan.

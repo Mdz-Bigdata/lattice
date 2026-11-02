@@ -143,6 +143,21 @@ export interface QueryResult {
   /** True when the rows came from the query result cache; age is how old they are. */
   cached?: boolean;
   cache_age_seconds?: number | null;
+  /** Present when the semantic layer answered: which definitions produced the numbers. */
+  semantic?: {
+    model: string;
+    planner?: "rules" | "llm" | null;
+    joins: string[];
+    filters?: { field: string; op: string; value?: unknown }[];
+    definitions?: { name: string; description: string; expression: string; time_field?: string }[];
+    warnings?: string[];
+  };
+  /** What was checked before this result was returned, and what could not be. */
+  verification?: {
+    governed: boolean;
+    status: "passed" | "skipped";
+    checks: { name: string; status: "passed" | "skipped"; detail: string }[];
+  };
 }
 export interface QueryRequest {
   question?: string;
