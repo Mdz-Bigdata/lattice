@@ -20,7 +20,11 @@ such a statement wrong while still looking right:
 * tables and columns the source does not have;
 * joins with no condition, which multiply every row by every row;
 * fan-outs: SUM, AVG or plain COUNT over rows that a join repeats. Whether a join
-  repeats rows depends on the data, so the join key is probed for duplicates.
+  repeats rows depends on the data, so the join key is probed for duplicates;
+* joins on the wrong column, when the relationship between two tables is known;
+* filter values the data does not contain (status = 'refunded' on a column that only
+  ever says 已退款), which run fine and return a confident zero;
+* tables and columns the question scope excludes.
 
 A pre-aggregated subquery or CTE is the correct way to combine facts, and passes
 because grouping by the join key makes that key unique.
@@ -30,7 +34,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Any, Callable
 
 import sqlglot
 from sqlglot import exp
@@ -38,7 +42,11 @@ from sqlglot.optimizer.scope import Scope, traverse_scope
 
 #: (schema or None, table, key columns) -> True, False when it has duplicates, None when unknown.
 UniquenessProbe = Callable[[str | None, str, list[str]], "bool | None"]
+#: (schema or None, table, column, value, is a LIKE pattern) -> whether any row matches, None when unknown.
+ValueProbe = Callable[[str | None, str, str, str, bool], "bool | None"]
 MAX_PROBES = 12
+MAX_VALUE_PROBES = 8
+DATE_LIKE = re.compile(r"^\d{4}([-/]\d{1,2}){0,2}")
 
 
 @dataclass
@@ -46,6 +54,13 @@ class AuditReport:
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     passed: list[str] = field(default_factory=list)
+    #: Filters on values the data does not hold. Worth one correction, but the value may
+    #: simply not have occurred yet, so a model that insists gets a warning, not a refusal.
+    value_issues: list[str] = field(default_factory=list)
+    #: Every ``table.column`` the statement filters on by a string value.
+    filtered_columns: set[str] = field(default_factory=set)
+    #: The columns behind ``value_issues``, so a correction can be held to keeping the condition.
+    value_columns: set[str] = field(default_factory=set)
 
 
 def parse_schema_context(text: str) -> dict[str, set[str]]:
@@ -172,11 +187,52 @@ def _join_pairs(select: exp.Select, scope: Scope) -> tuple[list[_Join], list[str
     return list(pairs.values()), bare
 
 
+def _column_owner(column: exp.Column, scope: Scope) -> str:
+    if column.table:
+        return column.table
+    sources = list(scope.selected_sources)
+    return sources[0] if len(sources) == 1 else ""
+
+
+def _filter_values(select: exp.Select, scope: Scope) -> list[tuple[exp.Table, str, str, bool]]:
+    """(table, column, value, is LIKE) for string filters on physical columns of this SELECT."""
+    where = select.args.get("where")
+    if where is None:
+        return []
+    found = []
+
+    def add(left: exp.Expression, value: exp.Expression, like: bool) -> None:
+        while isinstance(left, (exp.Lower, exp.Upper, exp.Trim, exp.Paren)):
+            left = left.this
+        if not isinstance(left, exp.Column) or not isinstance(value, exp.Literal) or not value.is_string:
+            return
+        table = _physical(scope, _column_owner(left, scope))
+        text = value.this
+        if table is not None and text and not DATE_LIKE.match(text):
+            found.append((table, left.name, text, like))
+
+    for node in where.find_all(exp.EQ, exp.In, exp.Like, exp.ILike):
+        if node.find_ancestor(exp.Select) is not select:
+            continue
+        if isinstance(node, exp.In):
+            for item in node.expressions:
+                add(node.this, item, False)
+        else:
+            add(node.left, node.right, not isinstance(node, exp.EQ))
+    return found
+
+
 def audit_sql(
     sql: str,
     dialect: str,
     known: dict[str, set[str]] | None = None,
     probe: UniquenessProbe | None = None,
+    *,
+    edges: list[Any] | None = None,
+    table_allowed: Callable[[str], bool] | None = None,
+    column_allowed: Callable[[str, str], bool] | None = None,
+    hides_columns: Callable[[str], bool] | None = None,
+    value_probe: ValueProbe | None = None,
 ) -> AuditReport:
     report = AuditReport()
     tree = None
@@ -213,6 +269,7 @@ def audit_sql(
         return probes[key]
 
     fan_checked = False
+    value_checks = 0
     for scope in scopes:
         select = scope.expression
         if not isinstance(select, exp.Select):
@@ -238,6 +295,33 @@ def audit_sql(
                 for column in scope.columns:
                     if not column.table and column.name.lower() not in everything and column.name.lower() not in outputs and everything:
                         report.errors.append(f"列 {column.name} 不在所查询的表中。")
+        # ----- what the question scope excludes
+        for alias in scope.selected_sources:
+            table = _physical(scope, alias)
+            if table is None:
+                continue
+            if table_allowed is not None and not table_allowed(table.name):
+                report.errors.append(f"表 {table.name} 不在智能问数允许访问的范围内。")
+            if column_allowed is not None:
+                # An unqualified column could belong to any source of this SELECT.
+                for column in scope.columns:
+                    if (column.table == alias or not column.table) and not column_allowed(table.name, column.name):
+                        report.errors.append(f"字段 {table.name}.{column.name} 不在智能问数允许访问的范围内。")
+                if select.is_star and hides_columns is not None and hides_columns(table.name):
+                    report.errors.append(f"表 {table.name} 含有不允许访问的字段，请明确列出需要的字段，不要使用 SELECT *。")
+        # ----- filter values
+        for table, column, value, like in _filter_values(select, scope):
+            target = f"{table.name}.{column}".lower()
+            report.filtered_columns.add(target)
+            if value_probe is None or value_checks >= MAX_VALUE_PROBES:
+                continue
+            value_checks += 1
+            if value_probe(table.db or None, table.name, column, value, like) is False:
+                report.value_columns.add(target)
+                report.value_issues.append(
+                    f"{table.name}.{column} 中没有匹配 '{value}' 的数据。如果是取值写法不对，请改用该字段的实际取值；"
+                    "如果问题问的就是这个值，请保留这个筛选条件，结果为空也是正确答案。不要去掉条件，也不要改成回答别的问题。"
+                )
         # ----- joins
         joins = select.args.get("joins") or []
         if not joins:
@@ -245,6 +329,30 @@ def audit_sql(
         pairs, bare = _join_pairs(select, scope)
         for alias in bare:
             report.errors.append(f"表 {alias} 的关联没有条件，会产生笛卡尔积。")
+        # ----- joins that contradict a known relationship
+        for pair in pairs:
+            left, right = _physical(scope, pair.left), _physical(scope, pair.right)
+            if left is None or right is None or not edges:
+                continue
+            related = [edge for edge in edges if edge.touches(left.name, right.name)]
+            if not related:
+                report.warnings.append(f"{left.name} 与 {right.name} 之间没有已知的关联关系，请核对关联字段（{', '.join(pair.left_columns)} = {', '.join(pair.right_columns)}）。")
+                continue
+            used = {(a.lower(), b.lower()) for a, b in zip(pair.left_columns, pair.right_columns)}
+            matches = False
+            for edge in related:
+                forward = edge.many_table.lower() == left.name.lower()
+                near, far = (edge.many_columns, edge.one_columns) if forward else (edge.one_columns, edge.many_columns)
+                if {(a.lower(), b.lower()) for a, b in zip(near, far)} <= used:
+                    matches = True
+            if matches:
+                continue
+            described = "；".join(edge.text() for edge in related)
+            message = f"{left.name} 与 {right.name} 的关联字段不对：用的是 {', '.join(pair.left_columns)} = {', '.join(pair.right_columns)}，已知关系是 {described}。"
+            if any(edge.source != "数据验证的推断" for edge in related):
+                report.errors.append(message)
+            else:
+                report.warnings.append(message)
         aggregates = _own_aggregates(select)
         sensitive = [item for item in aggregates if not _repeat_safe(item)]
         if not sensitive:
@@ -304,7 +412,17 @@ def audit_sql(
         report.passed.append("关联键唯一性探测未发现重复累计。")
     report.errors = list(dict.fromkeys(report.errors))
     report.warnings = list(dict.fromkeys(report.warnings))
+    report.value_issues = list(dict.fromkeys(report.value_issues))
     return report
+
+
+def value_probe_sql(schema: str | None, table: str, column: str, value: str, like: bool, dialect: str) -> str:
+    """One row exists exactly when some row holds this value, compared without regard to case."""
+    target = exp.Table(this=exp.to_identifier(table, quoted=True), db=exp.to_identifier(schema, quoted=True) if schema else None)
+    subject = exp.Lower(this=exp.column(exp.to_identifier(column, quoted=True)))
+    literal = exp.Literal.string(value.lower())
+    condition = exp.Like(this=subject, expression=literal) if like else exp.EQ(this=subject, expression=literal)
+    return exp.Select(expressions=[exp.alias_(exp.Literal.number(1), "lattice_hit")]).from_(target).where(condition).limit(1).sql(dialect=dialect)
 
 
 def duplicate_key_probe_sql(schema: str | None, table: str, columns: list[str], dialect: str) -> str:

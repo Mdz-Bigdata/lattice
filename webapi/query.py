@@ -312,6 +312,11 @@ class QueryStore:
     def _json_value(value):
         return json_value(value)
 
+    def find(self, result_id: str):
+        with sqlite3.connect(self.history_db) as con:
+            row = con.execute("SELECT result FROM query_history WHERE id = ?", (result_id,)).fetchone()
+        return json.loads(row[0]) if row else None
+
     def history(self):
         with sqlite3.connect(self.history_db) as con:
             return [

@@ -146,12 +146,14 @@ export interface QueryResult {
   /** Present when the semantic layer answered: which definitions produced the numbers. */
   semantic?: {
     model: string;
-    planner?: "rules" | "llm" | null;
+    planner?: "rules" | "llm" | "verified" | null;
     joins: string[];
     filters?: { field: string; op: string; value?: unknown }[];
     definitions?: { name: string; description: string; expression: string; time_field?: string }[];
     warnings?: string[];
   };
+  /** The question that produced this result; absent for hand-written SQL. */
+  question?: string;
   /** What was checked before this result was returned, and what could not be. */
   verification?: {
     governed: boolean;

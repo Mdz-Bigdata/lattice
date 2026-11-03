@@ -230,6 +230,16 @@ def parse_header_lines(text: str) -> dict[str, str]:
     return headers
 
 
+def _group_foreign_keys(rows: Any) -> list[dict[str, Any]]:
+    """Merge (constraint, table, referenced table, column, referenced column) rows per constraint."""
+    grouped: dict[tuple[str, str], dict[str, Any]] = {}
+    for constraint, table, referenced, column, referenced_column in rows:
+        entry = grouped.setdefault((table, constraint), {"table": table, "columns": [], "referenced_table": referenced, "referenced_columns": []})
+        entry["columns"].append(column)
+        entry["referenced_columns"].append(referenced_column)
+    return list(grouped.values())
+
+
 class Connector:
     """Base class; subclasses declare metadata and implement the engine calls."""
 
@@ -345,6 +355,10 @@ class Connector:
     def view_definition(self, schema: str, name: str) -> str | None:
         """The query behind a view when the engine exposes it (the catalog derives lineage from it)."""
         return None
+
+    def foreign_keys(self, schema: str) -> list[dict[str, Any]]:
+        """Declared foreign keys: table, columns, referenced_table, referenced_columns."""
+        return []
 
     def execute(self, sql: str, limit: int) -> tuple[list[str], list[list[Any]]]:
         """Run validated SQL and return up to ``limit`` raw rows."""
@@ -533,6 +547,17 @@ class DuckDBConnector(Connector):
                 for row in columns
             ],
         }
+
+    def foreign_keys(self, schema):
+        check_identifier(schema, "模式名")
+        rows = self._run(
+            lambda con: con.execute(
+                "SELECT table_name, constraint_column_names, referenced_table, referenced_column_names "
+                "FROM duckdb_constraints() WHERE constraint_type = 'FOREIGN KEY' AND schema_name = ?",
+                [schema],
+            ).fetchall()
+        )
+        return [{"table": row[0], "columns": list(row[1]), "referenced_table": row[2], "referenced_columns": list(row[3])} for row in rows]
 
     def view_definition(self, schema, name):
         check_identifier(schema, "模式名")
@@ -733,6 +758,20 @@ class MySQLFamilyConnector(Connector):
                 for row in columns
             ],
         }
+
+    def foreign_keys(self, schema):
+        check_identifier(schema, "数据库名")
+
+        def load(cursor):
+            cursor.execute(
+                "SELECT CONSTRAINT_NAME, TABLE_NAME, REFERENCED_TABLE_NAME, COLUMN_NAME, REFERENCED_COLUMN_NAME "
+                "FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA = %s AND REFERENCED_TABLE_NAME IS NOT NULL "
+                "ORDER BY CONSTRAINT_NAME, ORDINAL_POSITION",
+                (schema,),
+            )
+            return cursor.fetchall()
+
+        return _group_foreign_keys(self._run(load))
 
     def view_definition(self, schema, name):
         check_identifier(schema, "数据库名")
@@ -1001,6 +1040,24 @@ class PostgresConnector(Connector):
                 for row in columns
             ],
         }
+
+    def foreign_keys(self, schema):
+        check_identifier(schema, "模式名")
+
+        def load(cursor):
+            cursor.execute(
+                "SELECT c.conname, src.relname, dst.relname, a.attname, b.attname FROM pg_constraint c "
+                "JOIN pg_class src ON src.oid = c.conrelid JOIN pg_class dst ON dst.oid = c.confrelid "
+                "JOIN pg_namespace n ON n.oid = src.relnamespace "
+                "CROSS JOIN LATERAL unnest(c.conkey, c.confkey) WITH ORDINALITY AS k(s, d, ord) "
+                "JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.s "
+                "JOIN pg_attribute b ON b.attrelid = c.confrelid AND b.attnum = k.d "
+                "WHERE c.contype = 'f' AND n.nspname = %s ORDER BY c.conname, k.ord",
+                (schema,),
+            )
+            return cursor.fetchall()
+
+        return _group_foreign_keys(self._run(load))
 
     def view_definition(self, schema, name):
         check_identifier(schema, "模式名")

@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .llm import LlmError
+from .schema_linking import SENSITIVE_COLUMN
 from .semantic_query import GRAINS, Model, OPERATORS
 
 MAX_VALUES_SHOWN = 30
@@ -381,8 +382,9 @@ PLAN_SCHEMA = {
 }
 
 
-def catalog_text(model: Model, values: dict[str, list[str]]) -> str:
+def catalog_text(model: Model, values: dict[str, list[str]], hidden: set[str] | None = None) -> str:
     """What the language model may choose from: definitions, not table structures."""
+    hidden = hidden or set()
     lines = [f"语义模型：{model.name}" + (f"（{model.description}）" if model.description else ""), "指标："]
     for metric in model.metrics.values():
         synonyms = f"；又称 {'、'.join(metric.synonyms)}" if metric.synonyms else ""
@@ -394,6 +396,8 @@ def catalog_text(model: Model, values: dict[str, list[str]]) -> str:
             if not item.is_dimension:
                 continue
             target = f"{dataset.name}.{item.name}"
+            if target in hidden:
+                continue
             notes = []
             if item.is_time:
                 notes.append("时间")
@@ -402,7 +406,7 @@ def catalog_text(model: Model, values: dict[str, list[str]]) -> str:
             if item.synonyms:
                 notes.append("又称 " + "、".join(item.synonyms))
             options = values.get(target) or []
-            if options:
+            if options and not SENSITIVE_COLUMN.search(item.name):
                 notes.append("取值：" + "、".join(options[:MAX_VALUES_SHOWN]) + ("等" if len(options) > MAX_VALUES_SHOWN else ""))
             lines.append(f"- {target}" + (f"（{'；'.join(notes)}）" if notes else ""))
     return "\n".join(lines)
@@ -493,9 +497,28 @@ def check_plan(data: dict[str, Any], question: str, model: Model, values: dict[s
     return request, problems
 
 
-def plan_with_model(generator: Any, question: str, model: Model, values: dict[str, list[str]], *, today: dt.date | None = None) -> Plan:
+def plan_with_model(
+    generator: Any,
+    question: str,
+    model: Model,
+    values: dict[str, list[str]],
+    *,
+    today: dt.date | None = None,
+    hidden: set[str] | None = None,
+    examples: list[dict[str, Any]] | None = None,
+    glossary: str = "",
+) -> Plan:
     today = today or dt.date.today()
-    prompt = f"今天日期：{today.isoformat()}\n{catalog_text(model, values)}\n\n用户问题：{question.strip()[:2000]}"
+    sections = [f"今天日期：{today.isoformat()}", catalog_text(model, values, hidden)]
+    if glossary:
+        sections.append(glossary)
+    if examples:
+        # Confirmed by a person, so these settle what the company's words mean.
+        sections.append("已由人工确认的相似问题，映射方式应与之保持一致：\n" + "\n".join(
+            f"- 问题：{item['question']}\n  映射：{json.dumps({key: value for key, value in item['definition']['request'].items() if value}, ensure_ascii=False)}"
+            for item in examples
+        ))
+    prompt = "\n\n".join([*sections, f"用户问题：{question.strip()[:2000]}"])
     feedback = ""
     problems: list[str] = []
     for attempt in range(2):

@@ -389,9 +389,9 @@ button {
   overflow: hidden;
 }
 .query-heading {
-  height: 53px;
-  flex: 0 0 53px;
-  padding: 0 17px;
+  min-height: 53px;
+  flex: 0 0 auto;
+  padding: 6px 17px;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -403,12 +403,15 @@ button {
   white-space: nowrap;
 }
 .query-status {
+  flex-wrap: wrap;
+  row-gap: 6px;
   display: flex;
   align-items: center;
   gap: 8px;
   font-size: 11px;
   color: #858d96;
   white-space: nowrap;
+  justify-content: flex-end;
 }
 .text-button {
   display: inline-flex;
@@ -689,6 +692,40 @@ button {
 }
 .trust-detail small {
   color: var(--muted);
+}
+.trust-confirm {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+.question-scope {
+  display: grid;
+  gap: 12px;
+  padding: 14px 16px;
+  font-size: 13px;
+}
+.question-scope p {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.6;
+}
+.question-scope label {
+  display: grid;
+  gap: 4px;
+}
+.question-scope textarea {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font: inherit;
+  resize: vertical;
+}
+.question-scope .primary-button {
+  justify-self: start;
 }
 .trust-check {
   margin-right: 6px;

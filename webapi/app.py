@@ -752,6 +752,56 @@ def query(payload: QueryInput, request: Request):
     )
 
 
+class ConfirmQuestionInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    result_id: str = Field(max_length=64)
+
+
+class QuestionScopeInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    allow_tables: list[str] = Field(default_factory=list, max_length=500)
+    deny_tables: list[str] = Field(default_factory=list, max_length=500)
+    deny_columns: list[str] = Field(default_factory=list, max_length=500)
+
+
+@app.get("/api/query/confirmed")
+def confirmed_questions(request: Request, datasource_id: str | None = None):
+    return {"items": request.app.state.queries.memory.confirmed(datasource_id)}
+
+
+@app.post("/api/query/confirmed")
+def confirm_question(payload: ConfirmQuestionInput, request: Request):
+    return guarded(request.app.state.queries.confirm, payload.result_id)
+
+
+@app.post("/api/query/confirmed/{item_id}/delete")
+def delete_confirmed_question(item_id: str, payload: EmptyInput, request: Request):
+    return {"deleted": request.app.state.queries.memory.delete(item_id)}
+
+
+@app.get("/api/query/log")
+def question_log(request: Request, limit: int = 100, outcome: str | None = None):
+    return {"items": request.app.state.queries.memory.entries(limit, outcome)}
+
+
+@app.get("/api/datasources/{source_id}/question-scope")
+def get_question_scope(source_id: str, request: Request):
+    guarded(request.app.state.sources.record, source_id)
+    return request.app.state.queries.scope.get(source_id)
+
+
+@app.post("/api/datasources/{source_id}/question-scope")
+def set_question_scope(source_id: str, payload: QuestionScopeInput, request: Request):
+    guarded(request.app.state.sources.record, source_id)
+    queries = request.app.state.queries
+    try:
+        saved = queries.scope.save(source_id, payload.allow_tables, payload.deny_tables, payload.deny_columns)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    queries.invalidate_schema(source_id)
+    return saved
+
+
 @app.get("/api/query/cache")
 def query_cache(request: Request, datasource_id: str | None = None, limit: int = 50):
     cache = request.app.state.query_cache

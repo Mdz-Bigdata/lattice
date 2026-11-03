@@ -48,6 +48,7 @@ unique but whose data is not.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import threading
@@ -157,6 +158,15 @@ class Model:
     relationships: list[Relationship]
     metrics: dict[str, Metric]
 
+    def fingerprint(self) -> str:
+        """Changes whenever a definition does, so a confirmed answer can notice it went stale."""
+        definition = {
+            "datasets": {d.name: [d.source, d.primary_key, {f.name: f.expressions for f in d.fields.values()}] for d in self.datasets.values()},
+            "relationships": [[r.from_dataset, r.to_dataset, r.from_columns, r.to_columns] for r in self.relationships],
+            "metrics": {m.name: [m.expressions, m.time_field] for m in self.metrics.values()},
+        }
+        return hashlib.sha256(json.dumps(definition, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
+
     def dimensions(self) -> list[dict[str, Any]]:
         items = []
         for dataset in self.datasets.values():
@@ -187,6 +197,19 @@ def _synonyms(node: Any) -> list[str]:
     if isinstance(context, dict) and isinstance(context.get("synonyms"), list):
         return [str(item) for item in context["synonyms"] if item][:20]
     return []
+
+
+def source_tables(source: str) -> list[str]:
+    """The physical tables behind a dataset: its table, or those a wide-table query reads."""
+    text = source.strip()
+    if not re.match(r"^\s*(select|with)\b", text, re.IGNORECASE):
+        return [text.rsplit(".", 1)[-1].lower()]
+    try:
+        tree = sqlglot.parse_one(text, read="duckdb")
+    except sqlglot.errors.SqlglotError:
+        return ["\x00unparseable"]  # Matches no table, so this model is not offered for the source.
+    ctes = {cte.alias_or_name.lower() for cte in tree.find_all(exp.CTE)}
+    return sorted({table.name.lower() for table in tree.find_all(exp.Table) if table.name.lower() not in ctes})
 
 
 def _time_field(node: Any) -> str:
@@ -1144,17 +1167,10 @@ class SemanticQueryEngine:
                 model = self.load_model(item["id"])
             except (SemanticQueryError, ValueError):
                 continue
-            if model.metrics and all(self._source_table_name(dataset.source) in tables for dataset in model.datasets.values()):
+            if model.metrics and all(name in tables for dataset in model.datasets.values() for name in source_tables(dataset.source)):
                 found.append(model)
         found.sort(key=lambda model: model.storage == "builtin")
         return found
-
-    @staticmethod
-    def _source_table_name(source: str) -> str:
-        text = source.strip()
-        if re.match(r"^\s*(select|with)\b", text, re.IGNORECASE):
-            return ""  # A query as a dataset: its tables cannot be matched by name.
-        return text.rsplit(".", 1)[-1].lower()
 
     def _source_tables(self, record: dict[str, Any]) -> set[str]:
         if self.queries is None:
@@ -1300,8 +1316,11 @@ class SemanticQueryEngine:
                 "definitions": self.definitions(model, names),
                 "warnings": compiled.warnings,
                 "planner": planner,
-                **({"question": question} if question else {}),
+                # Enough to run this answer again and to tell if its definitions have changed.
+                "request": request,
+                "fingerprint": model.fingerprint(),
             },
+            **({"question": question} if question else {}),
             "verification": {"governed": True, "status": "skipped" if any(check["status"] == "skipped" for check in checks) else "passed", "checks": checks},
         }
         return self.queries.payload(record, heading, result, "semantic", reasoning, compiled.chart, started, extra=extra)

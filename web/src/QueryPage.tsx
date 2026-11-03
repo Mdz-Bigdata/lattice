@@ -185,13 +185,119 @@ export function QueryReport({
     </section>
   );
 }
+/** Which tables and columns questions on this data source may reach. */
+function QuestionScopeDrawer({
+  sourceId,
+  onClose,
+}: {
+  sourceId: string;
+  onClose: () => void;
+}) {
+  const path = `/api/datasources/${encodeURIComponent(sourceId)}/question-scope`;
+  const [scope, setScope] = useState<{
+    allow_tables: string;
+    deny_tables: string;
+    deny_columns: string;
+  } | null>(null);
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+  useEffect(() => {
+    request<Record<string, string[]>>(path)
+      .then((data) =>
+        setScope({
+          allow_tables: data.allow_tables.join("\n"),
+          deny_tables: data.deny_tables.join("\n"),
+          deny_columns: data.deny_columns.join("\n"),
+        }),
+      )
+      .catch((reason) => setError(errorMessage(reason)));
+  }, [path]);
+  const lines = (text: string) =>
+    text
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+  async function save() {
+    if (!scope) return;
+    setError("");
+    setMessage("");
+    try {
+      await request(path, {
+        allow_tables: lines(scope.allow_tables),
+        deny_tables: lines(scope.deny_tables),
+        deny_columns: lines(scope.deny_columns),
+      });
+      setMessage("已保存，下一次提问生效。");
+    } catch (reason) {
+      setError(errorMessage(reason));
+    }
+  }
+  const fields = [
+    ["allow_tables", "表白名单", "每行一个，可用 * 通配；留空表示不限制。例如 dwd_*"],
+    ["deny_tables", "表黑名单", "每行一个，优先于白名单。例如 sys_*"],
+    ["deny_columns", "字段黑名单", "每行一个 表.字段。例如 users.phone"],
+  ] as const;
+  return (
+    <Drawer
+      id="question-scope-dialog"
+      title="问数范围"
+      icon={<ShieldCheck size={17} />}
+      onClose={onClose}
+    >
+      {error && <ErrorBanner message={error} />}
+      {!scope && !error && <Loading />}
+      {scope && (
+        <div className="question-scope">
+          <p>
+            限制智能问数能读取的表和字段，范围之外的内容不会发给模型，生成的 SQL
+            也不会执行。这不是数据库权限，SQL 工作台不受影响。
+          </p>
+          {fields.map(([key, label, hint]) => (
+            <label key={key}>
+              <span>{label}</span>
+              <textarea
+                rows={4}
+                value={scope[key]}
+                placeholder={hint}
+                onChange={(event) =>
+                  setScope({ ...scope, [key]: event.target.value })
+                }
+              />
+            </label>
+          ))}
+          <button className="primary-button" onClick={() => void save()}>
+            保存
+          </button>
+          {message && <small>{message}</small>}
+        </div>
+      )}
+    </Drawer>
+  );
+}
+
 /** Says what the numbers mean and how far they can be trusted. */
 function TrustPanel({ result }: { result: QueryResult }) {
   const verification = result.verification;
   const semantic = result.semantic;
   const [open, setOpen] = useState(false);
+  const [confirmState, setConfirmState] = useState<"idle" | "saving" | "done">(
+    semantic?.planner === "verified" ? "done" : "idle",
+  );
+  const [confirmError, setConfirmError] = useState("");
   if (!verification) return null;
   const warnings = semantic?.warnings ?? [];
+  const canConfirm = Boolean(result.question) && result.provider !== "sql";
+  async function confirmAnswer() {
+    setConfirmState("saving");
+    setConfirmError("");
+    try {
+      await request("/api/query/confirmed", { result_id: result.id });
+      setConfirmState("done");
+    } catch (error) {
+      setConfirmError(errorMessage(error));
+      setConfirmState("idle");
+    }
+  }
   const incomplete = verification.status !== "passed";
   const trusted = verification.governed && !incomplete;
   const summary = verification.governed
@@ -267,6 +373,25 @@ function TrustPanel({ result }: { result: QueryResult }) {
               </ul>
             </section>
           )}
+          {canConfirm && (
+            <section className="trust-confirm">
+              <button
+                className="small-button"
+                disabled={confirmState !== "idle"}
+                onClick={() => void confirmAnswer()}
+              >
+                {confirmState === "done"
+                  ? "已确认口径正确"
+                  : confirmState === "saving"
+                    ? "保存中…"
+                    : "确认口径正确"}
+              </button>
+              <small>
+                确认后这个问题固定按此回答，相似问题也会参考它；口径定义变化后确认自动失效。
+              </small>
+              {confirmError && <ErrorBanner message={confirmError} />}
+            </section>
+          )}
           {verification.checks.length > 0 && (
             <section>
               <h4>校验记录</h4>
@@ -326,6 +451,7 @@ export default function QueryPage({
     useState<CatalogProvider[]>(FALLBACK_PROVIDERS);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [scopeOpen, setScopeOpen] = useState(false);
   const [history, setHistory] = useState<QueryResult[]>([]);
   const [historyBusy, setHistoryBusy] = useState(false);
   const [historyError, setHistoryError] = useState("");
@@ -463,6 +589,16 @@ export default function QueryPage({
             </span>
             <Settings2 size={12} />
           </button>
+          <button
+            type="button"
+            className="small-button"
+            aria-haspopup="dialog"
+            title="限制智能问数能读取的表和字段"
+            onClick={() => setScopeOpen(true)}
+          >
+            <ShieldCheck size={14} />
+            问数范围
+          </button>
           <button className="text-button" onClick={() => void loadHistory()}>
             <History size={13} />
             历史问答
@@ -579,6 +715,12 @@ export default function QueryPage({
           </button>
         </form>
       </div>
+      {scopeOpen && (
+        <QuestionScopeDrawer
+          sourceId={sourceId}
+          onClose={() => setScopeOpen(false)}
+        />
+      )}
       {historyOpen && (
         <Drawer
           id="history-dialog"
