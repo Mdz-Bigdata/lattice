@@ -78,6 +78,8 @@ SAMPLE_TABLES = (
 #: How many times a model may rewrite a statement after seeing what was wrong with it.
 MAX_CORRECTIONS = 2
 SCHEMA_INDEX_SECONDS = 300
+#: A read that failed may be an engine restarting, so what is left of it is not kept for long.
+SCHEMA_RETRY_SECONDS = 30
 #: Reading table structures stops here on a slow engine; questions then work from what was read.
 SCHEMA_INDEX_BUDGET_SECONDS = 20
 MAX_INDEXED_TABLES = 300
@@ -738,6 +740,7 @@ class QueryService:
         tables: list[TableInfo] = []
         declared: list[JoinEdge] = []
         complete = True
+        unread: ConnectorError | None = None
         if record["id"] == LOCAL_SAMPLE:
             tables = [TableInfo(None, item["name"], item.get("label", ""), item.get("rows"), item["columns"]) for item in self.store.metadata()]
         else:
@@ -746,7 +749,8 @@ class QueryService:
             schemas = [default] if default else [item["name"] for item in connector.schemas()[:3]]
             deadline = time.monotonic() + SCHEMA_INDEX_BUDGET_SECONDS
             for schema in schemas:
-                listed = connector.tables(schema)
+                # Before the limits below: the few tables a scope admits must not lose out to the rest.
+                listed = [entry for entry in connector.tables(schema) if self.scope.table_allowed(record["id"], entry["name"])]
                 complete = complete and len(listed) <= MAX_INDEXED_TABLES
                 for entry in listed[:MAX_INDEXED_TABLES]:
                     columns: list[dict[str, Any]] = []
@@ -755,8 +759,9 @@ class QueryService:
                         try:
                             detail = connector.table(schema, entry["name"])
                             columns, rows = detail["columns"], detail.get("rows", rows)
-                        except ConnectorError:
+                        except ConnectorError as error:
                             complete = False
+                            unread = error
                     else:
                         complete = False
                     tables.append(TableInfo(schema, entry["name"], str(entry.get("comment") or ""), rows, columns))
@@ -764,12 +769,14 @@ class QueryService:
                     declared += edges_from_foreign_keys(connector.foreign_keys(schema))
                 except Exception:  # noqa: BLE001 - keys are a help; engines without them still answer
                     pass
+        if unread and not any(table.columns for table in tables):
+            raise unread  # Names without a single structure: the engine failed, not the question.
         tables = [table for table in tables if self.scope.table_allowed(record["id"], table.name)]
         for table in tables:
             table.columns = [column for column in table.columns if self.scope.column_allowed(record["id"], table.name, column["name"])]
         edges = [*self._model_edges(record), *declared]
         edges += self._inferred_edges(record, tables, edges)
-        self._schema_index[record["id"]] = (time.monotonic() + SCHEMA_INDEX_SECONDS, tables, edges, complete)
+        self._schema_index[record["id"]] = (time.monotonic() + (SCHEMA_RETRY_SECONDS if unread else SCHEMA_INDEX_SECONDS), tables, edges, complete)
         return tables, edges, complete
 
     def _model_edges(self, record: dict[str, Any]) -> list[JoinEdge]:
@@ -820,6 +827,8 @@ class QueryService:
         try:
             tables, edges, _ = self._index_schema(record)
         except (DataSourceError, ConnectorError):
+            if self._scope_is_set(record):
+                raise  # The plain listing ignores the scope, and the scope is not what failed.
             return None
         tables = [table for table in tables if table.columns]
         if not tables:

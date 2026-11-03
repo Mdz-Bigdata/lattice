@@ -13,13 +13,17 @@
 # and limitations under the License.
 """What a model sees for free SQL, what it is held to, and what people confirm."""
 
+import time
+
 import duckdb
 import pytest
 from fastapi.testclient import TestClient
 
 from webapi import app as app_module
-from webapi.connectors import make_connector
+from webapi import questions as question_module
+from webapi.connectors import ConnectorError, make_connector
 from webapi.llm import SqlGenerator
+from webapi.questions import SCHEMA_RETRY_SECONDS
 from webapi.schema_linking import INFERRED, JoinEdge, QuestionScope, TableInfo, join_candidates, link_schema, singular_stem
 from webapi.semantic_query import SemanticQueryEngine, source_tables
 from webapi.sql_audit import audit_sql, value_probe_sql
@@ -287,6 +291,88 @@ def test_a_scope_that_leaves_nothing_sends_no_schema_to_the_model(client, tmp_pa
     client.post("/api/datasources/local-sample/question-scope", json={"allow_tables": ["nothing_like_this_*"]})
     plain = ask(client, "随便瞧瞧", "local-sample")
     assert plain.status_code == 422 and calls == []
+
+
+def connector_type(client, source_id):
+    return type(client.app.state.queries.registry.connector(source_id))
+
+
+def test_an_unreachable_engine_is_not_reported_as_a_scope_problem(client, tmp_path, monkeypatch):
+    """Seen with Docker hung: Doris and Hive answered "check your scope" while the scope was right."""
+    source_id = source(client, warehouse(tmp_path / "w.duckdb"))
+    client.post(f"/api/datasources/{source_id}/question-scope", json={"allow_tables": ["orders", "customers"]})
+    calls = generator_replies(monkeypatch, [GOOD])
+
+    def down(*_):
+        raise ConnectorError("无法连接引擎")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(connector_type(client, source_id), "tables", down)
+        answer = ask(client, "各地区订单金额", source_id)
+    assert answer.status_code == 400 and "无法连接引擎" in answer.json()["detail"]
+    assert "问数范围" not in answer.json()["detail"] and calls == []
+    assert ask(client, "各地区订单金额", source_id).status_code == 200
+
+
+def test_tables_listed_but_unreadable_are_not_a_scope_problem_and_not_remembered(client, tmp_path, monkeypatch):
+    """The engine died between the listing and the structures: five minutes of empty tables followed."""
+    source_id = source(client, warehouse(tmp_path / "w.duckdb"))
+    client.post(f"/api/datasources/{source_id}/question-scope", json={"allow_tables": ["orders", "customers"]})
+    calls = generator_replies(monkeypatch, [GOOD])
+
+    def down(*_):
+        raise ConnectorError("读取超时")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(connector_type(client, source_id), "table", down)
+        answer = ask(client, "各地区订单金额", source_id)
+    assert answer.status_code == 400 and "读取超时" in answer.json()["detail"]
+    assert "问数范围" not in answer.json()["detail"] and calls == []
+    # The engine is back, and the next question must not need the cache to run out.
+    assert ask(client, "各地区订单金额", source_id).status_code == 200 and calls
+
+
+def test_a_partly_read_schema_is_remembered_only_briefly(client, tmp_path, monkeypatch):
+    source_id = source(client, warehouse(tmp_path / "w.duckdb"))
+    queries = client.app.state.queries
+    kind = connector_type(client, source_id)
+    real = kind.table
+
+    def flaky(self, schema, name):
+        if name == "customers":
+            raise ConnectorError("读取超时")
+        return real(self, schema, name)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(kind, "table", flaky)
+        tables, _, complete = queries._index_schema(queries._record(source_id))
+    assert not complete and next(table for table in tables if table.name == "customers").columns == []
+    assert queries._schema_index[source_id][0] <= time.monotonic() + SCHEMA_RETRY_SECONDS
+    queries._schema_index.clear()
+    queries._index_schema(queries._record(source_id))
+    assert queries._schema_index[source_id][0] > time.monotonic() + SCHEMA_RETRY_SECONDS
+
+
+def test_structures_are_read_only_for_tables_in_scope(client, tmp_path, monkeypatch):
+    """A scope naming a few tables of a big source must not lose them to the reading budget."""
+    source_id = source(client, warehouse(tmp_path / "w.duckdb"))
+    client.post(f"/api/datasources/{source_id}/question-scope", json={"allow_tables": ["orders", "customers"]})
+    queries = client.app.state.queries
+    kind = connector_type(client, source_id)
+    real = kind.table
+    read = []
+
+    def counted(self, schema, name):
+        read.append(name)
+        return real(self, schema, name)
+
+    monkeypatch.setattr(kind, "table", counted)
+    # Which semantic models apply is decided over the whole source, and nothing of it reaches a model.
+    monkeypatch.setattr(queries, "_model_edges", lambda record: [])
+    monkeypatch.setattr(question_module, "MAX_INDEXED_TABLES", 2)
+    tables, _, complete = queries._index_schema(queries._record(source_id))
+    assert sorted(read) == ["customers", "orders"] and complete
+    assert {table.name for table in tables} == {"customers", "orders"}
 
 
 def test_allow_list_limits_tables_and_bad_column_rule_is_rejected(tmp_path):
