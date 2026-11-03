@@ -24,7 +24,8 @@ such a statement wrong while still looking right:
 * joins on the wrong column, when the relationship between two tables is known;
 * filter values the data does not contain (status = 'refunded' on a column that only
   ever says 已退款), which run fine and return a confident zero;
-* tables and columns the question scope excludes.
+* tables and columns the question scope excludes;
+* measures a wide table repeats per key, which SUM counts once per row with no join in sight.
 
 A pre-aggregated subquery or CTE is the correct way to combine facts, and passes
 because grouping by the join key makes that key unique.
@@ -57,6 +58,10 @@ class AuditReport:
     #: Filters on values the data does not hold. Worth one correction, but the value may
     #: simply not have occurred yet, so a model that insists gets a warning, not a refusal.
     value_issues: list[str] = field(default_factory=list)
+    #: The aggregates the statement computes over physical columns, for a person to review.
+    measures: list[str] = field(default_factory=list)
+    #: Names of the columns summed or averaged anywhere in the statement, inner queries included.
+    measure_names: set[str] = field(default_factory=set)
     #: Every ``table.column`` the statement filters on by a string value.
     filtered_columns: set[str] = field(default_factory=set)
     #: The columns behind ``value_issues``, so a correction can be held to keeping the condition.
@@ -232,6 +237,9 @@ def audit_sql(
     table_allowed: Callable[[str], bool] | None = None,
     column_allowed: Callable[[str, str], bool] | None = None,
     hides_columns: Callable[[str], bool] | None = None,
+    repeated_measures: Callable[[str], dict[str, str]] | None = None,
+    uncertain_measures: Callable[[str], dict[str, str]] | None = None,
+    unprofiled: Callable[[str], bool] | None = None,
     value_probe: ValueProbe | None = None,
 ) -> AuditReport:
     report = AuditReport()
@@ -322,6 +330,43 @@ def audit_sql(
                     f"{table.name}.{column} 中没有匹配 '{value}' 的数据。如果是取值写法不对，请改用该字段的实际取值；"
                     "如果问题问的就是这个值，请保留这个筛选条件，结果为空也是正确答案。不要去掉条件，也不要改成回答别的问题。"
                 )
+        for aggregate in _own_aggregates(select):
+            columns = list(aggregate.find_all(exp.Column))
+            if not isinstance(aggregate, exp.Count):
+                report.measure_names |= {column.name.lower() for column in columns}
+            # A derived table's column is named after the real one or hides it; either way the
+            # physical choice is what is worth showing, so report where a real table is read.
+            if any(_physical(scope, _column_owner(column, scope)) is not None for column in columns):
+                text = aggregate.sql(dialect=dialect)
+                if text not in report.measures:
+                    report.measures.append(text)
+        for name, source in scope.sources.items():
+            # SUM over a pre-reduced subquery: the measure is chosen one level down, by a column
+            # the aggregate there may not touch, so name the outer aggregate too.
+            if isinstance(source, Scope):
+                for aggregate in _own_aggregates(select):
+                    text = aggregate.sql(dialect=dialect)
+                    if text not in report.measures:
+                        report.measures.append(text)
+                break
+        # ----- measures a wide table already repeats
+        if repeated_measures is not None:
+            for aggregate in _own_aggregates(select):
+                if _repeat_safe(aggregate):
+                    continue
+                for column in aggregate.find_all(exp.Column):
+                    table = _physical(scope, _column_owner(column, scope))
+                    if table is not None and unprofiled is not None and unprofiled(table.name):
+                        report.warnings.append(f"未能探测 {table.name} 的粒度（查询失败或超时），无法排除 {column.name} 在多行上重复，{aggregate.sql(dialect=dialect)} 可能偏大，请核对。")
+                    key = repeated_measures(table.name).get(column.name.lower()) if table is not None else None
+                    if key:
+                        report.errors.append(
+                            f"{aggregate.sql(dialect=dialect)} 存在重复累计：{table.name}.{column.name} 在同一个 {key} 的多行上取值相同。"
+                            f"请先用子查询按 {key} 去重（SELECT DISTINCT 键, {column.name}, 需要的维度），再汇总。"
+                        )
+                    weak = uncertain_measures(table.name).get(column.name.lower()) if table is not None and uncertain_measures is not None else None
+                    if weak:
+                        report.warnings.append(f"{table.name}.{column.name} 在同一个 {weak} 内取值相同，但无法确定它属于哪个键（证据太少，或同时符合多个键）。{aggregate.sql(dialect=dialect)} 的去重方式会影响结果，请核对。")
         # ----- joins
         joins = select.args.get("joins") or []
         if not joins:

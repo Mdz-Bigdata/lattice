@@ -37,6 +37,7 @@ TABLES = {
     "t_lattice_sellers": "商家",
     "t_lattice_payments": "支付",
     "store_sales": "门店销售（TPC-DS 风格）",
+    "dws_sales_wide": "销售宽表（每行一条订单明细，已带订单、客户、商品、商家属性）",
 }
 QUESTIONS = [
     "月度销售额趋势",
@@ -64,6 +65,32 @@ MONTH_SQL = """SELECT strftime(shipping_limit_date, '%Y-%m') AS sales_month,
 FROM t_lattice_order_items
 GROUP BY strftime(shipping_limit_date, '%Y-%m')
 ORDER BY sales_month NULLS FIRST"""
+#: Data with real one-to-many rows, written to every engine so joins and reductions can be
+#: checked there: in the demo tables each order has one item and one payment, which hides
+#: every mistake of that kind. Not offered to questions; scripts/verify-questions.py uses it.
+VERIFY_TABLES = {
+    "lattice_verify_customers": "校验数据：客户",
+    "lattice_verify_orders": "校验数据：订单",
+    "lattice_verify_items": "校验数据：订单明细（每单多条）",
+    "lattice_verify_payments": "校验数据：支付（每单可多笔）",
+    "lattice_verify_wide": "校验数据：明细粒度宽表，订单级字段每行重复",
+}
+VERIFY_SQL = (
+    """CREATE TABLE lattice_verify_customers AS SELECT i::INTEGER AS customer_id,
+    CASE i % 3 WHEN 0 THEN '华东' WHEN 1 THEN '华南' ELSE '华北' END AS region FROM range(1, 13) t(i)""",
+    """CREATE TABLE lattice_verify_orders AS SELECT i::INTEGER AS order_id, (i % 12 + 1)::INTEGER AS customer_id,
+    CASE WHEN i % 5 = 0 THEN '已取消' ELSE '已完成' END AS status,
+    (DATE '2024-01-01' + INTERVAL (i * 9) DAY)::DATE AS order_date, CAST(100 + i * 7 AS DECIMAL(12,2)) AS order_amount FROM range(1, 61) t(i)""",
+    """CREATE TABLE lattice_verify_items AS SELECT row_number() OVER (ORDER BY o.order_id, k.k)::INTEGER AS item_id, o.order_id,
+    CASE (o.order_id + k.k) % 3 WHEN 0 THEN '数码' WHEN 1 THEN '家居' ELSE '食品' END AS category,
+    CAST(10 + (o.order_id * 3 + k.k * 11) % 40 AS DECIMAL(12,2)) AS item_price
+    FROM lattice_verify_orders o JOIN range(1, 5) k(k) ON k.k <= o.order_id % 4 + 1""",
+    """CREATE TABLE lattice_verify_payments AS SELECT row_number() OVER (ORDER BY o.order_id, k.k)::INTEGER AS payment_id, o.order_id,
+    CASE k.k WHEN 1 THEN '在线支付' ELSE '银行转账' END AS payment_type, CAST(o.order_amount / (o.order_id % 2 + 1) AS DECIMAL(12,2)) AS paid
+    FROM lattice_verify_orders o JOIN range(1, 3) k(k) ON k.k <= o.order_id % 2 + 1 WHERE o.status = '已完成'""",
+    """CREATE TABLE lattice_verify_wide AS SELECT i.item_id, i.order_id, o.customer_id, c.region, o.status, o.order_date, i.category, i.item_price, o.order_amount
+    FROM lattice_verify_items i JOIN lattice_verify_orders o USING (order_id) JOIN lattice_verify_customers c USING (customer_id) ORDER BY i.item_id""",
+)
 HISTORY_LIMIT = 50
 STORE_SALES_SQL = """CREATE TABLE store_sales AS SELECT
     CAST(strftime(i.shipping_limit_date, '%Y%m%d') AS INTEGER) AS ss_sold_date_sk,
@@ -78,6 +105,22 @@ STORE_SALES_SQL = """CREATE TABLE store_sales AS SELECT
     CAST(i.price AS DECIMAL(7,2)) AS ss_net_paid
 FROM t_lattice_order_items i
 JOIN t_lattice_orders o ON o.order_id = i.order_id
+ORDER BY i.order_id"""
+
+
+#: One row per order item, as a warehouse would build it. An order's payments are summed per
+#: order and so repeat on each of its items: the trap wide tables set for SUM.
+WIDE_SALES_SQL = """CREATE OR REPLACE TABLE dws_sales_wide AS SELECT
+    i.order_id, i.product_id, i.seller_id, o.customer_id,
+    o.order_date, o.status, c.customer_name, c.region,
+    p.product_name, p.category, s.seller_name,
+    i.price, pay.payment_value
+FROM t_lattice_order_items i
+JOIN t_lattice_orders o ON o.order_id = i.order_id
+LEFT JOIN t_lattice_customers c ON c.customer_id = o.customer_id
+LEFT JOIN t_lattice_products p ON p.product_id = i.product_id
+LEFT JOIN t_lattice_sellers s ON s.seller_id = i.seller_id
+LEFT JOIN (SELECT order_id, sum(payment_value) AS payment_value FROM t_lattice_payments GROUP BY order_id) pay ON pay.order_id = i.order_id
 ORDER BY i.order_id"""
 
 
@@ -145,6 +188,17 @@ class QueryStore:
             ).fetchone()[0]
             if not has_store_sales:
                 con.execute(STORE_SALES_SQL)
+            has_wide = con.execute(
+                "SELECT count(*) FROM information_schema.tables WHERE table_name='dws_sales_wide'"
+            ).fetchone()[0]
+            if not has_wide:
+                con.execute(WIDE_SALES_SQL)
+            has_verify = con.execute(
+                "SELECT count(*) FROM information_schema.tables WHERE table_name='lattice_verify_wide'"
+            ).fetchone()[0]
+            if not has_verify:
+                for statement in VERIFY_SQL:
+                    con.execute(statement)
         with sqlite3.connect(self.history_db) as con:
             con.execute(
                 "CREATE TABLE IF NOT EXISTS query_history(id TEXT PRIMARY KEY, created_at TEXT, result TEXT)"
@@ -231,7 +285,7 @@ class QueryStore:
                 raise ValueError(
                     "只允许读取本地示例业务表，不允许文件、外部数据或跨库访问。"
                 )
-            if table.name not in TABLES and table.name not in ctes:
+            if table.name not in TABLES and table.name not in VERIFY_TABLES and table.name not in ctes:
                 raise ValueError(f"未知或禁止访问的数据表：{table.name}")
         # Table-valued functions may occur outside a Table node (e.g. UNNEST).
         for node in tree.walk():

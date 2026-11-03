@@ -231,8 +231,9 @@ SYSTEM_PROMPT = """你是企业数据平台的 SQL 分析助手。根据用户�
 6. 多表关联：只按业务上的主外键关联，每个 JOIN 都要有 ON 条件；用 JOIN 前先想清楚关系是一对一、多对一还是一对多。
 7. 防止重复累计：一对多关联后，一的一侧的行会重复，SUM、AVG、COUNT 会偏大。把多个事实表合在一起时，先分别按维度聚合成子查询或 CTE，再关联合并；只有 COUNT(DISTINCT 主键) 可以直接跨一对多关联。
 8. 给出了“已知的表关联”时，关联这些表必须使用其中的字段，不要按字段名猜测其他关联；禁止 SELECT *；聚合查询必须写全 GROUP BY。
-9. 不要自造业务口径：用户说的概念在表结构和业务语义中找不到对应字段或取值时，不要用相近字段近似。筛选值要用数据中实际存在的取值，不确定时不要用 LIKE 模糊匹配。
-10. 输出 JSON 对象，字段：title（中文标题）、sql、steps（字符串数组）、dimension（维度列别名或空字符串）、metric（指标列别名或空字符串）、chart_type（bar/line/pie/table）。"""
+9. 宽表优先：一张宽表就能回答时不要再关联其他表。宽表每行通常是最细的明细，订单金额这类上层度量会在多行上重复；看到“重复度量”提示时，必须先按键去重再汇总；统计订单数等要用 COUNT(DISTINCT 键)，不要用 COUNT(*)。
+10. 不要自造业务口径：用户说的概念在表结构和业务语义中找不到对应字段或取值时，不要用相近字段近似。筛选值要用数据中实际存在的取值，不确定时不要用 LIKE 模糊匹配。
+11. 输出 JSON 对象，字段：title（中文标题）、sql、steps（字符串数组）、dimension（维度列别名或空字符串）、metric（指标列别名或空字符串）、chart_type（bar/line/pie/table）。"""
 
 OUTPUT_SCHEMA = {
     "type": "object",
@@ -554,14 +555,15 @@ def extract_json(text: str) -> dict[str, Any]:
     if text.startswith("```"):
         text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
         text = re.sub(r"\n?```$", "", text)
+    # strict=False: models often write a multi-line SQL string with raw line breaks.
     try:
-        data = json.loads(text)
+        data = json.loads(text, strict=False)
     except ValueError:
         match = re.search(r"\{.*\}", text, flags=re.DOTALL)
         if not match:
             raise LlmError("模型没有返回 JSON 结果。")
         try:
-            data = json.loads(match.group(0))
+            data = json.loads(match.group(0), strict=False)
         except ValueError as error:
             raise LlmError("模型返回的 JSON 无法解析。") from error
     if not isinstance(data, dict):
@@ -608,6 +610,23 @@ def openai_failure(status_code: int, body: str, model: str, base_url: str, api_k
     if status_code >= 500:
         return LlmError(f"模型服务内部错误（HTTP {status_code}），请检查服务端日志{suffix}")
     return LlmError(f"模型接口错误（HTTP {status_code}）{suffix}")
+
+
+def retrying(call: Any) -> Any:
+    """Call a model again after a failure that says nothing about the request.
+
+    Seen in practice: JSON with a stray quote after an array, and a TLS connection dropped mid
+    handshake. Both go away on the next call, while a wrong key or model does not, so those
+    are reported at once.
+    """
+    for pause in (1, 3):
+        try:
+            return call()
+        except LlmError as error:
+            if not any(mark in str(error) for mark in ("JSON", "无法连接", "超时", "内部错误")):
+                raise
+            time.sleep(pause)
+    return call()
 
 
 class SqlGenerator:

@@ -22,6 +22,7 @@ reasoning, ``sql`` carries the statement, ``result`` the executed payload.
 from __future__ import annotations
 
 import datetime as dt
+import re
 import time
 import uuid
 from typing import Any, Callable, Iterator
@@ -32,7 +33,7 @@ from sqlglot import exp
 
 from .connectors import CONNECTORS, DIALECT_LABELS, ConnectorError, chart_hint, guard_sql, referenced_tables
 from .datasources import DataSourceError, DataSourceRegistry
-from .llm import LlmError, LlmSettings, SqlGenerator
+from .llm import LlmError, LlmSettings, SqlGenerator, retrying
 from .query import QueryStore
 from .observability import observe
 from .query_cache import QueryCache
@@ -44,6 +45,7 @@ from .schema_linking import (
     TEXT_TYPE,
     TOP_K,
     KEY_COLUMN,
+    NUMERIC_TYPE,
     JoinEdge,
     QuestionScope,
     SchemaLink,
@@ -51,11 +53,14 @@ from .schema_linking import (
     edges_from_foreign_keys,
     join_candidates,
     link_schema,
+    measure_is_explicit,
+    measure_term,
     render_link,
     table_menu,
 )
-from .semantic_planner import Plan, catalog_text, plan_locally, plan_with_model
-from .semantic_query import SemanticQueryError, source_tables
+from .table_profile import KEY_LIKE, TableProfile, profile_table, self_check
+from .semantic_planner import Plan, catalog_text, metric_named_in, plan_locally, plan_with_model
+from .semantic_query import Compiler, SemanticQueryError, parse_model, source_tables
 from .sql_audit import AuditReport, audit_sql, duplicate_key_probe_sql, parse_schema_context, value_probe_sql
 
 LOCAL_SAMPLE = "local-sample"
@@ -83,7 +88,8 @@ JOIN_MATCH_RATIO = 0.95
 MAX_ENUM_COLUMNS = 15
 MAX_ENUM_VALUES = 30
 PICK_TABLES_SYSTEM = (
-    "你负责为数据问题挑选需要用到的表。根据表名、注释和字段判断，只选回答问题必需的表，包括用于筛选、分组和关联的表，"
+    "你负责为数据问题挑选需要用到的表。根据表名、注释和字段判断，只选回答问题必需的表，包括用于筛选、分组和关联的表。"
+    "如果一张宽表（字段很多、已带维度，名称常含 wide、dws、ads）就能回答，只选这张宽表。"
     '不要超过 8 张。输出 JSON：{"tables": ["表名"]}。'
 )
 PICK_TABLES_SCHEMA = {
@@ -92,6 +98,173 @@ PICK_TABLES_SCHEMA = {
     "required": ["tables"],
     "additionalProperties": False,
 }
+
+
+MAX_MEASURE_OPTIONS = 8
+#: Stands in for a table when a word was settled as a semantic model's metric.
+METRIC_TERM = "@metric"
+
+
+def detail_statement(sql: str, wide: TableInfo, details: list[TableInfo], edges: list[JoinEdge], dialect: str) -> str | None:
+    """Restate a simple wide-table query over its base tables, or None if it is not simple.
+
+    What it can restate: grouped columns, plain aggregates of columns, equality filters, reading
+    the wide table directly or through one SELECT DISTINCT. The statement comes from the same
+    compiler as the semantic layer, so joins take the same route and the same fan-out rules hold.
+    """
+    try:
+        tree = sqlglot.parse_one(sql, read=dialect)
+    except sqlglot.errors.SqlglotError:
+        try:
+            tree = sqlglot.parse_one(sql, read="duckdb")
+        except sqlglot.errors.SqlglotError:
+            return None
+    if not isinstance(tree, exp.Select):
+        return None
+
+    def from_of(select: exp.Select) -> exp.Expression | None:
+        clause = select.args.get("from_") or select.args.get("from")
+        return clause.this if clause else None
+
+    selects = [tree]
+    ctes = {cte.alias_or_name: cte.this for cte in tree.find_all(exp.CTE)}
+    source = from_of(tree)
+    if isinstance(source, exp.Table) and source.name in ctes:
+        source = ctes[source.name]
+    elif isinstance(source, exp.Subquery):
+        source = source.this
+    if isinstance(source, exp.Select):
+        if source.args.get("joins") or source.args.get("group") or len(ctes) > 1:
+            return None
+        selects.append(source)
+        source = from_of(source)
+    if not isinstance(source, exp.Table) or source.name.lower() != wide.name.lower() or tree.args.get("joins") or tree.args.get("having"):
+        return None
+
+    def strip(node: exp.Expression) -> exp.Expression:
+        node = node.unalias()
+        while isinstance(node, (exp.Round, exp.Cast, exp.Paren)) or (isinstance(node, exp.Coalesce) and not node.expressions[1:]):
+            node = node.this
+        if isinstance(node, exp.Coalesce):
+            node = node.this
+        return node
+
+    # order_id sits on orders, items and payments, and counting it on payments would count only
+    # the paid orders. A column belongs to the table the join graph says it identifies; a column
+    # on several tables with no such owner cannot be placed, so this query is not restated.
+    holders: dict[str, list[TableInfo]] = {}
+    for table in details:
+        for column in table.columns:
+            holders.setdefault(column["name"].lower(), []).append(table)
+    owners = {column.lower(): edge.one_table.lower() for edge in edges for column in edge.one_columns}
+    columns_of: dict[str, TableInfo] = {}
+    for name, tables in holders.items():
+        owned = [table for table in tables if table.name.lower() == owners.get(name) or [part.lower() for part in table.primary_key] == [name]]
+        if len(tables) == 1 or len(owned) == 1:
+            columns_of[name] = tables[0] if len(tables) == 1 else owned[0]
+    metrics, dimensions = [], []
+    for item in tree.selects:
+        node = strip(item)
+        if isinstance(node, exp.Column):
+            dimensions.append(node.name)
+            continue
+        if isinstance(node, exp.Count) and isinstance(node.this, exp.Distinct) and len(node.this.expressions) == 1 and isinstance(node.this.expressions[0], exp.Column):
+            function, column = "COUNT(DISTINCT {})", node.this.expressions[0].name
+        elif isinstance(node, (exp.Sum, exp.Avg, exp.Min, exp.Max)) and isinstance(node.this, exp.Column):
+            function, column = f"{node.sql_name()}({{}})", node.this.name
+        else:
+            return None
+        metrics.append((item.alias_or_name, function, column))
+    if not metrics:
+        return None
+    filters = []
+    for select in selects:
+        where = select.args.get("where")
+        if where is None:
+            continue
+        terms = [where.this]
+        while terms:
+            term = terms.pop()
+            if isinstance(term, exp.And):
+                terms += [term.left, term.right]
+            elif isinstance(term, exp.EQ) and isinstance(term.left, exp.Column) and isinstance(term.right, exp.Literal):
+                filters.append({"field": term.left.name, "op": "=", "value": term.right.this})
+            else:
+                return None
+    if any(name.lower() not in columns_of for name in [*dimensions, *(column for _, _, column in metrics), *(item["field"] for item in filters)]):
+        return None
+
+    def reference(name: str) -> str:
+        return f"{columns_of[name.lower()].name}.{name}"
+
+    document = {
+        "name": "lattice_detail_path",
+        "datasets": [
+            {
+                "name": table.name,
+                "source": table.qualified,
+                "primary_key": table.primary_key or [edge.one_columns[0] for edge in edges if edge.one_table.lower() == table.name.lower()][:1],
+                "fields": [{"name": column["name"], "datatype": "", "expression": column["name"]} for column in table.columns],
+            }
+            for table in details
+        ],
+        "relationships": [
+            {"name": f"r{index}", "from": edge.many_table, "to": edge.one_table, "from_columns": edge.many_columns, "to_columns": edge.one_columns}
+            for index, edge in enumerate(edges)
+            if {edge.many_table.lower(), edge.one_table.lower()} <= {table.name.lower() for table in details}
+        ],
+        "metrics": [{"name": f"m{index}", "expression": function.format(reference(column))} for index, (_, function, column) in enumerate(metrics)],
+    }
+    try:
+        model = parse_model(document)
+        compiled = Compiler(model, dialect).compile({
+            "metrics": [f"m{index}" for index in range(len(metrics))],
+            "dimensions": [{"field": reference(name)} for name in dimensions],
+            "filters": [{**item, "field": reference(item["field"])} for item in filters],
+        }, ordered=False)
+    except SemanticQueryError:
+        return None
+    return compiled.sql
+
+
+def compare_results(first: dict[str, Any], second: dict[str, Any]) -> str | None:
+    """How two answers to one question differ: "" if not at all, None if they cannot be compared.
+
+    Rows are matched on their text values, and numbers by value in order, because the two
+    queries were written separately and need not name or order their columns alike.
+    """
+    def number(value: Any) -> float | None:
+        # Some drivers hand decimals back as text (Hive does), so the value decides, not its type.
+        if isinstance(value, bool) or value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        return float(value) if isinstance(value, str) and re.fullmatch(r"-?\d+(\.\d+)?", value) else None
+
+    def split(result: dict[str, Any]) -> dict[tuple[str, ...], list[float]] | None:
+        table: dict[tuple[str, ...], list[float]] = {}
+        for row in result["rows"]:
+            labels = tuple(str(value)[:10] for value in row if number(value) is None)
+            if labels in table:
+                return None
+            table[labels] = sorted(number(value) for value in row if number(value) is not None)
+        return table
+
+    if first.get("truncated") or second.get("truncated"):
+        return None
+    ours, theirs = split(first), split(second)
+    if ours is None or theirs is None:
+        return None
+    if len(ours) != len(theirs) or set(ours) != set(theirs):
+        missing = sorted(set(ours) ^ set(theirs))[:3]
+        return f"分组不同（{missing}）"
+    for labels, values in ours.items():
+        if len(values) != len(theirs[labels]):
+            return None
+        for mine, other in zip(values, theirs[labels]):
+            if abs(mine - other) > max(0.01, abs(other) * 1e-9):
+                return f"{'、'.join(labels) or '合计'}：宽表 {mine:,.2f}，明细 {other:,.2f}"
+    return ""
 
 
 class QueryError(ValueError):
@@ -128,6 +301,7 @@ class QueryService:
         self.memory = QuestionMemory(store.history_db)
         self.scope = QuestionScope(store.history_db.parent / "question-scope.json")
         self._schema_index: dict[str, tuple[float, list[TableInfo], list[JoinEdge], bool]] = {}
+        self._wide_profiles: dict[str, dict[str, tuple[float, TableProfile]]] = {}
 
     # ----- execution ---------------------------------------------------------------
     def _record(self, source_id: str | None) -> dict[str, Any]:
@@ -261,6 +435,8 @@ class QueryService:
         source = source_id or LOCAL_SAMPLE
         try:
             for name, data in self._answer(question, sql, source_id, refresh):
+                if name == "clarify":
+                    self.memory.log(source, text, "clarify", detail="、".join(item["term"] for item in data["terms"]))
                 if name == "result":
                     self.memory.log(
                         source, text, "answered", provider=data.get("provider", ""), planner=(data.get("semantic") or {}).get("planner") or "",
@@ -304,7 +480,10 @@ class QueryService:
                     if answered:
                         return
                 link = self._linked_schema(record, question)
-                schema_text = render_link(link, self._enum_values(record, link)) if link else self._schema_context(record)
+                if link is None and self._scope_is_set(record):
+                    # The plain listing knows nothing of the scope, so it must not stand in.
+                    raise QueryError(422, "问数范围内没有可以回答这个问题的表，没有向模型发送任何表结构。请检查「问数范围」的设置。")
+                schema_text = render_link(link, self._enum_values(record, link), self._repeats_of(record, link)) if link else self._schema_context(record)
                 if link:
                     schema_text = self._annotate(record, schema_text)
                     if link.seeds:
@@ -313,12 +492,19 @@ class QueryService:
                         yield "step", {"text": f"读取到 {len(link.edges)} 条已知的表关联，作为关联路径的约束。"}
                 if context:
                     schema_text = f"{schema_text}\n\n已定义的业务口径，涉及这些指标时必须按此计算：\n{context}"
+                terms = [term for term in self.memory.terms_in(record["id"], question) if term["table"] != METRIC_TERM]
+                if terms:
+                    schema_text += "\n\n口径词典（已由人工确认，这些词必须按此计算）：\n" + "\n".join(f"- {term['term']}：{term['table']}.{term['column']}" for term in terms)
+                    yield "step", {"text": "按口径词典理解：" + "、".join(f"{term['term']} = {term['table']}.{term['column']}" for term in terms) + "。"}
                 examples = self.memory.examples(record["id"], question, "sql")
                 if examples:
                     schema_text += "\n\n已由人工确认的相似问答，业务口径应与之保持一致：\n" + "\n".join(f"- 问题：{item['question']}\n  SQL：{item['definition']['sql']}" for item in examples)
                     yield "step", {"text": f"参考 {len(examples)} 条人工确认过的相似问答。"}
-                outcome = yield from self._generate_checked(record, question, dialect, dialect_label, label, schema_text, refresh)
+                outcome = yield from self._generate_checked(record, question, dialect, dialect_label, label, schema_text, refresh, terms, None if context else link)
+                if outcome is None:
+                    return  # The person has to say what a word means first.
                 plan, result, repaired, audit = outcome
+                second = (yield from self._second_path(record, question, plan, result, link, dialect, dialect_label, label, schema_text)) if link else None
             except LlmError as error:
                 # A question the semantic layer already set aside must not fall through to
                 # the keyword rules, which would answer 月度环比 as plain monthly sales.
@@ -338,7 +524,18 @@ class QueryService:
                 yield "step", {"text": steps[-1]}
                 steps.append(f"执行只读 SQL，返回 {len(result['rows'])} 行" + ("（已截断）。" if result.get("truncated") else "。"))
                 chart = {"dimension": plan["dimension"], "metric": plan["metric"], "type": plan["chart_type"]}
-                extra = {"verification": self._verification_of(audit), "question": question}
+                verification = self._verification_of(audit)
+                if terms:
+                    # What a person already settled is not put back to them as an open question.
+                    settled = {term["column"].lower() for term in terms}
+                    verification["checks"] = [check for check in verification["checks"] if not (check["name"] == "模型选用的度量" and all(any(column in measure.lower() for column in settled) for measure in audit.measures))]
+                    verification["checks"].insert(0, {"name": "口径词典", "status": "passed", "detail": "、".join(f"{term['term']} = {term['table']}.{term['column']}" for term in terms) + "（已由人工确认）。"})
+                if second:
+                    own = second.pop("self_checks", [])
+                    verification["checks"].extend([second, *own])
+                    if any(check["status"] == "skipped" for check in [second, *own]):
+                        verification["status"] = "skipped"
+                extra = {"verification": verification, "question": question}
                 yield "result", self.payload(record, plan["title"], result, "llm", steps, chart, started, extra=extra)
                 return
         try:
@@ -380,17 +577,31 @@ class QueryService:
             model = next((item for item in models if item.id == definition.get("model_id")), None)
             if model is not None and model.fingerprint() == definition.get("fingerprint"):
                 plan = Plan("ok", request=definition["request"], title=pinned["title"], planner="verified", steps=["这个问题的映射已由人工确认，直接使用。"])
-                yield from self._run_plan(record, model, plan, question, refresh)
+                yield from self._run_routed(record, [(model, plan)], [], models, question, refresh)
                 return True
             yield "step", {"text": "这个问题确认时使用的口径定义已经变化，确认不再生效，重新解读。"}
+        settled_metrics = {term["term"]: term["column"] for term in self.memory.terms(record["id"]) if term["table"] == METRIC_TERM}
         attempts: list[tuple[Any, dict[str, list[str]], Plan]] = []
+        planned: list[tuple[Any, Plan]] = []
+        refusal: QueryError | None = None
         for model in models:
             values = {key: options for key, options in self.semantic.dimension_values(model, record).items() if self._field_in_scope(record, model, key)}
-            plan = plan_locally(question, model, values)
-            if plan.status == "ok":
-                yield from self._run_plan(record, model, plan, question, refresh)
-                return True
+            plan = plan_locally(question, model, values, settled_metrics)
             attempts.append((model, values, plan))
+            if plan.status != "ok":
+                continue
+            try:
+                self.semantic.compile(model.id, plan.request, record["id"])
+            except SemanticQueryError as error:
+                # This model cannot compute it; one with the right tables may still.
+                refusal = refusal or QueryError(error.status_code, str(error))
+                continue
+            planned.append((model, plan))
+        if planned:
+            yield from self._run_routed(record, planned, attempts, models, question, refresh)
+            return True
+        if refusal is not None:
+            raise refusal
         # Words that need interpreting go to the model most of the question matched.
         # With no word matched anywhere, the richest model is the one most likely to define it.
         model, values, local = max(attempts, key=lambda item: (item[2].score, len(item[0].metrics)))
@@ -414,7 +625,16 @@ class QueryService:
                 f"模型不可用（{error}），而规则无法解读这个问题：{local.reason}语义模型 {model.name} 现有指标：{supported}。",
             ) from error
         if plan.status == "ok":
-            yield from self._run_plan(record, model, plan, question, refresh)
+            # The model read a word as a metric the question does not name. That reading is a
+            # guess about the business until someone says so: 订单金额 is not obviously 销售总额.
+            guessed = [name for name in plan.request.get("metrics") or [] if not metric_named_in(question, model.metrics[name]) and name not in settled_metrics.values()]
+            if guessed and len(model.metrics) > 1:
+                yield "clarify", {"question": question, "datasource_id": record["id"], "terms": [{"term": measure_term(question), "options": [
+                    {"table": METRIC_TERM, "column": metric.name, "comment": metric.description}
+                    for metric in sorted(model.metrics.values(), key=lambda item: item.name not in guessed)[:MAX_MEASURE_OPTIONS]
+                ]}]}
+                return True
+            yield from self._run_routed(record, [(model, plan)], attempts, models, question, refresh)
             return True
         if plan.status == "unmapped":
             raise QueryError(422, f"无法按已定义的口径回答：{plan.reason} 语义模型 {model.name} 现有指标：{supported}。没有猜测口径，请先在语义模型中定义它。")
@@ -452,8 +672,50 @@ class QueryService:
             if not self._field_in_scope(record, model, target):
                 raise QueryError(403, f"字段 {target} 不在智能问数允许访问的范围内。")
 
-    def _run_plan(self, record: dict[str, Any], model: Any, plan: Plan, question: str, refresh: bool) -> Iterator[tuple[str, Any]]:
+    def _run_routed(
+        self, record: dict[str, Any], planned: list[tuple[Any, Plan]], attempts: list[tuple[Any, dict[str, list[str]], Plan]],
+        models: list[Any], question: str, refresh: bool,
+    ) -> Iterator[tuple[str, Any]]:
+        """Answer from the first model that can, checking a wide table against the detail.
+
+        The detail tables are what a wide table is built from, so when the two disagree the
+        detail wins and the reader is told, rather than the faster number being shown as fact.
+        """
+        model, plan = planned[0]
+        note = ""
+        checks: list[dict[str, Any]] = []
+        # The wide table the question came closest to, not just the first single-table model.
+        skipped_wide = max((item for item in attempts if item[0].is_wide and item[0] is not model), key=lambda item: item[2].score, default=None)
+        if skipped_wide is not None and not model.is_wide:
+            reason = skipped_wide[2].reason or "它无法计算这个问题。"
+            note = f"优先查询宽表 {skipped_wide[0].name}，但{reason}改用明细表计算。"
+        if model.is_wide:
+            found = False
+            for detail in (item for item in models if not item.is_wide):
+                # Asking for fresh data covers what the answer is compared against too.
+                check = self.semantic.cross_check(model, plan.request, detail, record, refresh)
+                if check is None:
+                    continue
+                found = True
+                differs = check.pop("differs", False)
+                checks.append(check)
+                if differs:
+                    translated = self.semantic.translate_request(plan.request, model, detail)
+                    note = f"宽表 {model.name} 与明细不一致，已改用明细表关联计算。"
+                    model, plan = detail, Plan("ok", request={**plan.request, **translated}, title=plan.title, steps=plan.steps, planner=plan.planner)
+                break
+            if not found:
+                checks.append({"name": "宽表与明细核对", "status": "info", "detail": "没有能表达这个问题的明细模型，这个结果只来自宽表，以下自检不等于和第二来源核对过。"})
+                checks.extend(self.semantic.wide_self_check(model, record, refresh))
+        yield from self._run_plan(record, model, plan, question, refresh, extra_checks=checks, route_note=note)
+
+    def _run_plan(
+        self, record: dict[str, Any], model: Any, plan: Plan, question: str, refresh: bool,
+        extra_checks: list[dict[str, Any]] | None = None, route_note: str = "",
+    ) -> Iterator[tuple[str, Any]]:
         self._check_plan_scope(record, model, plan.request)
+        if route_note:
+            yield "step", {"text": route_note}
         for step in plan.steps:
             yield "step", {"text": step}
         try:
@@ -462,6 +724,7 @@ class QueryService:
             yield "result", self.semantic.query(
                 model.id, plan.request, datasource_id=record["id"], refresh=refresh,
                 title=plan.title, steps=plan.steps, planner=plan.planner, question=question,
+                extra_checks=extra_checks, route_note=route_note,
             )
         except SemanticQueryError as error:
             raise QueryError(error.status_code, str(error)) from error
@@ -549,6 +812,9 @@ class QueryService:
                 continue
         return edges
 
+    def _scope_is_set(self, record: dict[str, Any]) -> bool:
+        return any(self.scope.get(record["id"]).values())
+
     def _linked_schema(self, record: dict[str, Any], question: str) -> SchemaLink | None:
         """The part of the schema this question is about; None falls back to the plain listing."""
         try:
@@ -570,10 +836,62 @@ class QueryService:
             return []
         prompt = f"数据库中的表：\n{table_menu(tables)}\n\n用户问题：{question[:2000]}"
         try:
-            picked = self.generator.complete_json(prompt, system=PICK_TABLES_SYSTEM, schema=PICK_TABLES_SCHEMA).get("tables")
+            picked = retrying(lambda: self.generator.complete_json(prompt, system=PICK_TABLES_SYSTEM, schema=PICK_TABLES_SCHEMA)).get("tables")
         except LlmError:
             return []  # Word matching and the full listing still work without it.
         return [str(name) for name in picked or []][:TOP_K] if isinstance(picked, list) else []
+
+    def _table_profile(self, record: dict[str, Any], table: TableInfo) -> TableProfile:
+        """What the data says about a wide table's grain, kept for a few minutes."""
+        cache = self._wide_profiles.setdefault(record["id"], {})
+        name = table.name.lower()
+        if name in cache and cache[name][0] > time.monotonic():
+            return cache[name][1]
+        source = exp.Table(this=exp.to_identifier(table.name, quoted=True), db=exp.to_identifier(table.schema, quoted=True) if table.schema else None)
+        kinds = {column["name"]: str(column.get("type") or "") for column in table.columns}
+        profile = profile_table(lambda statement: self.execute(record, statement)["rows"], source, list(kinds), CONNECTORS[record["type"]].dialect, kinds=kinds)
+        cache[name] = (time.monotonic() + SCHEMA_INDEX_SECONDS, profile)
+        return profile
+
+    def _wide_self_check(self, record: dict[str, Any], table: TableInfo) -> list[dict[str, str]]:
+        source = exp.Table(this=exp.to_identifier(table.name, quoted=True), db=exp.to_identifier(table.schema, quoted=True) if table.schema else None)
+        columns = [(column["name"], str(column.get("type") or "")) for column in table.columns]
+        return self_check(lambda statement: self.execute(record, statement)["rows"], source, columns, CONNECTORS[record["type"]].dialect, primary_key=table.primary_key or None)
+
+    def _numeric_findings(self, table: TableInfo, findings: dict[str, list[tuple[str, ...]]]) -> dict[str, str]:
+        numeric = {column["name"] for column in table.columns if NUMERIC_TYPE.search(str(column.get("type") or "")) and not KEY_LIKE.search(column["name"])}
+        return {column.lower(): " 或 ".join(", ".join(key) for key in keys) for column, keys in findings.items() if column in numeric}
+
+    def _repeated_measures(self, record: dict[str, Any], table: TableInfo) -> dict[str, str]:
+        """Numeric columns that describe a key rather than a row: SUM would count them per row."""
+        return self._numeric_findings(table, self._table_profile(record, table).constant)
+
+    def _declared_measures(self, record: dict[str, Any], table: str) -> dict[str, str]:
+        """Numeric fields a semantic model says belong to a key, for this physical table."""
+        if self.semantic is None:
+            return {}
+        declared: dict[str, str] = {}
+        try:
+            models = self.semantic.models_for(record)
+        except Exception:  # noqa: BLE001 - data profiling still applies
+            return {}
+        for model in models:
+            for dataset in model.datasets.values():
+                if source_tables(dataset.source) != [table.lower()]:
+                    continue
+                for item in dataset.fields.values():
+                    if item.grain and item.datatype in {"Decimal", "Float", "Integer"}:
+                        declared[item.name.lower()] = ", ".join(item.grain)
+        return declared
+
+    def _uncertain_measures(self, record: dict[str, Any], table: TableInfo) -> dict[str, str]:
+        profile = self._table_profile(record, table)
+        # Constant within several keys is as unsettled as thin evidence: which one is a choice.
+        several = {column: keys for column, keys in profile.constant.items() if len(keys) > 1}
+        return self._numeric_findings(table, {**profile.uncertain, **several})
+
+    def _repeats_of(self, record: dict[str, Any], link: SchemaLink) -> dict[str, dict[str, str]]:
+        return {table.qualified: self._repeated_measures(record, table) for table in link.tables if table.is_wide}
 
     def _enum_values(self, record: dict[str, Any], link: SchemaLink) -> dict[str, list[str]]:
         """Real values of text columns with few of them, so 华东 finds the column that holds it."""
@@ -616,22 +934,120 @@ class QueryService:
 
         known: dict[str, set[str]] | None = None
         edges: list[JoinEdge] = []
+        tables: list[TableInfo] = []
+        indexed = False
         try:
             tables, edges, complete = self._index_schema(record)
+            indexed = True
             if complete and all(table.columns for table in tables):
                 known = {table.name.lower(): {column["name"].lower() for column in table.columns} for table in tables}
         except (DataSourceError, ConnectorError):
             pass
         source = record["id"]
+        by_name = {table.name.lower(): table for table in tables} if indexed else {}
+
+        def repeated(table: str) -> dict[str, str]:
+            info = by_name.get(table.lower())
+            found = self._repeated_measures(record, info) if info is not None and info.is_wide else {}
+            # What a semantic model declares counts for free SQL too, and is stronger than data.
+            return {**found, **self._declared_measures(record, table)}
+
+        def uncertain(table: str) -> dict[str, str]:
+            info = by_name.get(table.lower())
+            return self._uncertain_measures(record, info) if info is not None and info.is_wide else {}
+
+        def unreadable(table: str) -> bool:
+            info = by_name.get(table.lower())
+            return info is not None and info.is_wide and self._table_profile(record, info).failed
+
         return audit_sql(
-            sql, dialect, known, probe, edges=edges, value_probe=value_probe,
+            sql, dialect, known, probe, edges=edges, value_probe=value_probe, repeated_measures=repeated, uncertain_measures=uncertain, unprofiled=unreadable,
             table_allowed=lambda table: self.scope.table_allowed(source, table),
             column_allowed=lambda table, column: self.scope.column_allowed(source, table, column),
             hides_columns=lambda table: self.scope.hides_columns_of(source, table),
         )
 
+    def _unsettled_measures(self, question: str, audit: AuditReport, link: SchemaLink | None, terms: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """A question to ask if this statement chose a measure the question does not name.
+
+        销售额 may be a price or an order amount, both statements run and both look right, so no
+        check on the SQL can tell. This does not ask a model whether there is ambiguity, since
+        that would only move the guess: every measure used has to be named by the question's own
+        words or settled in the dictionary, and otherwise the person who asked decides.
+        """
+        if link is None:
+            return []
+        measures: dict[str, tuple[TableInfo, dict[str, Any]]] = {}
+        # A column of the same name in a wide table and its source is one measure, not a choice.
+        for table in sorted(link.tables, key=lambda item: not item.is_wide):
+            for column in table.columns:
+                if NUMERIC_TYPE.search(str(column.get("type") or "")) and not KEY_LIKE.search(column["name"]):
+                    measures.setdefault(column["name"].lower(), (table, column))
+        if len(measures) < 2:
+            return []  # One measure on offer is no choice at all.
+        bound = {term["column"].lower() for term in terms}
+        unsettled = [
+            name for name in sorted(audit.measure_names)
+            if name in measures and name not in bound and not measure_is_explicit(question, measures[name][1]["name"], str(measures[name][1].get("comment") or ""))
+        ]
+        if not unsettled:
+            return []
+        return [{"term": measure_term(question), "options": [
+            {"table": table.name, "column": column["name"], "comment": str(column.get("comment") or "")}
+            for table, column in list(measures.values())[:MAX_MEASURE_OPTIONS]
+        ]}]
+
+    def _second_path(
+        self, record: dict[str, Any], question: str, plan: dict[str, Any], result: dict[str, Any], link: SchemaLink,
+        dialect: str, dialect_label: str, label: str, schema_text: str,
+    ) -> Iterator[tuple[str, Any]]:
+        """Compute a wide-table answer again from the tables it was built from, and compare.
+
+        The second statement comes from the compiler and the join graph, with no model involved,
+        so it cannot share the first statement's misunderstanding. Only when the first statement
+        is too elaborate to restate is a model asked, and the result says that is weaker evidence.
+        Two routes disagreeing cannot say which is right, so the reader is shown both.
+        """
+        wide = [table for table in link.tables if table.is_wide and table.name.lower() in plan["sql"].lower()]
+        # The whole schema, not the tables shown to the model: when a wide table answers, the
+        # model needed no detail tables, so the detail may not be among those it was shown.
+        everything, edges, _ = self._index_schema(record)
+        details = [table for table in everything if not table.is_wide and table.columns]
+        if not wide:
+            return None
+        if not details or not edges:
+            return {"name": "宽表与明细交叉验证", "status": "info", "detail": "数据源里没有能重新计算这个结果的明细表，这个结果只来自宽表，自检不等于和第二来源核对过。", "self_checks": self._wide_self_check(record, wide[0])}
+        statement = detail_statement(plan["sql"], wide[0], details, edges, dialect)
+        compiled = statement is not None
+        if statement is None:
+            names = "、".join(table.name for table in wide)
+            prompt = f"{question}\n\n不要使用宽表 {names}，只用明细表（{'、'.join(table.name for table in details[:TOP_K])}）按已知的表关联计算，输出的维度和指标顺序与宽表结果一致：{'、'.join(result['columns'])}。"
+            try:
+                other = retrying(lambda: self.generator.generate(prompt, dialect_label, label, schema_text))
+                statement = other["sql"]
+                if any(table.name.lower() in statement.lower() for table in wide):
+                    return {"name": "宽表与明细交叉验证", "status": "info", "detail": "这条查询无法由平台改写，模型也未能只用明细表写出第二条，没有做比较。"}
+                audit = self._audit(record, statement, dialect)
+                if audit.errors:
+                    return {"name": "宽表与明细交叉验证", "status": "info", "detail": "第二条查询未通过校验，没有做比较：" + "；".join(audit.errors)[:200]}
+            except (LlmError, DataSourceError, ConnectorError) as error:
+                return {"name": "宽表与明细交叉验证", "status": "info", "detail": f"第二条查询未能生成，没有做比较：{str(error)[:200]}"}
+        try:
+            again = self.execute(record, statement)
+        except QueryError as error:
+            return {"name": "宽表与明细交叉验证", "status": "info", "detail": f"第二条查询未能执行，没有做比较：{str(error)[:200]}"}
+        yield "step", {"text": "用明细表重新计算一遍，与宽表结果比较。"}
+        how = "由平台按连接图确定性生成明细查询" if compiled else "这条查询无法由平台改写，第二条也由模型生成，两条可能有相同的理解错误"
+        difference = compare_results(result, again)
+        if difference is None:
+            return {"name": "宽表与明细交叉验证", "status": "info", "detail": f"{how}；两条查询的结果结构不同，无法逐行比较。"}
+        if difference:
+            return {"name": "宽表与明细交叉验证", "status": "skipped", "detail": f"{how}，结果不一致：{difference}。可能是宽表尚未同步，或口径不同，请核对两边的 SQL。明细查询：{statement[:400]}"}
+        return {"name": "宽表与明细交叉验证", "status": "passed" if compiled else "info", "detail": f"{how}，{len(result['rows'])} 行结果全部一致。"}
+
     def _generate_checked(
-        self, record: dict[str, Any], question: str, dialect: str, dialect_label: str, label: str, schema_text: str, refresh: bool
+        self, record: dict[str, Any], question: str, dialect: str, dialect_label: str, label: str, schema_text: str, refresh: bool,
+        terms: list[dict[str, Any]] | None = None, link: SchemaLink | None = None,
     ) -> Iterator[tuple[str, Any]]:
         """Generate SQL, showing the model what was wrong until it holds up or the tries run out.
 
@@ -645,13 +1061,17 @@ class QueryService:
         required_filters: set[str] = set()
         reported_values: list[str] = []
         for attempt in range(MAX_CORRECTIONS + 1):
-            plan = self.generator.generate(prompt, dialect_label, label, schema_text)
+            plan = retrying(lambda: self.generator.generate(prompt, dialect_label, label, schema_text))
             audit = self._audit(record, plan["sql"], dialect)
             problems = list(audit.errors)
             dropped = sorted(required_filters - audit.filtered_columns)
             if dropped:
                 # "Fixing" a filter the data cannot satisfy by removing it answers another question.
                 problems.append(f"修正后的 SQL 不再按 {'、'.join(dropped)} 筛选，答的已经不是原来的问题。" + "；".join(reported_values)[:300])
+            for term in terms or []:
+                # A confirmed meaning is not advice: the statement has to actually use it.
+                if not re.search(rf"\b{re.escape(term['column'])}\b", plan["sql"], re.IGNORECASE):
+                    problems.append(f"“{term['term']}”已确认为 {term['table']}.{term['column']}，SQL 中没有使用这个字段。")
             if audit.value_issues and not value_feedback_given:
                 problems += audit.value_issues
                 required_filters |= audit.value_columns
@@ -663,6 +1083,10 @@ class QueryService:
                 yield "step", {"text": "SQL 未通过校验，要求模型修正：" + "；".join(problems)[:300]}
                 prompt = self._correction(question, plan["sql"], problems)
                 continue
+            unsettled = self._unsettled_measures(question, audit, link, terms or [])
+            if unsettled:
+                yield "clarify", {"question": question, "datasource_id": record["id"], "terms": unsettled}
+                return None
             yield "sql", {"sql": plan["sql"], "title": plan["title"]}
             try:
                 result, repaired = self.run_generated(record, plan["sql"], dialect, dialect_label, refresh)
@@ -705,6 +1129,24 @@ class QueryService:
         yield "result", self.payload(record, pinned["title"], result, "llm", steps, None, started, extra={"verification": verification, "question": question})
         return True
 
+    def define_term(self, source_id: str, term: str, table: str, column: str) -> dict[str, Any]:
+        """Settle what a word means on this source, after checking the column is real and allowed."""
+        record = self._record(source_id)
+        if not str(term).strip():
+            raise QueryError(400, "请填写业务用语。")
+        if table == METRIC_TERM:
+            if self.semantic is None or not any(str(column) in model.metrics for model in self.semantic.models_for(record)):
+                raise QueryError(400, f"语义模型中没有指标 {column}。")
+            return self.memory.define_term(record["id"], str(term).strip(), METRIC_TERM, str(column))
+        try:
+            tables, _, _ = self._index_schema(record)
+        except (DataSourceError, ConnectorError) as error:
+            raise QueryError(400, f"读取表结构失败：{error}") from error
+        target = next((item for item in tables if item.name.lower() == str(table).lower()), None)
+        if target is None or not target.has(column):
+            raise QueryError(400, f"字段 {table}.{column} 不存在，或不在智能问数允许访问的范围内。")
+        return self.memory.define_term(record["id"], str(term).strip(), target.name, str(column))
+
     def confirm(self, result_id: str, created_by: str = "") -> dict[str, Any]:
         payload = self.store.find(result_id)
         if payload is None:
@@ -717,12 +1159,19 @@ class QueryService:
     def invalidate_schema(self, source_id: str | None = None) -> None:
         if source_id:
             self._schema_index.pop(source_id, None)
+            self._wide_profiles.pop(source_id, None)
         else:
             self._schema_index.clear()
+            self._wide_profiles.clear()
 
     @staticmethod
     def _verification_of(audit: AuditReport) -> dict[str, Any]:
-        checks = [{"name": "SQL 静态与关联键校验", "status": "passed", "detail": text} for text in audit.passed]
+        checks: list[dict[str, Any]] = []
+        if audit.measures:
+            # Without a semantic model nothing can say this is what the question meant, so a
+            # person has to be able to see it: 销售额 may be item_price or order_amount.
+            checks.append({"name": "模型选用的度量", "status": "info", "detail": "、".join(audit.measures) + "。平台无法判断这是否符合你的业务口径，请确认。"})
+        checks += [{"name": "SQL 静态与关联键校验", "status": "passed", "detail": text} for text in audit.passed]
         checks += [{"name": "未能完成的校验", "status": "skipped", "detail": text} for text in audit.warnings]
         return {"governed": False, "status": "skipped" if audit.warnings else "passed", "checks": checks}
 
@@ -830,6 +1279,8 @@ class QueryService:
         for name, data in self.answer(question, sql, source_id, refresh):
             if name == "result":
                 result = data
+            elif name == "clarify":
+                return {"needs_clarification": True, "clarification": data}
         if result is None:
             raise QueryError(500, "查询没有返回结果。")
         return result

@@ -59,7 +59,7 @@ def test_health_types_and_errors(client):
 
 def test_ingest_browse_sample_and_usage(client):
     run = ingest_sample(client)
-    assert run["summary"]["tables"] == 7
+    assert run["summary"]["tables"] == 13
     entity = client.get("/api/metadata/entity", params={"entity_type": "table", "ref": ORDERS, "view": True}).json()
     assert entity["column_count"] == 4 and entity["service"]["fqn"] == "local-sample"
     sample = client.get("/api/metadata/entity/sample", params={"ref": ORDERS, "limit": 2}).json()
@@ -69,11 +69,11 @@ def test_ingest_browse_sample_and_usage(client):
     assert usage["queries"] == 1 and usage["views"] == 1
     assert client.get("/api/metadata/entity/queries", params={"entity_type": "table", "ref": ORDERS}).json()["total"] == 1
     children = client.get("/api/metadata/entity/children", params={"entity_type": "databaseSchema", "ref": "local-sample.sample.main"}).json()
-    assert children["groups"][0]["total"] == 7
+    assert children["groups"][0]["total"] == 13
     database = next(item for item in client.get("/api/metadata/tree").json()["categories"] if item["id"] == "database")
     assert {service["fqn"] for service in database["services"]} == {"local-sample", "polaris"}
     services = {item["fqn"]: item for item in client.get("/api/metadata/ingestion/services").json()["items"]}
-    assert services["local-sample"]["last_run"]["status"] == "success" and services["local-sample"]["asset_count"] == 7
+    assert services["local-sample"]["last_run"]["status"] == "success" and services["local-sample"]["asset_count"] == 13
     assert client.get("/api/metadata/search", params={"q": "t_lattice_orders"}).json()["total"] == 1
 
 

@@ -333,6 +333,112 @@ def model_document(tables):
     }
 
 
+def wide_model_document(tables) -> dict | None:
+    """The demo sales definitions over the wide table, for the questions it can answer."""
+    table = next((item for item in tables if item["name"] == "dws_sales_wide"), None)
+    if table is None:
+        return None
+    types = {"INT": "Integer", "DATE": "Date", "DECIMAL": "Decimal"}
+    # What people call each column, and for an order's attributes the key they belong to:
+    # the columns without a grain differ from one item of an order to the next.
+    order = ["order_id"]
+    terms = {
+        "region": (["地区", "区域", "大区"], order, "客户所在地区"),
+        "customer_name": (["客户", "客户名称", "买家"], order, "客户名称"),
+        "category": (["类别", "商品类别", "品类", "分类", "商品分类"], [], "商品类别"),
+        "product_name": (["商品", "商品名称", "产品"], [], "商品名称"),
+        "seller_name": (["商家", "商家名称", "卖家", "店铺"], [], "商家名称"),
+        "status": (["状态", "订单状态"], order, "订单状态"),
+        "order_date": (["下单日期", "下单时间"], order, "下单日期，所有销售口径的统计日期"),
+        "payment_value": ([], order, "订单的支付金额，同一订单的每条明细上重复"),
+        "customer_id": ([], order, ""),
+    }
+
+    def field(column):
+        kind = next((value for key, value in types.items() if key in column["type"]), "String")
+        synonyms, grain, description = terms.get(column["name"], ([], [], ""))
+        # Copies, since one shared list would be written to YAML as an alias, which models refuse.
+        context = {key: list(value) for key, value in (("synonyms", synonyms), ("grain", grain)) if value}
+        extra = {"ai_context": context} if context else {}
+        if description:
+            extra["description"] = description
+        return {"name": column["name"], "datatype": kind, "expression": {"dialects": [{"dialect": "ANSI_SQL", "expression": column["name"]}]}, **extra}
+
+    def metric(name, expression, description, kind, synonyms, grain=None):
+        document = _demo_metric(name, expression, description, kind, synonyms)
+        document["ai_context"]["time_field"] = "sales_wide.order_date"
+        if grain:
+            document["ai_context"]["grain"] = list(grain)
+        return document
+
+    return {
+        "version": "0.2.0.dev0",
+        "semantic_model": [
+            {
+                "name": "lattice_demo_sales_wide",
+                "description": "Lattice 本地演示销售宽表模型，指标与 lattice_demo_sales 同名同义，数据不来自真实业务系统",
+                "datasets": [
+                    {
+                        "name": "sales_wide",
+                        "source": "local.main.dws_sales_wide",
+                        "description": table["label"],
+                        "primary_key": ["order_id", "product_id"],
+                        "fields": [field(column) for column in table["columns"]],
+                    }
+                ],
+                "metrics": [
+                    metric("total_sales", "SUM(sales_wide.price)", "销售总额：订单明细价格之和", "Decimal", ["销售额", "销售总额", "销售金额", "成交额", "gmv", "营业额"]),
+                    metric("order_count", "COUNT(DISTINCT sales_wide.order_id)", "订单数：去重订单编号", "Integer", ["订单量", "订单数", "单量", "订单数量"], order),
+                    metric("item_count", "COUNT(sales_wide.product_id)", "订单明细行数", "Integer", ["明细数", "明细行数", "销售件数", "商品件数"]),
+                    metric("avg_order_value", "ROUND(SUM(sales_wide.price) / COUNT(DISTINCT sales_wide.order_id), 2)", "客单价：销售总额 / 订单数", "Decimal", ["客单价", "平均订单金额", "平均客单价", "笔单价"]),
+                    metric("total_payment", "SUM(sales_wide.payment_value)", "支付总额：支付金额之和", "Decimal", ["支付额", "支付总额", "支付金额", "实付金额", "付款金额"]),
+                    metric("customer_count", "COUNT(DISTINCT sales_wide.customer_id)", "下单客户数：有订单的去重客户", "Integer", ["客户数", "下单客户数", "买家数", "客户数量"], order),
+                ],
+            }
+        ],
+    }
+
+
+def verification_model_documents() -> dict[str, dict]:
+    """Models over the one-to-many verification tables, reached only by their exact reference.
+
+    The wide one deliberately declares no grains: what it gets right, it gets from the data.
+    """
+    def fields(*items):
+        return [{"name": name, "datatype": kind, "expression": name} for name, kind in items]
+
+    def metric(name, expression, kind="Decimal"):
+        return {"name": name, "datatype": kind, "expression": expression}
+
+    return {
+        "builtin:verify-wide": {
+            "name": "lattice_verify_wide_model",
+            "datasets": [{
+                "name": "w",
+                "source": "local.main.lattice_verify_wide",
+                "primary_key": ["item_id"],
+                "fields": fields(("item_id", "Integer"), ("order_id", "Integer"), ("customer_id", "Integer"), ("region", "String"), ("status", "String"), ("order_date", "Date"), ("category", "String"), ("item_price", "Decimal"), ("order_amount", "Decimal")),
+            }],
+            "metrics": [metric("sales", "SUM(w.item_price)"), metric("amount", "SUM(w.order_amount)"), metric("orders", "COUNT(DISTINCT w.order_id)", "Integer")],
+        },
+        "builtin:verify-star": {
+            "name": "lattice_verify_star_model",
+            "datasets": [
+                {"name": "items", "source": "local.main.lattice_verify_items", "primary_key": ["item_id"], "fields": fields(("item_id", "Integer"), ("order_id", "Integer"), ("category", "String"), ("item_price", "Decimal"))},
+                {"name": "orders", "source": "local.main.lattice_verify_orders", "primary_key": ["order_id"], "fields": fields(("order_id", "Integer"), ("customer_id", "Integer"), ("status", "String"), ("order_date", "Date"), ("order_amount", "Decimal"))},
+                {"name": "payments", "source": "local.main.lattice_verify_payments", "primary_key": ["payment_id"], "fields": fields(("payment_id", "Integer"), ("order_id", "Integer"), ("payment_type", "String"), ("paid", "Decimal"))},
+                {"name": "customers", "source": "local.main.lattice_verify_customers", "primary_key": ["customer_id"], "fields": fields(("customer_id", "Integer"), ("region", "String"))},
+            ],
+            "relationships": [
+                {"name": "items_orders", "from": "items", "to": "orders", "from_columns": ["order_id"], "to_columns": ["order_id"]},
+                {"name": "payments_orders", "from": "payments", "to": "orders", "from_columns": ["order_id"], "to_columns": ["order_id"]},
+                {"name": "orders_customers", "from": "orders", "to": "customers", "from_columns": ["customer_id"], "to_columns": ["customer_id"]},
+            ],
+            "metrics": [metric("sales", "SUM(items.item_price)"), metric("amount", "SUM(orders.order_amount)"), metric("paid", "SUM(payments.paid)"), metric("orders", "COUNT(DISTINCT orders.order_id)", "Integer")],
+        },
+    }
+
+
 def _demo_metric(name: str, expression: str, description: str, datatype: str, synonyms: list[str]) -> dict:
     return {
         "name": name,
@@ -369,6 +475,8 @@ async def lifespan(app):
         semantic=app.state.semantic,
         queries=app.state.queries,
         builtin=lambda: model_document(app.state.store.metadata()),
+        builtin_wide=lambda: wide_model_document(app.state.store.metadata()),
+        hidden_models=verification_model_documents(),
     )
     app.state.queries.semantic = app.state.semantic_engine
     # The quality metadata lives in a real PostgreSQL database. An unreachable
@@ -777,6 +885,29 @@ def confirm_question(payload: ConfirmQuestionInput, request: Request):
 @app.post("/api/query/confirmed/{item_id}/delete")
 def delete_confirmed_question(item_id: str, payload: EmptyInput, request: Request):
     return {"deleted": request.app.state.queries.memory.delete(item_id)}
+
+
+class QuestionTermInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    datasource_id: str = Field(max_length=128)
+    term: str = Field(max_length=100)
+    table: str = Field(max_length=128)
+    column: str = Field(max_length=128)
+
+
+@app.get("/api/query/terms")
+def question_terms(request: Request, datasource_id: str | None = None):
+    return {"items": request.app.state.queries.memory.terms(datasource_id)}
+
+
+@app.post("/api/query/terms")
+def define_question_term(payload: QuestionTermInput, request: Request):
+    return guarded(request.app.state.queries.define_term, payload.datasource_id, payload.term, payload.table, payload.column)
+
+
+@app.post("/api/query/terms/{item_id}/delete")
+def delete_question_term(item_id: str, payload: EmptyInput, request: Request):
+    return {"deleted": request.app.state.queries.memory.delete_term(item_id)}
 
 
 @app.get("/api/query/log")

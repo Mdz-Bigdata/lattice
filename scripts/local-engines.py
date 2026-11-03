@@ -331,10 +331,10 @@ def sample_table_names() -> list[str]:
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
     try:
-        from webapi.query import TABLES  # noqa: WPS433 (project module)
+        from webapi.query import TABLES, VERIFY_TABLES  # noqa: WPS433 (project module)
     except ImportError as error:
         raise RuntimeError(f"无法导入 webapi.query（示例数据来源）：{error}") from error
-    return list(TABLES)
+    return [*TABLES, *VERIFY_TABLES]
 
 
 def sample_connection():

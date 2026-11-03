@@ -38,6 +38,9 @@ def client(tmp_path, monkeypatch):
         monkeypatch.delenv(name, raising=False)
     with TestClient(app_module.app, base_url="http://127.0.0.1:8787") as test_client:
         monkeypatch.setattr(app_module.app.state.polaris, "status", lambda: {"status": "online", "version": "1.7.0"})
+        # These tests are about the joined tables; routing to the wide table has its own.
+        test_client.app.state.semantic_engine.builtin_wide = None
+        test_client.app.state.semantic_engine.invalidate()
         store = test_client.app.state.store
         with duckdb.connect(str(store.db)) as con:
             # Customer 1 (华南, since 1 % 3 == 1) buys two products from two sellers in one
@@ -233,7 +236,7 @@ def test_model_plan_that_drops_a_filter_is_sent_back(client, monkeypatch):
     configure(client)
     fixed = {**PLAN, "filters": [{"field": "t_lattice_customers.region", "op": "=", "value": "华东地区"}]}
     calls = plan_replies(monkeypatch, [PLAN, fixed])
-    answer = ask(client, "华东的订单金额是什么水平")
+    answer = ask(client, "华东的销售额是什么水平")
     assert answer.status_code == 200, answer.text
     assert len(calls) == 2 and "华东" in calls[1] and "没有按" in calls[1]
     payload = answer.json()

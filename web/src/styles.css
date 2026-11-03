@@ -693,6 +693,59 @@ button {
 .trust-detail small {
   color: var(--muted);
 }
+.clarify-card {
+  margin: 12px 0;
+  padding: 14px 16px;
+  border: 1px solid #f3d9a4;
+  border-radius: 6px;
+  background: #fffaf0;
+  font-size: 13px;
+}
+.clarify-card h3 {
+  margin: 0 0 6px;
+  font-size: 14px;
+}
+.clarify-card p {
+  margin: 0 0 10px;
+  color: var(--muted);
+  line-height: 1.6;
+}
+.clarify-card fieldset {
+  margin: 0 0 12px;
+  padding: 0;
+  border: 0;
+}
+.clarify-card legend {
+  padding: 0;
+  margin-bottom: 6px;
+  font-weight: 600;
+}
+.clarify-card label {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+  cursor: pointer;
+}
+.clarify-card small {
+  color: var(--muted);
+}
+.question-terms {
+  display: grid;
+  gap: 6px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+.question-terms > div {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.question-terms small {
+  color: var(--muted);
+}
 .trust-confirm {
   display: flex;
   flex-wrap: wrap;
@@ -737,6 +790,7 @@ button {
   background: #d8f3e0;
   color: #1f7a43;
 }
+.trust-check.info,
 .trust-check.skipped {
   background: #fdeccb;
   color: #8a5a10;

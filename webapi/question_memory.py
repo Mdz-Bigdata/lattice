@@ -58,6 +58,11 @@ class QuestionMemory:
                 UNIQUE(datasource_id, normalized))"""
             )
             con.execute(
+                """CREATE TABLE IF NOT EXISTS question_term(
+                id TEXT PRIMARY KEY, created_at TEXT, datasource_id TEXT, term TEXT, normalized TEXT,
+                table_name TEXT, column_name TEXT, UNIQUE(datasource_id, normalized))"""
+            )
+            con.execute(
                 """CREATE TABLE IF NOT EXISTS question_log(
                 id TEXT PRIMARY KEY, created_at TEXT, datasource_id TEXT, question TEXT,
                 outcome TEXT, provider TEXT, planner TEXT, sql TEXT, detail TEXT, result_id TEXT)"""
@@ -121,6 +126,32 @@ class QuestionMemory:
     def delete(self, item_id: str) -> bool:
         with sqlite3.connect(self.path) as con:
             return con.execute("DELETE FROM verified_question WHERE id = ?", (item_id,)).rowcount > 0
+
+    # ----- what words mean -----------------------------------------------------------------
+    @staticmethod
+    def _term_view(row: dict[str, Any]) -> dict[str, Any]:
+        return {"id": row["id"], "created_at": row["created_at"], "datasource_id": row["datasource_id"], "term": row["term"], "table": row["table_name"], "column": row["column_name"]}
+
+    def define_term(self, datasource_id: str, term: str, table: str, column: str) -> dict[str, Any]:
+        row = {"id": str(uuid.uuid4()), "created_at": dt.datetime.now(dt.timezone.utc).isoformat(), "datasource_id": datasource_id, "term": term, "normalized": normalize(term), "table_name": table, "column_name": column}
+        with sqlite3.connect(self.path) as con:
+            con.execute("INSERT OR REPLACE INTO question_term VALUES (:id, :created_at, :datasource_id, :term, :normalized, :table_name, :column_name)", row)
+        return self._term_view(row)
+
+    def terms(self, datasource_id: str | None = None) -> list[dict[str, Any]]:
+        where, parameters = ("WHERE datasource_id = ?", (datasource_id,)) if datasource_id else ("", ())
+        with sqlite3.connect(self.path) as con:
+            con.row_factory = sqlite3.Row
+            return [self._term_view(dict(row)) for row in con.execute(f"SELECT * FROM question_term {where} ORDER BY term", parameters)]
+
+    def terms_in(self, datasource_id: str, question: str) -> list[dict[str, Any]]:
+        """The settled words this question uses. 商品销售额 settled does not settle 销售额."""
+        text = normalize(question)
+        return [term for term in self.terms(datasource_id) if normalize(term["term"]) in text]
+
+    def delete_term(self, item_id: str) -> bool:
+        with sqlite3.connect(self.path) as con:
+            return con.execute("DELETE FROM question_term WHERE id = ?", (item_id,)).rowcount > 0
 
     # ----- the log -----------------------------------------------------------------------
     def log(self, datasource_id: str, question: str, outcome: str, *, provider: str = "", planner: str = "", sql: str = "", detail: str = "", result_id: str = "") -> None:

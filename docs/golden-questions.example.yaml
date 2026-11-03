@@ -1,0 +1,29 @@
+# 智能问数黄金题集：你们真实业务里的问题，以及人工确认过的标准答案 SQL。
+# 这是判断“口径对不对”的唯一依据：平台能校验 SQL 和数据，但不知道业务上什么才算对。
+#
+# 运行（需先启动服务，失败时返回非零退出码，可放进 CI）：
+#   .runtime/envs/core/bin/python scripts/verify-questions.py --golden 你的题集.yaml
+#
+# 建议从财务或业务方最常核对的 10 到 20 个问题开始，每次定义变更后重跑。
+# 问题会发给「智能问数」配置的模型，含业务内容的题集请先确认这样做符合你们的数据规定。
+
+- datasource: local-sample            # 数据源 ID，在「数据源」页面可以看到
+  question: 各地区的销售额
+  # 标准答案：由懂业务的人写，并和财务或报表核对过。
+  # 列名和顺序可以不同，比较时按文字列对齐分组、按数值比较。
+  expected_sql: |
+    SELECT c.region, SUM(i.price) AS sales
+    FROM t_lattice_order_items i
+    JOIN t_lattice_orders o ON i.order_id = o.order_id
+    LEFT JOIN t_lattice_customers c ON o.customer_id = c.customer_id
+    GROUP BY c.region
+
+- datasource: local-sample
+  question: 2018年各类别的订单量
+  expected_sql: |
+    SELECT p.category, COUNT(DISTINCT o.order_id) AS orders
+    FROM t_lattice_orders o
+    JOIN t_lattice_order_items i ON o.order_id = i.order_id
+    JOIN t_lattice_products p ON i.product_id = p.product_id
+    WHERE o.order_date BETWEEN DATE '2018-01-01' AND DATE '2018-12-31'
+    GROUP BY p.category

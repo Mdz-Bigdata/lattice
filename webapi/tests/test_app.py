@@ -50,7 +50,7 @@ def test_sample_query_aggregates_actual_rows_and_persists_history(store):
     assert len(result["rows"]) == 11
     assert [row[1] for row in result["rows"]] == MONTHLY
     assert result["source"] == "本地示例数据 · DuckDB"
-    assert sum(table["rows"] for table in store.metadata()) == 4490
+    assert sum(table["rows"] for table in store.metadata()) == 5590
     reopened = QueryStore(store.db.parent)
     assert reopened.history()[0]["id"] == result["id"]
 
@@ -127,7 +127,7 @@ def test_numeric_metric_can_precede_a_trailing_text_column(store):
 
 def test_api_query_and_model_validation(client):
     boot = client.get("/api/bootstrap").json()
-    assert len(boot["tables"]) == 7
+    assert len(boot["tables"]) == 8
     assert client.post("/api/validate", json={"yaml": boot["model_yaml"]}).json()[
         "valid"
     ]

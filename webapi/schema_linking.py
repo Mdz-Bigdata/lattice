@@ -36,6 +36,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
+#: Names and comments warehouses give their wide tables, and the size that gives one away.
+WIDE_NAME = re.compile(r"(^|_)(wide|dws|ads|dm)(_|$)|宽表", re.IGNORECASE)
+WIDE_MIN_COLUMNS = 12
+#: A wide table scores this much higher: one table answering is one join that cannot go wrong.
+WIDE_BONUS = 1.5
+NUMERIC_TYPE = re.compile(r"int|decimal|numeric|double|float|real|number", re.IGNORECASE)
 SEMANTIC = "语义模型"
 DECLARED = "外键"
 INFERRED = "数据验证的推断"
@@ -64,11 +70,19 @@ class TableInfo:
         return f"{self.schema}.{self.name}" if self.schema else self.name
 
     @property
+    def quoted(self) -> str:
+        return f'"{self.schema}"."{self.name}"' if self.schema else f'"{self.name}"'
+
+    @property
     def primary_key(self) -> list[str]:
         return [column["name"] for column in self.columns if column.get("primary_key")]
 
     def has(self, column: str) -> bool:
         return any(item["name"].lower() == column.lower() for item in self.columns)
+
+    @property
+    def is_wide(self) -> bool:
+        return bool(WIDE_NAME.search(self.name) or WIDE_NAME.search(self.comment)) or len(self.columns) >= WIDE_MIN_COLUMNS
 
 
 @dataclass
@@ -122,7 +136,7 @@ def score_table(question: dict[str, int], table: TableInfo) -> float:
     total = overlap(table.name, 5) + overlap(table.comment, 4) + overlap(table.described, 2)
     for column in table.columns:
         total += overlap(column["name"], 2) + overlap(str(column.get("comment") or ""), 3)
-    return total
+    return total * WIDE_BONUS if table.is_wide else total
 
 
 def _adjacent(edges: Iterable[JoinEdge]) -> dict[str, set[str]]:
@@ -209,7 +223,7 @@ def table_menu(tables: list[TableInfo], limit: int = MAX_LISTED) -> str:
     return "\n".join(lines)
 
 
-def render_link(link: SchemaLink, values: dict[str, list[str]]) -> str:
+def render_link(link: SchemaLink, values: dict[str, list[str]], repeats: dict[str, dict[str, str]] | None = None) -> str:
     """The schema block of the prompt. Table lines keep the shared ``- 库.表：列`` shape."""
     lines = []
     for table in link.tables:
@@ -220,6 +234,13 @@ def render_link(link: SchemaLink, values: dict[str, list[str]]) -> str:
             for column in table.columns[:60]
         )
         lines.append(f"- {head}{rows}：{columns}")
+    wide = [table.qualified for table in link.tables if table.is_wide]
+    if wide:
+        lines.append("\n宽表（已经带好维度，能用一张宽表回答就不要再关联其他表）：" + "、".join(wide))
+    for table, measures in (repeats or {}).items():
+        if measures:
+            lines.append(f"\n{table} 中的重复度量（同一个键的多行取值相同，直接 SUM 会重复累计，必须先按键去重，例如 SELECT DISTINCT 键, 度量 的子查询）：")
+            lines.extend(f"- {column}：按 {key} 去重" for column, key in measures.items())
     if link.edges:
         lines.append("\n已知的表关联（箭头从多的一侧指向一的一侧；关联这些表时必须使用这些字段）：")
         lines.extend(f"- {edge.text()}（来源：{edge.source}）" for edge in link.edges)
@@ -263,6 +284,55 @@ def join_candidates(tables: list[TableInfo], known: list[JoinEdge]) -> list[tupl
 
 def edges_from_foreign_keys(rows: list[dict[str, Any]]) -> list[JoinEdge]:
     return [JoinEdge(row["table"], list(row["columns"]), row["referenced_table"], list(row["referenced_columns"]), DECLARED) for row in rows]
+
+
+#: The business words questions use, and how columns tend to spell them.
+BUSINESS_WORDS = {
+    "订单": ("order", "ord"), "明细": ("item", "detail", "line"), "商品": ("item", "product", "goods", "sku"), "产品": ("product",),
+    "金额": ("amount", "amt", "money"), "额": ("amount", "amt"), "价格": ("price",), "单价": ("price",), "价": ("price",),
+    "支付": ("pay", "paid", "payment"), "付款": ("pay", "paid", "payment"), "实付": ("paid",), "销售": ("sale", "sales"),
+    "收入": ("revenue", "income"), "营收": ("revenue",), "成本": ("cost",), "利润": ("profit", "margin"), "运费": ("freight", "shipping"),
+    "折扣": ("discount",), "税": ("tax",), "退款": ("refund",), "数量": ("qty", "quantity", "num"), "件数": ("qty", "quantity"),
+    "费用": ("fee", "cost", "expense"), "工资": ("salary", "wage"), "库存": ("stock", "inventory"),
+}
+#: Parts of a column name that say nothing about what it measures.
+NEUTRAL_NAME_PARTS = {"t", "the", "sum", "total", "val", "value", "num", "cnt"}
+MEASURE_TAIL = re.compile(r"(销售额|成交额|营业额|交易额|金额|收入|营收|利润|成本|价格|单价|费用|运费|业绩|收益|支出|数量|价值|额|价)$")
+
+
+def measure_is_explicit(question: str, column: str, comment: str = "") -> bool:
+    """Whether the question itself names this column, so that using it is not a choice.
+
+    Every meaningful part of the column's name has to be accounted for: 订单金额 names
+    order_amount, while 金额 alone only names part of it, and 销售额 does not name item_price.
+    A wrong yes would answer with the wrong measure and a wrong no costs one question, once,
+    so this only says yes on the words themselves. No model is involved.
+    """
+    text = re.sub(r"\s+", "", question).lower()
+    if column.lower() in text or (comment and re.sub(r"\s+", "", comment).lower() in text):
+        return True
+    named = set(re.findall(r"[a-z]+", text))
+    for word, spellings in BUSINESS_WORDS.items():
+        if word in text:
+            named |= set(spellings)
+    parts = {part for part in re.split(r"[^a-z0-9]+", column.lower()) if part and part not in NEUTRAL_NAME_PARTS}
+    return bool(parts) and parts <= named
+
+
+def measure_term(question: str) -> str:
+    """The words of a question that name a measure: 各地区的商品销售额 gives 商品销售额."""
+    for piece in re.split(r"[的各每按和与及、，,。？?！!\s]+", question):
+        match = MEASURE_TAIL.search(piece)
+        if not match:
+            continue
+        term = match.group(1)
+        prefix = piece[:match.start()]
+        for word in BUSINESS_WORDS:
+            if prefix.endswith(word):
+                term = word + term
+                break
+        return term
+    return question.strip()[:60]
 
 
 class QuestionScope:

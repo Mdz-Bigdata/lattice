@@ -31,6 +31,7 @@ import {
   LOCAL_SAMPLE_ID,
   SECRET_MASK,
   type Bootstrap,
+  type Clarification,
   type DataSource,
   type Health,
   type LlmStatus,
@@ -185,6 +186,81 @@ export function QueryReport({
     </section>
   );
 }
+/** Ask what a word means instead of guessing, and remember the answer. */
+function ClarifyCard({
+  clarification,
+  onSettled,
+}: {
+  clarification: Clarification;
+  onSettled: () => void;
+}) {
+  const [choices, setChoices] = useState<Record<string, string>>({});
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const complete = clarification.terms.every((item) => choices[item.term]);
+  async function save() {
+    setSaving(true);
+    setError("");
+    try {
+      for (const item of clarification.terms) {
+        const [table, column] = choices[item.term].split("\u0000");
+        await request("/api/query/terms", {
+          datasource_id: clarification.datasource_id,
+          term: item.term,
+          table,
+          column,
+        });
+      }
+      onSettled();
+    } catch (reason) {
+      setError(errorMessage(reason));
+      setSaving(false);
+    }
+  }
+  return (
+    <section className="clarify-card">
+      <h3>请确认口径</h3>
+      <p>
+        这些用语可能对应多个字段，结果会不一样。平台无法替你判断，请选择一个；确认后写入口径词典，之后不再询问。
+      </p>
+      {clarification.terms.map((item) => (
+        <fieldset key={item.term}>
+          <legend>“{item.term}”指的是</legend>
+          {item.options.map((option) => {
+            const value = `${option.table}\u0000${option.column}`;
+            return (
+              <label key={value}>
+                <input
+                  type="radio"
+                  name={`term-${item.term}`}
+                  checked={choices[item.term] === value}
+                  onChange={() =>
+                    setChoices({ ...choices, [item.term]: value })
+                  }
+                />
+                <code>
+                  {option.table === "@metric"
+                    ? option.column
+                    : `${option.table}.${option.column}`}
+                </code>
+                {option.comment && <small>{option.comment}</small>}
+              </label>
+            );
+          })}
+        </fieldset>
+      ))}
+      {error && <ErrorBanner message={error} />}
+      <button
+        className="primary-button"
+        disabled={!complete || saving}
+        onClick={() => void save()}
+      >
+        {saving ? "保存中…" : "确认并继续查询"}
+      </button>
+    </section>
+  );
+}
+
 /** Which tables and columns questions on this data source may reach. */
 function QuestionScopeDrawer({
   sourceId,
@@ -201,6 +277,23 @@ function QuestionScopeDrawer({
   } | null>(null);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
+  const [terms, setTerms] = useState<
+    { id: string; term: string; table: string; column: string }[]
+  >([]);
+  const termsPath = `/api/query/terms?datasource_id=${encodeURIComponent(sourceId)}`;
+  useEffect(() => {
+    request<{ items: typeof terms }>(termsPath)
+      .then((data) => setTerms(data.items))
+      .catch((reason) => setError(errorMessage(reason)));
+  }, [termsPath]);
+  async function removeTerm(id: string) {
+    try {
+      await request(`/api/query/terms/${encodeURIComponent(id)}/delete`, {});
+      setTerms(terms.filter((item) => item.id !== id));
+    } catch (reason) {
+      setError(errorMessage(reason));
+    }
+  }
   useEffect(() => {
     request<Record<string, string[]>>(path)
       .then((data) =>
@@ -269,6 +362,28 @@ function QuestionScopeDrawer({
             保存
           </button>
           {message && <small>{message}</small>}
+          <div className="question-terms">
+            <span>口径词典</span>
+            {!terms.length && (
+              <small>还没有确认过的用语。提问遇到歧义时会询问，确认后记录在这里。</small>
+            )}
+            {terms.map((item) => (
+              <div key={item.id}>
+                <strong>{item.term}</strong>
+                <code>
+                  {item.table === "@metric"
+                    ? `指标 ${item.column}`
+                    : `${item.table}.${item.column}`}
+                </code>
+                <button
+                  className="small-button"
+                  onClick={() => void removeTerm(item.id)}
+                >
+                  删除
+                </button>
+              </div>
+            ))}
+          </div>
         </div>
       )}
     </Drawer>
@@ -300,10 +415,11 @@ function TrustPanel({ result }: { result: QueryResult }) {
   }
   const incomplete = verification.status !== "passed";
   const trusted = verification.governed && !incomplete;
+  const route = semantic?.route === "wide" ? "宽表" : semantic?.route === "join" ? "多表关联" : "";
   const summary = verification.governed
     ? incomplete
-      ? "按语义模型口径计算，部分校验未完成"
-      : "按语义模型口径计算，校验通过"
+      ? `按语义模型口径计算${route ? `（${route}）` : ""}，部分校验未完成`
+      : `按语义模型口径计算${route ? `（${route}）` : ""}，校验通过`
     : "模型直接生成的 SQL，未经语义层，请核对口径";
   return (
     <div className={`trust-panel${trusted ? " trusted" : " caution"}`}>
@@ -334,6 +450,21 @@ function TrustPanel({ result }: { result: QueryResult }) {
                     )}
                   </li>
                 ))}
+              </ul>
+            </section>
+          )}
+          {semantic?.route && (
+            <section>
+              <h4>查询路径</h4>
+              <ul>
+                <li>
+                  {semantic.route === "wide"
+                    ? "宽表直查，无需关联"
+                    : semantic.route === "join"
+                      ? "多表关联"
+                      : "单表查询"}
+                </li>
+                {semantic.route_note && <li>{semantic.route_note}</li>}
               </ul>
             </section>
           )}
@@ -399,7 +530,11 @@ function TrustPanel({ result }: { result: QueryResult }) {
                 {verification.checks.map((check) => (
                   <li key={check.name + check.detail}>
                     <span className={`trust-check ${check.status}`}>
-                      {check.status === "passed" ? "通过" : "未完成"}
+                      {check.status === "passed"
+                        ? "通过"
+                        : check.status === "info"
+                          ? "请确认"
+                          : "未完成"}
                     </span>
                     {check.name}：{check.detail}
                   </li>
@@ -452,6 +587,9 @@ export default function QueryPage({
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [scopeOpen, setScopeOpen] = useState(false);
+  const [clarification, setClarification] = useState<Clarification | null>(
+    null,
+  );
   const [history, setHistory] = useState<QueryResult[]>([]);
   const [historyBusy, setHistoryBusy] = useState(false);
   const [historyError, setHistoryError] = useState("");
@@ -496,9 +634,15 @@ export default function QueryPage({
     setError("");
     setSteps([]);
     setPendingSql(null);
+    setClarification(null);
     setSubmitted(text);
     const body = { question: text, datasource_id: sourceId, refresh };
     let outcome: Outcome = "pending";
+    function clarify(detail: Clarification) {
+      outcome = "result";
+      setClarification(detail);
+      setPhase("idle");
+    }
     function finish(answer: QueryResult) {
       outcome = "result";
       setResult(answer);
@@ -518,6 +662,7 @@ export default function QueryPage({
           onStep: (step) => setSteps((current) => [...current, step]),
           onSql: (sql, title) => setPendingSql({ sql, title }),
           onResult: finish,
+          onClarify: clarify,
           onError: fail,
         },
         abort.signal,
@@ -530,7 +675,15 @@ export default function QueryPage({
         return;
       }
       try {
-        finish(await request<QueryResult>("/api/query", body));
+        const answer = await request<
+          QueryResult & {
+            needs_clarification?: boolean;
+            clarification?: Clarification;
+          }
+        >("/api/query", body);
+        if (answer.needs_clarification && answer.clarification)
+          clarify(answer.clarification);
+        else finish(answer);
       } catch (inner) {
         if (!abort.signal.aborted) fail(errorMessage(inner));
       }
@@ -646,14 +799,20 @@ export default function QueryPage({
             )}
           </div>
         )}
-        {phase === "answered" && result && !error && (
+        {clarification && (
+          <ClarifyCard
+            clarification={clarification}
+            onSettled={() => void ask(clarification.question, true)}
+          />
+        )}
+        {phase === "answered" && result && !error && !clarification && (
           <QueryReport
             key={result.id}
             result={result}
             onRefresh={() => void ask(submitted, true)}
           />
         )}
-        {phase === "idle" && !result && !error && (
+        {phase === "idle" && !result && !error && !clarification && (
           <Empty title="开始探索你的数据">
             选择下方示例问题，或输入一个数据问题。
           </Empty>

@@ -66,7 +66,7 @@ CONTAINERS = {
     "doris": ("lattice-doris-fe", "lattice-doris-be"),
     "hive": ("lattice-hive",),
 }
-MEMORY = {"lattice-starrocks": "3g", "lattice-doris-fe": "2g", "lattice-doris-be": "2500m", "lattice-hive": "2g"}
+MEMORY = {"lattice-starrocks": "3g", "lattice-doris-fe": "2g", "lattice-doris-be": "2500m", "lattice-hive": "2500m"}
 DOCKER_TIMEOUT = 600
 PULL_TIMEOUT = 3600
 # Docker restarts these with the daemon, so a reboot does not leave the WebUI
@@ -816,7 +816,10 @@ def start_hive(log: Path, write_config) -> str:
         "-p", f"127.0.0.1:{PORTS['hive']}:10000", "-p", f"127.0.0.1:{HTTP_PORTS['hive']}:10002",
         "-e", "SERVICE_NAME=hiveserver2",
         "-e", "HIVESERVER2_PID_DIR=/opt/hive/pids",
-        "-e", f"SERVICE_OPTS=-Djavax.jdo.option.ConnectionURL=jdbc:derby:;databaseName={HIVE_DERBY_DIR};create=true",
+        # Tez tasks run inside HiveServer2 here, and the image's 1 GB runs out of heap on a few
+        # consecutive aggregations. SERVICE_OPTS comes later on its command line, so it wins. The
+        # JVM needs about 1 GB beyond its heap, which the container's limit leaves room for.
+        "-e", f"SERVICE_OPTS=-Xmx1536m -Djavax.jdo.option.ConnectionURL=jdbc:derby:;databaseName={HIVE_DERBY_DIR};create=true",
         "--tmpfs", "/opt/hive/pids:mode=1777",
         "-v", "lattice-hive-warehouse:/opt/hive/data/warehouse",
         f"-v", f"lattice-hive-metastore:{HIVE_METASTORE_DIR}",

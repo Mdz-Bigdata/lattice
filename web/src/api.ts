@@ -147,6 +147,8 @@ export interface QueryResult {
   semantic?: {
     model: string;
     planner?: "rules" | "llm" | "verified" | null;
+    route?: "wide" | "join" | "single";
+    route_note?: string;
     joins: string[];
     filters?: { field: string; op: string; value?: unknown }[];
     definitions?: { name: string; description: string; expression: string; time_field?: string }[];
@@ -158,8 +160,17 @@ export interface QueryResult {
   verification?: {
     governed: boolean;
     status: "passed" | "skipped";
-    checks: { name: string; status: "passed" | "skipped"; detail: string }[];
+    checks: { name: string; status: "passed" | "skipped" | "info"; detail: string }[];
   };
+}
+/** A word in the question that could mean several measures; only the asker can say which. */
+export interface Clarification {
+  question: string;
+  datasource_id: string;
+  terms: {
+    term: string;
+    options: { table: string; column: string; comment: string }[];
+  }[];
 }
 export interface QueryRequest {
   question?: string;
@@ -367,6 +378,7 @@ export interface StreamHandlers {
   onStep?: (text: string) => void;
   onSql?: (sql: string, title: string) => void;
   onResult?: (result: QueryResult) => void;
+  onClarify?: (clarification: Clarification) => void;
   onError?: (detail: string) => void;
   onDone?: () => void;
 }
@@ -402,6 +414,9 @@ function dispatchFrame(frame: string, handlers: StreamHandlers): boolean {
       return false;
     case "result":
       handlers.onResult?.(payload as unknown as QueryResult);
+      return false;
+    case "clarify":
+      handlers.onClarify?.(payload as unknown as Clarification);
       return false;
     case "error":
       handlers.onError?.(

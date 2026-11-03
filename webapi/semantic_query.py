@@ -41,6 +41,13 @@ points from the many side to the one side, which gives each join a direction:
 * Two equally short routes between datasets are two possible meanings, so they are
   refused until the request names the relationships to use.
 
+A wide table has already done its joins, so it has no join to reason about and the same
+mistake hides in a single table: at order-item grain, an order's amount is repeated on each
+of its items and SUM counts it once per item. ``ai_context.grain`` declares the key a field
+or metric really belongs to. Such a measure is reduced to one row per key before summing,
+is refused against a dimension finer than that key, and the declaration is checked against
+the data, because a wrong one would quietly drop real rows.
+
 ``SemanticQueryEngine.query`` then checks the outcome: the groups of an additive
 metric have to add up to its total, which also catches a key the model declares
 unique but whose data is not.
@@ -63,6 +70,7 @@ from sqlglot import exp
 from .connectors import CONNECTORS, DIALECT_LABELS
 from .observability import observe
 from .sql_audit import parse_schema_context
+from .table_profile import KEY_LIKE, profile_table, self_check
 
 LOCAL_SAMPLE = "local-sample"
 #: Which Ossie dialect expression to prefer for a sqlglot dialect, in order.
@@ -81,6 +89,9 @@ MAX_DIMENSIONS = 10
 MAX_FILTERS = 20
 MAX_JOINS = 8
 CACHE_SECONDS = 60
+#: Finding grains reads a whole sample, and a table's shape does not change by the minute.
+GRAIN_CACHE_SECONDS = 600
+BUILTIN_WIDE = "builtin:wide"
 #: Text dimensions read into the value dictionary, and how many values one may have.
 MAX_VALUE_COLUMNS = 40
 MAX_DIMENSION_VALUES = 200
@@ -117,6 +128,8 @@ class Field:
     is_dimension: bool = False
     description: str = ""
     synonyms: list[str] = field(default_factory=list)
+    #: Columns that determine this field; empty means it can differ on every row.
+    grain: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -146,6 +159,8 @@ class Metric:
     synonyms: list[str] = field(default_factory=list)
     #: The date a question about this metric means by "per month" (``dataset.field``).
     time_field: str = ""
+    #: Columns of one row of what this metric counts; see ``Field.grain``.
+    grain: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -158,12 +173,17 @@ class Model:
     relationships: list[Relationship]
     metrics: dict[str, Metric]
 
+    @property
+    def is_wide(self) -> bool:
+        """Answers from one dataset, with no join to get wrong and none to pay for."""
+        return len(self.datasets) == 1
+
     def fingerprint(self) -> str:
         """Changes whenever a definition does, so a confirmed answer can notice it went stale."""
         definition = {
-            "datasets": {d.name: [d.source, d.primary_key, {f.name: f.expressions for f in d.fields.values()}] for d in self.datasets.values()},
+            "datasets": {d.name: [d.source, d.primary_key, {f.name: [f.expressions, f.grain] for f in d.fields.values()}] for d in self.datasets.values()},
             "relationships": [[r.from_dataset, r.to_dataset, r.from_columns, r.to_columns] for r in self.relationships],
-            "metrics": {m.name: [m.expressions, m.time_field] for m in self.metrics.values()},
+            "metrics": {m.name: [m.expressions, m.time_field, m.grain] for m in self.metrics.values()},
         }
         return hashlib.sha256(json.dumps(definition, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
 
@@ -215,6 +235,14 @@ def source_tables(source: str) -> list[str]:
 def _time_field(node: Any) -> str:
     context = node.get("ai_context") if isinstance(node, dict) else None
     return str(context.get("time_field") or "") if isinstance(context, dict) else ""
+
+
+def _grain(node: Any) -> list[str]:
+    context = node.get("ai_context") if isinstance(node, dict) else None
+    declared = context.get("grain") if isinstance(context, dict) else None
+    if isinstance(declared, str):
+        declared = [declared]
+    return [str(item) for item in declared] if isinstance(declared, list) else []
 
 
 def extract_document(loaded: Any) -> dict[str, Any] | None:
@@ -275,6 +303,7 @@ def parse_model(document: dict[str, Any], *, model_id: str = "", storage: str = 
                 is_dimension=is_dimension,
                 description=str(item.get("description") or ""),
                 synonyms=_synonyms(item),
+                grain=_grain(item),
             )
         datasets[str(raw["name"])] = Dataset(
             name=str(raw["name"]),
@@ -301,7 +330,7 @@ def parse_model(document: dict[str, Any], *, model_id: str = "", storage: str = 
         expressions = _expressions(raw.get("expression"))
         if not expressions:
             continue
-        metrics[str(raw["name"])] = Metric(str(raw["name"]), expressions, str(raw.get("datatype") or ""), str(raw.get("description") or ""), _synonyms(raw), _time_field(raw))
+        metrics[str(raw["name"])] = Metric(str(raw["name"]), expressions, str(raw.get("datatype") or ""), str(raw.get("description") or ""), _synonyms(raw), _time_field(raw), _grain(raw))
     name = str(document["name"])
     return Model(id=model_id or name, name=name, storage=storage or "document", description=str(document.get("description") or ""), datasets=datasets, relationships=relationships, metrics=metrics)
 
@@ -328,6 +357,10 @@ class Compiled:
     additive: list[str] = field(default_factory=list)
     #: Metrics aggregated apart from each other because they measure different datasets.
     branches: list[dict[str, Any]] = field(default_factory=list)
+    #: (description, statement returning a row if a declared grain does not hold in the data).
+    grain_checks: list[tuple[str, str]] = field(default_factory=list)
+    #: Measures whose grain the data cannot settle; shown as an open question on the result.
+    uncertain: list[str] = field(default_factory=list)
 
     def view(self) -> dict[str, Any]:
         return {"sql": self.sql, "dialect": self.dialect, "dialect_label": DIALECT_LABELS.get(self.dialect, self.dialect), "datasets": self.datasets, "joins": self.joins, "columns": self.columns, "chart": self.chart, "warnings": self.warnings, "branches": self.branches}
@@ -343,6 +376,10 @@ class MetricShape:
     #: Datasets whose rows must not repeat: the grains of SUM, AVG and plain COUNT.
     grains: list[str]
     additive: bool
+    #: The key one row of this metric belongs to, when finer rows repeat it.
+    key: tuple[str, ...] = ()
+    #: Whether repeated rows would change the value, so they must be reduced first.
+    repeat_sensitive: bool = False
 
 
 @dataclass
@@ -386,7 +423,10 @@ def _literal(value: Any) -> exp.Expression:
 class Compiler:
     """Turns one request against one model into a SELECT for one dialect."""
 
-    def __init__(self, model: Model, dialect: str, *, bare_schemas: tuple[str, ...] = (), schema_map: dict[str, str] | None = None):
+    def __init__(
+        self, model: Model, dialect: str, *, bare_schemas: tuple[str, ...] = (), schema_map: dict[str, str] | None = None,
+        inferred: dict[tuple[str, str], list[str]] | None = None, uncertain: dict[tuple[str, str], list[str]] | None = None,
+    ):
         self.model = model
         self.dialect = dialect
         self.bare_schemas = tuple(name.lower() for name in bare_schemas)
@@ -395,6 +435,12 @@ class Compiler:
         self.used: list[str] = []
         #: Relationship names a request narrowed the joins to; None means all of them.
         self.allowed: set[str] | None = None
+        #: What the data says about undeclared grains: (dataset, column) -> keys, coarsest first.
+        self.inferred: dict[tuple[str, str], list[str]] = inferred or {}
+        #: The same on too little evidence: reported, not acted on.
+        self.uncertain: dict[tuple[str, str], list[str]] = uncertain or {}
+        #: Finding grains failed, so finding none means nothing.
+        self.profile_failed = False
 
     # ----- references -------------------------------------------------------------------
     def _alias(self, dataset: str) -> exp.Identifier:
@@ -577,7 +623,42 @@ class Compiler:
             grains = [home]
         root = expression.unalias() if isinstance(expression, exp.Alias) else expression
         additive = isinstance(root, exp.Sum) or (isinstance(root, exp.Count) and not _is_repeat_safe(root))
-        return MetricShape(metric.name, home, grains, additive)
+        return MetricShape(metric.name, home, grains, additive, self._metric_key(metric, expression), repeat_sensitive)
+
+    def _metric_key(self, metric: Metric, expression: exp.Expression) -> tuple[str, ...]:
+        """The grain a metric declares, or the one its measured fields share."""
+        if metric.grain:
+            return tuple(metric.grain)
+        keys: set[tuple[str, ...]] = set()
+        unkeyed = False
+        for aggregate in expression.find_all(exp.AggFunc):
+            if _is_repeat_safe(aggregate):
+                continue
+            for column in aggregate.find_all(exp.Column):
+                dataset = self.model.datasets.get(column.table)
+                item = dataset.fields.get(column.name) if dataset else None
+                found = self.inferred.get((column.table, column.name))
+                if item is not None and item.grain:
+                    keys.add(tuple(item.grain))
+                elif found:
+                    if len(found) > 1:
+                        # A monthly fee is constant per order and per customer. Reducing by the
+                        # wrong one counts one month instead of all, and the data cannot say which.
+                        options = " 或 ".join("、".join(option) for option in found)
+                        raise _bad(f"无法确定指标 {metric.name} 的统计粒度：{column.table}.{column.name} 在 {options} 内都取值相同，按不同的键去重结果不同，数据本身无法判断。请在语义模型中用 ai_context.grain 声明它属于哪个键。")
+                    keys.add(found[0])
+                else:
+                    unkeyed = True
+        # COUNT(DISTINCT order_id) counts orders, whether or not anyone declared it.
+        if not keys and not unkeyed and self.inferred:
+            for aggregate in expression.find_all(exp.Count):
+                if _is_repeat_safe(aggregate):
+                    columns = list(aggregate.find_all(exp.Column))
+                    if len(columns) == 1 and any((columns[0].name,) in options for options in self.inferred.values()):
+                        return (columns[0].name,)
+        if len(keys) > 1 or (keys and unkeyed):
+            raise _bad(f"指标 {metric.name} 同时聚合了不同粒度的字段（{'、'.join(', '.join(key) or '明细行' for key in sorted(keys))}），不能放在同一个聚合里。请拆成两个指标后再计算。")
+        return next(iter(keys), ())
 
     def _join_tree(self, root: str, needed: list[str]) -> list[JoinStep]:
         """The joins connecting every dataset in use to the root.
@@ -679,6 +760,28 @@ class Compiler:
                         f"关联后 {grain} 的一行会对应多行，{name} 会被重复累计而偏大，已拒绝执行。请改用这个指标自身所在数据集可以多对一到达的维度。"
                     )
         warnings = []
+        key = shapes[metric_names[0]].key if metric_names else ()
+        dedup: dict[str, Any] | None = None
+        if key:
+            finer = [f"{item['dataset'].name}.{item['column'].name}" for item in grouped if not self._determined_by(item["column"], key)]
+            sensitive = [name for name in metric_names if shapes[name].repeat_sensitive]
+            described = "、".join(key)
+            for name in metric_names:
+                if not finer:
+                    continue
+                if shapes[name].repeat_sensitive:
+                    raise _bad(
+                        f"无法按 {'、'.join(finer)} 计算指标 {name}：它是按 {described} 统计的，而 {described} 与这些维度是一对多关系，"
+                        f"同一个 {described} 会归入多个分组，{name} 会被重复累计而偏大，已拒绝执行。请改用不细于 {described} 的维度。"
+                    )
+                warnings.append(f"指标 {name} 按 {'、'.join(finer)} 分组时，同一个 {described} 可能同时归入多个分组（去重计数不重复累计），各分组之和可能大于总数。")
+            if sensitive:
+                filter_finer = [str(item.get("field")) for item in filters if str(item.get("field") or "") not in self.model.metrics and not self._determined_by(self._find_field(str(item.get("field")))[1], key)]
+                if filter_finer:
+                    warnings.append(f"筛选条件 {'、'.join(filter_finer)} 比 {described} 更细：只要有一行满足条件，整个 {described} 的 {'、'.join(sensitive)} 都会计入。")
+                source_note = "（粒度由数据探测得到，已全量核对）" if self._key_was_inferred(sensitive, shapes) else ""
+                warnings.append(f"{'、'.join(sensitive)} 在同一个 {described} 内重复出现，已按 {described} 去重后再汇总{source_note}。")
+                dedup = {"key": list(key), "dataset": shapes[sensitive[0]].home}
         fan_targets = {step.child for step in tree if step.fans_out}
         for step in tree:
             if step.parent in fan_targets:
@@ -687,7 +790,76 @@ class Compiler:
             if item["dataset"].name in fan_targets:
                 for name in metric_names:
                     warnings.append(f"指标 {name} 按 {item['dataset'].name}.{item['column'].name} 分组时，同一条记录可能同时归入多个分组（去重计数不重复累计），各分组之和可能大于总数。")
-        return {"root": root, "metrics": expressions, "grouped": grouped, "where": where, "having": having, "tree": tree, "warnings": warnings}
+        branch = {"root": root, "metrics": expressions, "grouped": grouped, "where": where, "having": having, "tree": tree, "warnings": warnings, "grain_checks": [], "inner": None}
+        if dedup:
+            self._reduce_to_key(branch, dedup, metric_names, shapes)
+        return branch
+
+    def _determined_by(self, item: Field, key: tuple[str, ...]) -> bool:
+        """Whether a field has one value per key: part of the key, or declared or found coarser."""
+        if item.name in key or (bool(item.grain) and set(item.grain) <= set(key)):
+            return True
+        return any(set(option) <= set(key) for (_, column), options in self.inferred.items() if column == item.name for option in options)
+
+    def _key_was_inferred(self, names: list[str], shapes: dict[str, MetricShape]) -> bool:
+        return any(not self.model.metrics[name].grain and any(shapes[name].key in options for options in self.inferred.values()) for name in names)
+
+    def _uncertain_about(self, metric_names: list[str]) -> list[str]:
+        """Measures whose grain could not be settled, in words a reader can act on."""
+        notes = []
+        if self.profile_failed:
+            notes.append("未能探测这张表的粒度（查询失败或超时），无法排除度量在多行上重复。如果它是宽表，请在语义模型中用 ai_context.grain 声明粒度。")
+        for name in metric_names:
+            self.used = []
+            for aggregate in self._metric_expression(self.model.metrics[name]).find_all(exp.AggFunc):
+                if _is_repeat_safe(aggregate):
+                    continue
+                for column in aggregate.find_all(exp.Column):
+                    keys = self.uncertain.get((column.table, column.name))
+                    if keys:
+                        key = "、".join(keys[0])
+                        notes.append(f"{column.table}.{column.name} 在同一个 {key} 内取值相同，但证据不足以确定它属于 {key}（重复的数据太少，或 {key} 不一定是键）。如果属于，{name} 会偏大；请在语义模型中用 ai_context.grain 声明。")
+        return list(dict.fromkeys(notes))
+
+    def _reduce_to_key(self, branch: dict[str, Any], dedup: dict[str, Any], metric_names: list[str], shapes: dict[str, MetricShape]) -> None:
+        """Move the branch's rows into ``SELECT DISTINCT key, dimensions, measures``.
+
+        DISTINCT rather than GROUP BY with MAX, so a measure that turns out not to be constant
+        per key keeps its rows and shows up in the reconciliation instead of losing them.
+        """
+        home = dedup["dataset"]
+        inner_columns: list[exp.Expression] = []
+        for index, column in enumerate(dedup["key"]):
+            inner_columns.append(exp.alias_(exp.Column(this=exp.to_identifier(column, quoted=True), table=self._alias(home)), exp.to_identifier(f"lattice_k{index}", quoted=True)))
+        for index, item in enumerate(branch["grouped"]):
+            alias = f"lattice_g{index}"
+            inner_columns.append(exp.alias_(item["expression"], exp.to_identifier(alias, quoted=True)))
+            item["expression"] = exp.column(exp.to_identifier(alias, quoted=True))
+        measures: dict[tuple[str, str], str] = {}
+
+        def rewrite(node: exp.Expression) -> exp.Expression:
+            if not isinstance(node, exp.Column) or not node.table:
+                return node
+            ident = (node.table, node.name)
+            if ident not in measures:
+                measures[ident] = f"lattice_v{len(measures)}"
+                inner_columns.append(exp.alias_(node.copy(), exp.to_identifier(measures[ident], quoted=True)))
+            return exp.column(exp.to_identifier(measures[ident], quoted=True))
+
+        branch["metrics"] = {name: expression.transform(rewrite) for name, expression in branch["metrics"].items()}
+        branch["having"] = [condition.transform(rewrite) for condition in branch["having"]]
+        inner = self._joined(branch)
+        for column in inner_columns:
+            inner = inner.select(column, append=True)
+        branch["inner"] = inner.distinct()
+        # The declaration decides what gets dropped, so the data has to agree with it.
+        keys = [exp.Column(this=exp.to_identifier(column, quoted=True), table=self._alias(home)) for column in dedup["key"]]
+        for (dataset, name), _ in measures.items():
+            if dataset != home:
+                continue
+            check = exp.Select(expressions=[exp.alias_(exp.Literal.number(1), "lattice_varies")]).from_(self._table(self.model.datasets[home]))
+            check = check.group_by(*[key.copy() for key in keys]).having(exp.GT(this=exp.Count(this=exp.Distinct(expressions=[exp.Column(this=exp.to_identifier(name, quoted=True), table=self._alias(home))])), expression=exp.Literal.number(1))).limit(1)
+            branch["grain_checks"].append((f"{dataset}.{name} 在同一个 {'、'.join(dedup['key'])} 内取值唯一", check.sql(dialect=self.dialect)))
 
     def _ordered(self, alias: str, desc: bool) -> exp.Ordered:
         """Order by a result column, leaving NULLs where this engine puts them by itself.
@@ -734,6 +906,11 @@ class Compiler:
         return select.group_by(expression.copy()).limit(limit).sql(dialect=self.dialect)
 
     def _from(self, branch: dict[str, Any]) -> exp.Select:
+        if branch["inner"] is not None:
+            return exp.Select().from_(branch["inner"].subquery("lattice_reduced"))
+        return self._joined(branch)
+
+    def _joined(self, branch: dict[str, Any]) -> exp.Select:
         select = exp.Select().from_(self._table(self.model.datasets[branch["root"]]))
         for step in branch["tree"]:
             relationship = step.relationship
@@ -779,14 +956,20 @@ class Compiler:
             metric = self.model.metrics[name]
             self.used = []
             shapes[name] = self._shape(metric, self._metric_expression(metric))
-        homes: list[str] = []
+        # Metrics counted on different rows are aggregated apart: another dataset, or the same
+        # wide table reduced to another key.
+        homes: list[tuple[str, tuple[str, ...]]] = []
         for name in [*metric_names, *hidden]:
-            if shapes[name].home not in homes:
-                homes.append(shapes[name].home)
+            place = (shapes[name].home, shapes[name].key if shapes[name].repeat_sensitive else ())
+            if place not in homes:
+                homes.append(place)
         if len(homes) == 1:
-            plan = [self._branch(metric_names, homes[0], dimensions, filters, shapes)]
+            plan = [self._branch(metric_names, homes[0][0], dimensions, filters, shapes)]
         else:
-            plan = [self._branch([name for name in [*metric_names, *hidden] if shapes[name].home == home], home, dimensions, dimension_filters, shapes) for home in homes]
+            plan = [
+                self._branch([name for name in [*metric_names, *hidden] if (shapes[name].home, shapes[name].key if shapes[name].repeat_sensitive else ()) == place], place[0], dimensions, dimension_filters, shapes)
+                for place in homes
+            ]
 
         # Result columns: dimensions first, then the metrics asked for.
         columns: list[dict[str, Any]] = []
@@ -873,9 +1056,13 @@ class Compiler:
         branches = []
         if len(plan) > 1:
             branches = [{"dataset": branch["root"], "metrics": [name for name in metric_names if name in branch["metrics"]]} for branch in plan]
-            warnings.append("这些指标分别来自不同的事实表（" + "、".join(branch["root"] for branch in plan) + "），已各自聚合后再按维度合并，避免相互放大。")
+            if len({branch["root"] for branch in plan}) > 1:
+                warnings.append("这些指标分别来自不同的事实表（" + "、".join(dict.fromkeys(branch["root"] for branch in plan)) + "），已各自聚合后再按维度合并，避免相互放大。")
+            else:
+                warnings.append("这些指标的统计粒度不同，已各自聚合后再按维度合并，避免相互放大。")
         additive = [metric_aliases[name] for name in metric_names if shapes[name].additive]
-        return Compiled(sql=sql, dialect=self.dialect, datasets=datasets, joins=joins, columns=columns, chart=chart, warnings=warnings, additive=additive, branches=branches)
+        grain_checks = [check for branch in plan for check in branch["grain_checks"]]
+        return Compiled(sql=sql, dialect=self.dialect, datasets=datasets, joins=joins, columns=columns, chart=chart, warnings=warnings, additive=additive, branches=branches, grain_checks=grain_checks, uncertain=self._uncertain_about(metric_names))
 
     def _across(
         self,
@@ -959,23 +1146,31 @@ class SemanticQueryEngine:
         semantic: Any = None,
         queries: Any = None,
         builtin: Callable[[], dict[str, Any] | None] | None = None,
+        builtin_wide: Callable[[], dict[str, Any] | None] | None = None,
+        hidden_models: dict[str, dict[str, Any]] | None = None,
         clock: Callable[[], float] = time.time,
     ):
+        self.hidden_models = hidden_models or {}
         self.models = models
         self.semantic = semantic
         self.queries = queries
         self.builtin = builtin
+        self.builtin_wide = builtin_wide
         self._clock = clock
         self._lock = threading.RLock()
         self._listing: tuple[float, list[dict[str, Any]]] | None = None
         self._cache: dict[str, tuple[float, Model]] = {}
         self._values: dict[tuple[str, str], tuple[float, dict[str, list[str]]]] = {}
+        self._grains: dict[tuple[str, str], tuple[float, dict, dict, bool]] = {}
+        self._self_checks: dict[tuple[str, str, str], tuple[float, list[dict[str, str]]]] = {}
 
     def invalidate(self) -> None:
         with self._lock:
             self._listing = None
             self._cache.clear()
             self._values.clear()
+            self._grains.clear()
+            self._self_checks.clear()
 
     # ----- discovery --------------------------------------------------------------------
     def list_models(self) -> list[dict[str, Any]]:
@@ -992,6 +1187,14 @@ class SemanticQueryEngine:
                     items.append(self._summary(model, "builtin", "内置演示模型"))
             except (SemanticQueryError, ValueError) as error:
                 errors.append(f"内置模型：{error}")
+        if self.builtin_wide is not None:
+            try:
+                document = self.builtin_wide()
+                if document:
+                    model = parse_model(extract_document(document) or {}, model_id=BUILTIN_WIDE, storage="builtin")
+                    items.append(self._summary(model, BUILTIN_WIDE, "内置演示宽表模型"))
+            except (SemanticQueryError, ValueError) as error:
+                errors.append(f"内置宽表模型：{error}")
         if self.models is not None:
             try:
                 for item in (self.models.list() or {}).get("items", []):
@@ -1034,6 +1237,12 @@ class SemanticQueryEngine:
         return model
 
     def _read(self, ref: str) -> Model:
+        if ref in self.hidden_models:
+            return parse_model(self.hidden_models[ref], model_id=ref, storage="builtin")
+        if ref in {BUILTIN_WIDE, "lattice_demo_sales_wide"}:
+            if self.builtin_wide is None:
+                raise SemanticQueryError(404, "没有内置演示宽表模型。")
+            return parse_model(extract_document(self.builtin_wide()) or {}, model_id=BUILTIN_WIDE, storage="builtin")
         if ref in {"builtin", "lattice_demo_sales"} or ref.startswith("builtin:"):
             if self.builtin is None:
                 raise SemanticQueryError(404, "没有内置演示模型。")
@@ -1139,7 +1348,66 @@ class SemanticQueryEngine:
     def _compile(self, model: Model, request: dict[str, Any], record: dict[str, Any]) -> Compiled:
         return self._compiler(model, record).compile(request)
 
+    def _data_grains(self, model: Model, compiler: Compiler, record: dict[str, Any]) -> tuple[dict, dict]:
+        """Grains a single-table model did not declare, found in the data and checked in full."""
+        if not model.is_wide or self.queries is None or not hasattr(self.queries, "execute"):
+            return {}, {}
+        dataset = next(iter(model.datasets.values()))
+        if not dataset.fields or re.match(r"^\s*(select|with)\b", dataset.source, re.IGNORECASE):
+            return {}, {}
+        key = (model.fingerprint(), record["id"])
+        with self._lock:
+            cached = self._grains.get(key)
+            if cached and self._clock() - cached[0] < GRAIN_CACHE_SECONDS:
+                compiler.profile_failed = cached[3]
+                return cached[1], cached[2]
+        # Plain columns only: a computed field's expression cannot be compared by name.
+        columns = [item.name for item in dataset.fields.values() if expression_for(item.expressions, compiler.dialect).strip('"`') == item.name]
+        declared = {item.name for item in dataset.fields.values() if item.grain}
+        keys = [name for name in columns if KEY_LIKE.search(name)]
+        table = compiler._table(dataset)
+        table = table.this if isinstance(table, exp.Alias) else table
+        table = table.copy()
+        table.set("alias", None)
+
+        def run(statement: str) -> list[list[Any]]:
+            return self.queries.execute(record, statement)["rows"]
+
+        try:
+            kinds = {item.name: {"Integer": "int", "String": "text"}.get(item.datatype, item.datatype.lower()) for item in dataset.fields.values()}
+            profile = profile_table(run, table, columns, compiler.dialect, keys=keys, kinds=kinds)
+        except Exception:  # noqa: BLE001 - nothing inferred; declared grains still apply
+            compiler.profile_failed = True
+            return {}, {}
+        # Fields that declare a grain need no finding, so a failure only matters without them.
+        compiler.profile_failed = profile.failed and len(declared) < len([item for item in dataset.fields.values() if item.datatype in NUMERIC_TYPES])
+        inferred = {(dataset.name, column): options for column, options in profile.constant.items() if column not in declared}
+        uncertain = {(dataset.name, column): options for column, options in profile.uncertain.items() if column not in declared}
+        if profile.sampled:
+            # A sample can miss the row that disproves it, and acting on a false finding drops data.
+            for (name, column), options in list(inferred.items()):
+                kept = []
+                for option in options:
+                    check = exp.Select(expressions=[exp.alias_(exp.Literal.number(1), "lattice_varies")]).from_(table.copy()).group_by(*[exp.column(exp.to_identifier(part, quoted=True)) for part in option]).having(exp.GT(this=exp.Count(this=exp.Distinct(expressions=[exp.column(exp.to_identifier(column, quoted=True))])), expression=exp.Literal.number(1))).limit(1)
+                    try:
+                        if not run(check.sql(dialect=compiler.dialect)):
+                            kept.append(option)
+                    except Exception:  # noqa: BLE001 - unconfirmed findings are not acted on
+                        continue
+                if kept:
+                    inferred[(name, column)] = kept
+                else:
+                    inferred.pop((name, column))
+        with self._lock:
+            self._grains[key] = (self._clock(), inferred, uncertain, compiler.profile_failed)
+        return inferred, uncertain
+
     def _compiler(self, model: Model, record: dict[str, Any]) -> Compiler:
+        compiler = self._plain_compiler(model, record)
+        compiler.inferred, compiler.uncertain = self._data_grains(model, compiler, record)
+        return compiler
+
+    def _plain_compiler(self, model: Model, record: dict[str, Any]) -> Compiler:
         dialect = CONNECTORS[record["type"]].dialect if record.get("type") in CONNECTORS else "duckdb"
         if record["id"] == LOCAL_SAMPLE:
             return Compiler(model, dialect, bare_schemas=DEFAULT_SCHEMA_ALIASES)
@@ -1155,7 +1423,12 @@ class SemanticQueryEngine:
         return Compiler(model, dialect, schema_map={name: default for name in aliases}, bare_schemas=() if default else aliases)
 
     def models_for(self, record: dict[str, Any], question: str = "") -> list[Model]:
-        """Models whose every table exists on this data source; user-defined ones come first."""
+        """Models whose every table exists on this data source, in the order to try them.
+
+        A wide table first, which has no join to get wrong and none to pay for, and models
+        with joins after it for what it does not hold. Within each, the user's own before
+        the built-in demo.
+        """
         tables = self._source_tables(record)
         if not tables:
             return []
@@ -1169,7 +1442,7 @@ class SemanticQueryEngine:
                 continue
             if model.metrics and all(name in tables for dataset in model.datasets.values() for name in source_tables(dataset.source)):
                 found.append(model)
-        found.sort(key=lambda model: model.storage == "builtin")
+        found.sort(key=lambda model: (not model.is_wide, model.storage == "builtin"))
         return found
 
     def _source_tables(self, record: dict[str, Any]) -> set[str]:
@@ -1214,6 +1487,120 @@ class SemanticQueryEngine:
             self._values[key] = (self._clock(), values)
         return values
 
+    @staticmethod
+    def translate_request(request: dict[str, Any], source: Model, target: Model) -> dict[str, Any] | None:
+        """The same question over another model, or None if it does not define all of it.
+
+        Metrics match by name, since models of one business share them on purpose; fields by
+        column name, then by a shared synonym. The compiler still decides whether it can run.
+        """
+        def locate(reference: Any) -> str | None:
+            dataset_name, _, column = str(reference).rpartition(".")
+            origin = source.datasets.get(dataset_name)
+            item = origin.fields.get(column) if origin else None
+            for dataset in target.datasets.values():
+                if column in dataset.fields:
+                    return f"{dataset.name}.{column}"
+            if item is not None and item.synonyms:
+                for dataset in target.datasets.values():
+                    for candidate in dataset.fields.values():
+                        if set(candidate.synonyms) & set(item.synonyms):
+                            return f"{dataset.name}.{candidate.name}"
+            return None
+
+        names = [str(name) for name in request.get("metrics") or []]
+        if not names or any(name not in target.metrics for name in names):
+            return None
+        dimensions = []
+        for item in request.get("dimensions") or []:
+            entry = dict(item) if isinstance(item, dict) else {"field": str(item)}
+            mapped = locate(entry.get("field"))
+            if mapped is None:
+                return None
+            dimensions.append({**entry, "field": mapped})
+        filters = []
+        for item in request.get("filters") or []:
+            entry = dict(item)
+            if str(entry.get("field")) in source.metrics:
+                if str(entry.get("field")) not in target.metrics:
+                    return None
+                filters.append(entry)
+                continue
+            mapped = locate(entry.get("field"))
+            if mapped is None:
+                return None
+            filters.append({**entry, "field": mapped})
+        return {"metrics": names, "dimensions": dimensions, "filters": filters}
+
+    def cross_check(self, wide: Model, wide_request: dict[str, Any], detail: Model, record: dict[str, Any], refresh: bool = False) -> dict[str, Any] | None:
+        """Compare a wide table's answer with the tables it was built from, group by group.
+
+        A wide table is a copy, and a copy can lag or be built on another definition. A total
+        alone can hide that: rows can be in the wrong group and still add up. Every metric is
+        compared, including counts and ratios. Returns None when the other model cannot express
+        the question; a failed comparison is a finding about the data, not an error.
+        """
+        translated = self.translate_request(wide_request, wide, detail)
+        if translated is None:
+            return None
+
+        def rows(model: Model, request: dict[str, Any]) -> tuple[dict[tuple[str, ...], dict[str, float]], bool]:
+            compiled = self._compiler(model, record).compile({**request, "order_by": None, "limit": None}, ordered=False)
+            result = self.queries.execute(record, compiled.sql, refresh=refresh)
+            kinds = {column["name"]: column["kind"] for column in compiled.columns}
+            positions = {name: index for index, name in enumerate(result["columns"])}
+            metric_names = {column["name"]: column["metric"] for column in compiled.columns if column["kind"] == "metric"}
+            table: dict[tuple[str, ...], dict[str, float]] = {}
+            for row in result["rows"]:
+                group = tuple(str(row[positions[name]])[:10] for name, kind in kinds.items() if kind == "dimension")
+                table[group] = {metric_names[name]: float(row[positions[name]] or 0) for name in metric_names}
+            return table, bool(result.get("truncated"))
+
+        try:
+            ours, ours_cut = rows(wide, wide_request)
+            theirs, theirs_cut = rows(detail, translated)
+        except SemanticQueryError:
+            return None  # The detail model cannot compute this one; nothing to compare with.
+        except Exception as error:  # noqa: BLE001 - a comparison that cannot run proves nothing either way
+            return {"name": "宽表与明细核对", "status": "skipped", "detail": f"未能比较：{str(error)[:200]}", "differs": False}
+        if ours_cut or theirs_cut:
+            return {"name": "宽表与明细核对", "status": "skipped", "detail": "结果行数超过上限，未能逐组比较。", "differs": False}
+        names = [str(name) for name in wide_request.get("metrics") or []]
+        groups = sorted(set(ours) | set(theirs))
+        for group in groups:
+            for name in names:
+                mine, other = ours.get(group, {}).get(name, 0.0), theirs.get(group, {}).get(name, 0.0)
+                if abs(mine - other) > max(0.01, abs(other) * 1e-9):
+                    where = "、".join(group) if group and group != ("",) else "合计"
+                    return {"name": "宽表与明细核对", "status": "skipped", "differs": True, "detail": f"{name} 在 {where}：宽表 {mine:,.2f}，明细 {other:,.2f}，相差 {mine - other:,.2f}。宽表可能尚未同步，或构建口径与明细不同。"}
+        return {"name": "宽表与明细核对", "status": "passed", "differs": False, "detail": f"{'、'.join(names)} 在 {len(groups)} 个分组上与明细逐一比较，全部一致。"}
+
+    def wide_self_check(self, model: Model, record: dict[str, Any], refresh: bool = False) -> list[dict[str, str]]:
+        """A wide table's own health, for when there is no detail to compare it with."""
+        dataset = next(iter(model.datasets.values()))
+        if re.match(r"^\s*(select|with)\b", dataset.source, re.IGNORECASE):
+            return []
+        key = (model.fingerprint(), record["id"], "self")
+        with self._lock:
+            cached = self._self_checks.get(key)
+            if cached and not refresh and self._clock() - cached[0] < GRAIN_CACHE_SECONDS:
+                return cached[1]
+        compiler = self._plain_compiler(model, record)
+        table = compiler._table(dataset)
+        table = (table.this if isinstance(table, exp.Alias) else table).copy()
+        table.set("alias", None)
+        kinds = {"Date": "date", "DateTime": "timestamp", "DateTimeTz": "timestamp", "String": "text"}
+        columns = [(item.name, kinds.get(item.datatype, "")) for item in dataset.fields.values() if expression_for(item.expressions, compiler.dialect).strip('"`') == item.name]
+        checks = self_check(lambda statement: self.queries.execute(record, statement, refresh=refresh)["rows"], table, columns, compiler.dialect, primary_key=dataset.primary_key or None)
+        with self._lock:
+            self._self_checks[key] = (self._clock(), checks)
+        return checks
+
+    @staticmethod
+    def _expression_of(compiler: Compiler, metric: Metric) -> exp.Expression:
+        compiler.used = []
+        return compiler._metric_expression(metric)
+
     def definitions(self, model: Model, metric_names: list[str]) -> list[dict[str, str]]:
         return [
             {"name": name, "description": model.metrics[name].description, "expression": expression_for(model.metrics[name].expressions, "duckdb"), "time_field": model.metrics[name].time_field}
@@ -1229,9 +1616,18 @@ class SemanticQueryEngine:
         model declares unique that has duplicates in the data, so it is an error: a number
         known to be wrong is not an answer. Failing to run the check is reported as such.
         """
-        checks: list[dict[str, Any]] = []
+        checks: list[dict[str, Any]] = [{"name": "粒度待确认", "status": "skipped", "detail": text} for text in compiled.uncertain]
         if compiled.joins:
             checks.append({"name": "关联路径", "status": "passed", "detail": "按语义模型声明的关系生成：" + "；".join(compiled.joins)})
+        for description, statement in compiled.grain_checks:
+            try:
+                varies = self.queries.execute(record, statement, 1, refresh=refresh)["rows"]
+            except Exception as error:  # noqa: BLE001 - the answer stands, and says it was not verified
+                checks.append({"name": "声明粒度核对", "status": "skipped", "detail": f"未能确认“{description}”：{str(error)[:160]}"})
+                continue
+            if varies:
+                raise SemanticQueryError(409, f"结果未通过口径校验，已拒绝返回：语义模型声明“{description}”，但数据中存在取值不同的情况，按声明去重会丢失数据。请修正语义模型的 ai_context.grain。")
+            checks.append({"name": "声明粒度核对", "status": "passed", "detail": description})
         if compiled.branches:
             checks.append({"name": "多事实表口径", "status": "passed", "detail": "；".join(f"{item['dataset']}：{'、'.join(item['metrics'])}" for item in compiled.branches) + "，各自聚合后合并。"})
         dimensions = request.get("dimensions") or []
@@ -1283,6 +1679,8 @@ class SemanticQueryEngine:
         steps: list[str] | None = None,
         planner: str | None = None,
         question: str | None = None,
+        extra_checks: list[dict[str, Any]] | None = None,
+        route_note: str = "",
     ) -> dict[str, Any]:
         model = self.load_model(reference)
         record = self._record(datasource_id)
@@ -1290,7 +1688,7 @@ class SemanticQueryEngine:
         compiled = self._compile(model, request, record)
         with observe("semantic_query", "semantic", model=model.name, datasource=record["id"]):
             result = self.queries.execute(record, compiled.sql, request.get("limit"), refresh=refresh)
-        checks = self._verify(model, request, compiled, record, result, refresh)
+        checks = [*self._verify(model, request, compiled, record, result, refresh), *(extra_checks or [])]
         metrics = ", ".join(str(name) for name in request.get("metrics") or [])
         dims = ", ".join(str(item.get("field") if isinstance(item, dict) else item) for item in request.get("dimensions") or [])
         heading = title or f"{model.name}：{metrics}" + (f" 按 {dims}" if dims else "")
@@ -1298,6 +1696,7 @@ class SemanticQueryEngine:
             *(steps or []),
             f"读取语义模型 {model.name}（{len(model.datasets)} 个数据集，{len(model.metrics)} 个指标）。",
             f"关联数据集 {' → '.join(compiled.datasets)}" + ("，关系：" + "；".join(compiled.joins) if compiled.joins else "") + "。",
+            *([route_note] if route_note else []),
             *compiled.warnings,
             f"按 {DIALECT_LABELS.get(compiled.dialect, compiled.dialect)} 生成聚合语句并在 {record.get('name') or record['id']} 上执行，返回 {len(result['rows'])} 行。",
             *(f"校验通过：{check['detail']}" for check in checks if check["status"] == "passed" and "核对" in check["name"]),
@@ -1316,6 +1715,9 @@ class SemanticQueryEngine:
                 "definitions": self.definitions(model, names),
                 "warnings": compiled.warnings,
                 "planner": planner,
+                # A wide table answers without joins; the note says why another path was taken.
+                "route": "join" if compiled.joins else "wide" if model.is_wide else "single",
+                "route_note": route_note,
                 # Enough to run this answer again and to tell if its definitions have changed.
                 "request": request,
                 "fingerprint": model.fingerprint(),

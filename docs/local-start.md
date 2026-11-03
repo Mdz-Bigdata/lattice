@@ -94,7 +94,7 @@ WebUI 的数据源页面支持十四种类型：DuckDB、MySQL、PostgreSQL、Cl
 
 Oracle（python-oracledb thin 模式）与 SQL Server（pymssql）是普通的 SQL 数据源，分别以 `FETCH FIRST` 和 `TOP` 限制返回行数，质量核查按各自方言生成语句（SQL Server 不支持正则核查）。MongoDB、Elasticsearch 与 Kafka 没有 SQL：连接器把集合 / 索引 / 主题当作表，把抽样文档或最近的消息（JSON 展开为字段，嵌套一层用点号命名）读入内存 DuckDB 后执行 SQL，每张表最多读取“快照行数”条记录，因此聚合结果是快照上的结果；这三类在质量核查中会标注扫描不完整。驱动 `oracledb`、`pymssql`、`pymongo`、`kafka-python` 已列入 `scripts/pyproject.toml`，缺失时数据源测试会给出安装提示。
 
-项目同时提供九个开箱即用的本地实例，写入同样的七张示例表 `t_lattice_orders`、`t_lattice_order_items`、`t_lattice_customers`、`t_lattice_products`、`t_lattice_sellers`、`t_lattice_payments`，以及供 Apache Ossie 示例模型使用的 TPC-DS 风格 `store_sales`（`lattice_demo` 库，共 4490 行），因此同一条 SQL 在九个数据源上返回一致结果：
+项目同时提供九个开箱即用的本地实例，写入同样的八张示例表（含销售宽表 `dws_sales_wide`） `t_lattice_orders`、`t_lattice_order_items`、`t_lattice_customers`、`t_lattice_products`、`t_lattice_sellers`、`t_lattice_payments`，以及供 Apache Ossie 示例模型使用的 TPC-DS 风格 `store_sales`（`lattice_demo` 库，共 4490 行），因此同一条 SQL 在九个数据源上返回一致结果：
 
 ```bash
 ./start.sh                  # 首次：准备全部组件并启动九个数据源（含镜像下载）
@@ -240,6 +240,7 @@ claude mcp add --transport http lattice-metadata http://127.0.0.1:8787/api/metad
 ## Lattice WebUI 功能
 
 - **智能问数**：面向任一已注册数据源提问，显示月度销售额、类别销售额、商家排名、订单量和平均金额；支持柱状图、折线图、条形图、饼图和数据表，保留查询历史。
+  - 查询路径为宽表优先、多表关联兜底：宽表的重复度量按声明的粒度去重后汇总，宽表与明细不一致时改用明细并提示差额。
   - 数据源被语义模型覆盖时，以语义模型为唯一口径：问题映射到已定义的指标和维度，多表 JOIN 由语义层生成，跨一对多的重复累计会被拒绝，不同事实表的指标各自聚合后合并，可加指标的分组合计必须等于总数才返回结果。规则能完整解释问题时不调用模型；模型中没有的口径直接拒答。结果卡片展示「口径与校验」。
   - 没有语义模型覆盖的数据源，或需要语义层之外计算（环比、占比等）的问题，由模型读取真实表结构生成 SQL。执行前校验表、列、JOIN 条件和关联键重复情况，不通过时交还模型修正一次，仍不通过则拒绝执行；结果标注「未经语义层」。模型未必严格遵守目标方言，因此引擎拒绝执行时会按目标方言转换后自动重试一次，并在思考过程中说明，转换后的 SQL 同样展示给用户。
 

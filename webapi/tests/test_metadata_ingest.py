@@ -150,7 +150,7 @@ def test_scheduler_runs_due_services_once_and_snapshots_the_day(env):
     assert sorted(scheduler.tick()) == sorted(["local-sample", source["id"]])
     assert scheduler.tick() == []
     assert service.store.get_snapshot(today()) is not None
-    assert service.list("table")["total"] == 9  # seven sample tables, one table and one view
+    assert service.list("table")["total"] == 15  # thirteen sample tables, one table and one view
 
 
 class FakeModels:

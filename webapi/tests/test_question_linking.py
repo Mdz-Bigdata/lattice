@@ -34,6 +34,9 @@ def client(tmp_path, monkeypatch):
         monkeypatch.delenv(name, raising=False)
     with TestClient(app_module.app, base_url="http://127.0.0.1:8787") as test_client:
         monkeypatch.setattr(app_module.app.state.polaris, "status", lambda: {"status": "online", "version": "1.7.0"})
+        # These tests are about the joined tables; routing to the wide table has its own.
+        test_client.app.state.semantic_engine.builtin_wide = None
+        test_client.app.state.semantic_engine.invalidate()
         assert test_client.post("/api/llm", json={"provider": "openai", "model": "m", "base_url": "http://127.0.0.1:1/v1", "api_key": "k"}).status_code == 200
         yield test_client
 
@@ -273,6 +276,19 @@ def test_denied_column_is_hidden_and_refused(client, tmp_path, monkeypatch):
     assert "customers.region" in ask(client, "客户", source_id).json()["detail"]
 
 
+def test_a_scope_that_leaves_nothing_sends_no_schema_to_the_model(client, tmp_path, monkeypatch):
+    """Seen in testing: with no table left, the plain listing stood in and ignored the scope."""
+    source_id = source(client, warehouse(tmp_path / "w.duckdb"))
+    client.post(f"/api/datasources/{source_id}/question-scope", json={"allow_tables": ["nothing_like_this_*"]})
+    calls = generator_replies(monkeypatch, [GOOD])
+    answer = ask(client, "各地区订单金额", source_id)
+    assert answer.status_code == 422 and "问数范围" in answer.json()["detail"] and calls == []
+    # The sample source too, whose listing comes from another place.
+    client.post("/api/datasources/local-sample/question-scope", json={"allow_tables": ["nothing_like_this_*"]})
+    plain = ask(client, "随便瞧瞧", "local-sample")
+    assert plain.status_code == 422 and calls == []
+
+
 def test_allow_list_limits_tables_and_bad_column_rule_is_rejected(tmp_path):
     scope = QuestionScope(tmp_path / "scope.json")
     scope.save("s", ["dwd_*"], ["dwd_secret"], ["dwd_users.phone"])
@@ -316,11 +332,11 @@ def plan_replies(monkeypatch, reply):
 
 def test_confirmed_plan_answers_without_the_model_until_the_definition_changes(client, monkeypatch):
     calls = plan_replies(monkeypatch, PLAN)
-    first = ask(client, "按大区看成交规模怎么样", "local-sample").json()
-    assert first["semantic"]["planner"] == "llm" and first["question"] == "按大区看成交规模怎么样" and len(calls) == 1
+    first = ask(client, "按大区看销售额怎么样", "local-sample").json()
+    assert first["semantic"]["planner"] == "llm" and first["question"] == "按大区看销售额怎么样" and len(calls) == 1
     confirmed = client.post("/api/query/confirmed", json={"result_id": first["id"]})
     assert confirmed.status_code == 200 and confirmed.json()["kind"] == "semantic"
-    second = ask(client, "按大区，看成交规模怎么样？", "local-sample").json()
+    second = ask(client, "按大区，看销售额怎么样？", "local-sample").json()
     assert second["semantic"]["planner"] == "verified" and second["sql"] == first["sql"] and len(calls) == 1
     # Definitions change: the confirmation described something that no longer exists.
     engine = client.app.state.semantic_engine
@@ -333,18 +349,18 @@ def test_confirmed_plan_answers_without_the_model_until_the_definition_changes(c
 
     monkeypatch.setattr(engine, "builtin", edited)
     engine.invalidate()
-    third = ask(client, "按大区看成交规模怎么样", "local-sample").json()
+    third = ask(client, "按大区看销售额怎么样", "local-sample").json()
     assert third["semantic"]["planner"] == "llm" and len(calls) == 2
 
 
 def test_only_confirmed_answers_become_examples(client, monkeypatch):
     calls = plan_replies(monkeypatch, PLAN)
-    first = ask(client, "大区成交规模", "local-sample").json()
-    ask(client, "大区成交规模如何", "local-sample")
+    first = ask(client, "大区销售额水平", "local-sample").json()
+    ask(client, "大区销售额水平如何", "local-sample")
     assert "人工确认" not in calls[1]
     client.post("/api/query/confirmed", json={"result_id": first["id"]})
-    ask(client, "大区成交规模如何", "local-sample")
-    assert "人工确认" in calls[2] and "大区成交规模" in calls[2] and "t_lattice_customers.region" in calls[2]
+    ask(client, "大区销售额水平如何", "local-sample")
+    assert "人工确认" in calls[2] and "大区销售额水平" in calls[2] and "t_lattice_customers.region" in calls[2]
 
 
 def test_confirmed_sql_is_reused_and_dropped_when_it_stops_holding_up(client, tmp_path, monkeypatch):
@@ -365,7 +381,7 @@ def test_confirmed_sql_is_reused_and_dropped_when_it_stops_holding_up(client, tm
 
 def test_confirmation_can_be_listed_and_removed_and_needs_a_question(client, monkeypatch):
     plan_replies(monkeypatch, PLAN)
-    first = ask(client, "大区成交规模", "local-sample").json()
+    first = ask(client, "大区销售额水平", "local-sample").json()
     item = client.post("/api/query/confirmed", json={"result_id": first["id"]}).json()
     assert [row["id"] for row in client.get("/api/query/confirmed", params={"datasource_id": "local-sample"}).json()["items"]] == [item["id"]]
     assert client.post(f"/api/query/confirmed/{item['id']}/delete", json={}).json() == {"deleted": True}

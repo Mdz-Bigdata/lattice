@@ -40,7 +40,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from .llm import LlmError
+from .llm import retrying
 from .schema_linking import SENSITIVE_COLUMN
 from .semantic_query import GRAINS, Model, OPERATORS
 
@@ -52,6 +52,16 @@ GRAIN_TERMS = {
     "quarter": ("每季度", "按季度", "各季度", "分季度", "季度", "按季", "每季"),
     "year": ("每年", "按年", "年度", "逐年", "各年", "分年", "年份"),
 }
+#: Words that can only mean grouping by a period, unlike 月 or 季度 which can name one.
+EXPLICIT_GRAINS = {
+    "day": ("每日", "每天", "按日", "按天", "逐日"),
+    "week": ("每周", "按周", "逐周"),
+    "month": ("每月", "按月", "月度", "逐月", "各月"),
+    "quarter": ("每季度", "按季度", "各季度", "分季度"),
+    "year": ("每年", "按年", "逐年", "各年"),
+}
+#: Computations the semantic layer cannot express, and so the only reason to write free SQL.
+DERIVED_WORDS = re.compile(r"环比|同比|占比|比重|比例|百分比|份额|累计|增长|增速|下降|涨幅|跌幅|差额|差值|相差|移动平均|滚动|留存|转化率|复购|中位数|分位|方差|标准差|[率]")
 DESCENDING = ("最高", "最多", "最大", "最好", "排名", "排行", "排序", "降序", "从高到低", "从大到小")
 ASCENDING = ("最低", "最少", "最小", "最差", "升序", "从低到高", "从小到大", "倒数")
 SUPERLATIVE = ("最高", "最多", "最大", "最好", "最低", "最少", "最小", "最差")
@@ -205,7 +215,14 @@ def _default_time_field(model: Model, metric_names: list[str]) -> str:
     return candidates[0] if len(candidates) == 1 else ""
 
 
-def plan_locally(question: str, model: Model, values: dict[str, list[str]]) -> Plan:
+def metric_named_in(question: str, metric: Any) -> bool:
+    """Whether the question's own words name this metric, by its name or a word it declares."""
+    text = normalize(question)
+    words = [metric.name, *metric.synonyms, metric.description.split("：")[0]]
+    return any(normalize(word) and normalize(word) in text for word in words)
+
+
+def plan_locally(question: str, model: Model, values: dict[str, list[str]], terms: dict[str, str] | None = None) -> Plan:
     text = normalize(question)
     taken = [False] * len(text)
 
@@ -230,7 +247,10 @@ def plan_locally(question: str, model: Model, values: dict[str, list[str]]) -> P
             break
 
     # Longest terms first, so 商品类别 is never read as 商品, and 客户数 not as 客户.
+    settled = terms or {}
     terms = _terms_of(model, values)
+    # Words a person confirmed mean what they said, ahead of anything the model suggests.
+    terms.extend((normalize(word), "metric", name) for word, name in settled.items() if name in model.metrics)
     for words, kind in (
         (DESCENDING, "desc"), (ASCENDING, "asc"), (TREND, "trend"),
         *((words, f"grain:{grain}") for grain, words in GRAIN_TERMS.items()),
@@ -412,11 +432,22 @@ def catalog_text(model: Model, values: dict[str, list[str]], hidden: set[str] | 
     return "\n".join(lines)
 
 
+def _field_named_in(text: str, target: str, item: Any, grain: str | None, values: dict[str, list[str]]) -> bool:
+    """Whether the question asks for this dimension, by its own words or a value of it."""
+    if grain:
+        return any(normalize(word) in text for word in GRAIN_TERMS.get(grain, ())) or any(word in text for word in (*TREND, grain))
+    words = [item.name, *item.synonyms, item.description.split("，")[0]]
+    if any(normalize(word) and normalize(word) in text for word in words):
+        return True
+    return any(normalize(option) in text for option in values.get(target) or [])
+
+
 def check_plan(data: dict[str, Any], question: str, model: Model, values: dict[str, list[str]]) -> tuple[dict[str, Any], list[str]]:
     """Normalize a model's plan, reporting anything the answer could not be trusted with."""
     problems: list[str] = []
     fields = {f"{dataset.name}.{item.name}": item for dataset in model.datasets.values() for item in dataset.fields.values()}
-    metrics = [str(name) for name in data.get("metrics") or []]
+    # Models sometimes wrap a name in an object; what it says is still clear.
+    metrics = [str(name.get("name") or name.get("metric") or "") if isinstance(name, dict) else str(name) for name in data.get("metrics") or []]
     for name in metrics:
         if name not in model.metrics:
             problems.append(f"指标 {name} 不在语义模型中。")
@@ -424,8 +455,9 @@ def check_plan(data: dict[str, Any], question: str, model: Model, values: dict[s
         problems.append("没有选择指标。")
     dimensions = []
     for item in data.get("dimensions") or []:
-        target = str((item or {}).get("field") or "")
-        grain = str((item or {}).get("grain") or "").lower()
+        item = item if isinstance(item, dict) else {"field": item}
+        target = str(item.get("field") or "")
+        grain = str(item.get("grain") or "").lower()
         if target not in fields:
             problems.append(f"维度 {target} 不在语义模型中。")
             continue
@@ -473,15 +505,50 @@ def check_plan(data: dict[str, Any], question: str, model: Model, values: dict[s
                 problems.append(f"时间范围 {value} 必须是两个 YYYY-MM-DD。")
         filters.append({"field": target, "op": operator, "value": value})
 
-    # The question's own literals have to survive into the plan.
+    # One value of a field leaves nothing to group by: 华南各月 is a filter and a month.
+    single = {item["field"] for item in filters if item["op"] == "=" or (item["op"] == "in" and len(item["value"] or []) == 1)}
+    dimensions = [item for item in dimensions if item["field"] not in single or item.get("grain")]
+    # Nothing may be added that the question does not ask for. A model that groups by customer
+    # because a phrase looked like it needed a dimension returns numbers that look entirely right.
     text = normalize(question)
+    # What the question does state has to arrive exactly. A model that reads 2018年3月 按季度 as
+    # the whole quarter gives a right total for a period nobody asked about.
+    spans, periods = time_range(text)
+    if len(periods) == 1:
+        wanted = list(periods[0])
+        between = [item.get("value") for item in filters if item["field"] in fields and fields[item["field"]].is_time and item["op"] == "between"]
+        if not any(isinstance(value, list) and [str(part)[:10] for part in value] == wanted for value in between):
+            problems.append(f"问题限定的时间范围是 {wanted[0]} 到 {wanted[1]}，计划中必须用 between 原样表示这个范围。")
+    remainder = "".join(character for index, character in enumerate(text) if not any(start <= index < end for start, end in spans))
+    for grain, words in EXPLICIT_GRAINS.items():
+        if any(word in remainder for word in words) and not any(item.get("grain") == grain for item in dimensions):
+            problems.append(f"问题要求按 {grain} 分组（{'、'.join(word for word in words if word in remainder)}），计划中缺少这个时间粒度。")
+    for entry in dimensions:
+        target = entry["field"]
+        if not _field_named_in(text, target, fields[target], entry.get("grain"), values):
+            problems.append(f"问题没有提到维度 {target}，不要添加问题没有要求的分组。")
+    for entry in filters:
+        target = entry["field"]
+        if target in model.metrics:
+            continue
+        if fields[target].is_time:
+            if not re.search(r"\d|今年|去年|前年|本月|上月|本周|上周|今天|昨天|最近|近\S{0,3}[天周月年]|季度|上半年|下半年", text):
+                problems.append(f"问题没有提到时间范围，不要添加 {target} 的时间筛选。")
+            continue
+        if entry["op"] in {"is_null", "not_null"}:
+            continue
+        given = entry.get("value") if isinstance(entry.get("value"), list) else [entry.get("value")]
+        known = values.get(target)
+        if known and not any(normalize(str(option)) in text for option in given):
+            problems.append(f"问题没有提到 {target} 的取值 {entry.get('value')}，不要添加问题没有要求的筛选。")
+    # The question's own literals have to survive into the plan.
     for target, options in values.items():
         named = [option for option in options if normalize(option) in text]
         if named and not any(item["field"] == target for item in filters):
             problems.append(f"问题提到了“{'、'.join(named)}”，但计划没有按 {target} 筛选。")
     time_filters = " ".join(str(item.get("value")) for item in filters if item["field"] in fields and fields[item["field"]].is_time)
     for year in re.findall(r"(\d{4})年", text):
-        if year not in time_filters:
+        if year not in time_filters and len(periods) != 1:
             problems.append(f"问题限定了 {year} 年，但计划没有对应的时间筛选。")
     top = _TOP.search(text)
     limit = data.get("limit")
@@ -489,7 +556,14 @@ def check_plan(data: dict[str, Any], question: str, model: Model, values: dict[s
         problems.append(f"问题要求前 {_number(top.group(1))} 名，但计划的 limit 是 {limit}。")
 
     request: dict[str, Any] = {"metrics": metrics, "dimensions": dimensions, "filters": filters}
-    orders = [{"field": str(item.get("field")), "desc": bool(item.get("desc"))} for item in data.get("order_by") or [] if isinstance(item, dict) and item.get("field")]
+    # Results are named by the column alone, while a model naturally writes dataset.column.
+    available = {*metrics, *(item["field"].rsplit(".", 1)[-1] for item in dimensions)}
+    orders = []
+    for item in data.get("order_by") or []:
+        if isinstance(item, dict) and item.get("field"):
+            name = str(item["field"]).rsplit(".", 1)[-1]
+            if name in available:
+                orders.append({"field": name, "desc": bool(item.get("desc"))})
     if orders:
         request["order_by"] = orders
     if isinstance(limit, int) and limit > 0:
@@ -522,19 +596,25 @@ def plan_with_model(
     feedback = ""
     problems: list[str] = []
     for attempt in range(2):
-        try:
-            data = generator.complete_json(prompt + feedback, system=PLAN_SYSTEM, schema=PLAN_SCHEMA)
-        except LlmError as error:
-            # Some services occasionally return text that is not valid JSON; once is worth repeating.
-            if attempt == 0 and "JSON" in str(error):
-                continue
-            raise
+        data = retrying(lambda: generator.complete_json(prompt + feedback, system=PLAN_SYSTEM, schema=PLAN_SCHEMA))
         status = str(data.get("status") or "")
         reason = str(data.get("reason") or "").strip()[:400]
         steps = [str(item).strip() for item in (data.get("steps") or []) if str(item).strip()][:4]
         if status == "unmapped":
+            # It said the concept is missing, but the question uses a word the model defines.
+            named = [metric for metric in model.metrics.values() if metric_named_in(question, metric)]
+            if named and attempt == 0:
+                feedback = "\n\n你判断语义模型没有这个口径，但问题中的用语已经是指标的名称或同义词：" + "、".join(metric.name for metric in named) + "。请使用这些指标重新输出。"
+                continue
             return Plan("unmapped", reason=reason or "模型判断语义模型没有这个口径。", planner="llm", steps=steps)
         if status == "derived":
+            # Leaving the semantic layer gives up every check on the plan, so it takes a real need.
+            # 对比 is a grouping: only computations the compiler cannot express justify it.
+            if not DERIVED_WORDS.search(normalize(question)) and attempt == 0:
+                feedback = "\n\n问题里没有环比、同比、占比、累计这类语义层不支持的计算；对比、拆分、列出都可以用 dimensions 分组表示。请输出 status 为 ok 的映射。"
+                continue
+            if not DERIVED_WORDS.search(normalize(question)):
+                return Plan("unmapped", reason=f"模型认为需要语义层之外的计算，但问题里没有这类计算：{reason}", planner="llm")
             return Plan("derived", reason=reason, planner="llm", steps=steps, request={"metrics": [str(item) for item in data.get("metrics") or [] if str(item) in model.metrics]})
         if status != "ok":
             return Plan("unmapped", reason="模型没有返回有效的映射结果。", planner="llm")
